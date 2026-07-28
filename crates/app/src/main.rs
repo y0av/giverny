@@ -67,6 +67,9 @@ pub enum Action {
     StartRename(RenameTarget),
     CommitRename(RenameTarget, Option<String>),
     Respawn(TabId),
+    DeleteCategory(CategoryId),
+    SetCategoryColor(CategoryId, usize),
+    MoveTab(TabId, CategoryId),
 }
 
 pub struct TabRuntime {
@@ -182,6 +185,17 @@ impl App {
             Action::Respawn(id) => {
                 self.spawn_session(ctx, id);
                 self.focus_terminal = true;
+            }
+            Action::DeleteCategory(id) => {
+                self.ws.remove_category(id);
+            }
+            Action::SetCategoryColor(id, color_index) => {
+                if let Some(cat) = self.ws.category_mut(id) {
+                    cat.color_index = color_index;
+                }
+            }
+            Action::MoveTab(tab, category) => {
+                self.ws.move_tab_to_category(tab, category);
             }
         }
     }

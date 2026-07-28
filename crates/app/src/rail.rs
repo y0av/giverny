@@ -141,6 +141,34 @@ fn category_header(
         return;
     }
 
+    // Right-click: category management.
+    resp.context_menu(|ui| {
+        if ui.button("rename").clicked() {
+            actions.push(Action::StartRename(RenameTarget::Category(cat.id)));
+            ui.close();
+        }
+        if ui.button("new tab here").clicked() {
+            actions.push(Action::NewTab { category: cat.id, cwd: None });
+            ui.close();
+        }
+        ui.menu_button("color", |ui| {
+            ui.horizontal(|ui| {
+                for (i, c) in crate::CATEGORY_PALETTE.iter().enumerate() {
+                    let btn = egui::Button::new("  ").fill(*c).corner_radius(3.0);
+                    if ui.add_sized(Vec2::splat(18.0), btn).clicked() {
+                        actions.push(Action::SetCategoryColor(cat.id, i));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        ui.separator();
+        if ui.button("delete category").clicked() {
+            actions.push(Action::DeleteCategory(cat.id));
+            ui.close();
+        }
+    });
+
     let tri = if cat.collapsed { "▸" } else { "▾" };
     p.text(
         Pos2::new(rect.min.x + 8.0, rect.center().y),
@@ -178,8 +206,6 @@ fn category_header(
     );
     if plus.clicked() {
         actions.push(Action::NewTab { category: cat.id, cwd: None });
-    } else if resp.double_clicked() {
-        actions.push(Action::StartRename(RenameTarget::Category(cat.id)));
     } else if resp.clicked() {
         actions.push(Action::ToggleCollapse(cat.id));
     }
@@ -199,7 +225,9 @@ fn tab_row(
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
     let p = ui.painter_at(rect);
-    let hovered = resp.hovered();
+    // Geometry-based hover: `resp.hovered()` flickers when the close button
+    // overlays the row in the hit-test stack.
+    let hovered = ui.rect_contains_pointer(rect);
 
     if row.active {
         p.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, row.color.gamma_multiply(0.16));
@@ -284,6 +312,27 @@ fn tab_row(
             return;
         }
     }
+
+    // Right-click: tab management.
+    resp.context_menu(|ui| {
+        if ui.button("rename").clicked() {
+            actions.push(Action::StartRename(RenameTarget::Tab(row.id)));
+            ui.close();
+        }
+        ui.menu_button("move to", |ui| {
+            for (id, name) in &app.ws.categories.iter().map(|c| (c.id, c.name.clone())).collect::<Vec<_>>() {
+                if ui.button(name).clicked() {
+                    actions.push(Action::MoveTab(row.id, *id));
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("close").clicked() {
+            actions.push(Action::CloseTab(row.id));
+            ui.close();
+        }
+    });
 
     if resp.double_clicked() {
         actions.push(Action::StartRename(RenameTarget::Tab(row.id)));

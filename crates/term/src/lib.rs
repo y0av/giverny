@@ -5,7 +5,11 @@
 //! renderer painted as an egui widget. Also owns input encoding (legacy +
 //! kitty keyboard protocol), selection, scrollback and search.
 
+pub mod input;
 pub mod io_loop;
+pub mod proxy;
 pub mod pty;
 pub mod render;
+pub mod session;
 pub mod tee;
+pub mod widget;

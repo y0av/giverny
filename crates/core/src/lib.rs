@@ -5,6 +5,7 @@
 //! crash-safe), single-instance locking, and restore orchestration.
 
 pub mod git;
+pub mod state;
 pub mod tabs;
 
 /// Shorten a path for display: `~` for home, middle segments elided to fit.

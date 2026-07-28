@@ -77,6 +77,15 @@ fn probe_replies_are_byte_exact() {
 }
 
 fn headless_session(script_shell: Option<(String, Vec<String>)>, cwd: PathBuf, config_dir: Option<PathBuf>) -> TermSession {
+    headless_session_preseeded(script_shell, cwd, config_dir, None)
+}
+
+fn headless_session_preseeded(
+    script_shell: Option<(String, Vec<String>)>,
+    cwd: PathBuf,
+    config_dir: Option<PathBuf>,
+    preseed: Option<&str>,
+) -> TermSession {
     let cfg = SpawnCfg {
         shell: script_shell,
         cwd,
@@ -86,7 +95,7 @@ fn headless_session(script_shell: Option<(String, Vec<String>)>, cwd: PathBuf, c
         claude_config_dir: config_dir,
         size: GridSize { cols: 100, rows: 30, cell_width: 8, cell_height: 16 },
     };
-    TermSession::spawn(&cfg, egui::Context::default(), Theme::monet_dark())
+    TermSession::spawn(&cfg, egui::Context::default(), Theme::monet_dark(), preseed)
         .expect("session spawns")
 }
 
@@ -131,6 +140,56 @@ fn flood_keeps_lock_responsive() {
         "terminal lock starved during flood: worst acquisition {worst_lock:?}"
     );
     session.shutdown();
+}
+
+fn drain_until_done(session: &TermSession) {
+    let ok = wait_for(
+        || {
+            let mut done = false;
+            while let Ok(ev) = session.events.try_recv() {
+                if matches!(ev, TabEvent::LoopDone(_)) {
+                    done = true;
+                }
+            }
+            done
+        },
+        Duration::from_secs(10),
+    );
+    assert!(ok, "session did not finish");
+}
+
+/// The M3 restore contract: scrollback from one session, serialized to an
+/// ANSI dump, pre-seeds a fresh session — text, colors, and ordering intact,
+/// with the restored divider between old content and the new shell.
+#[test]
+fn scrollback_survives_restart_via_preseed() {
+    let a = headless_session(
+        Some((
+            "/bin/sh".into(),
+            vec!["-c".into(), r"printf '\033[31mpoppy\033[0m plain \033[1mbold\033[0m\r\n'".into()],
+        )),
+        std::env::temp_dir(),
+        None,
+    );
+    drain_until_done(&a);
+    let dump = a.snapshot_ansi(1000).expect("snapshot from session A");
+    assert!(dump.contains("poppy"), "dump has text: {dump:?}");
+    assert!(dump.contains("\x1b[0;1"), "dump re-emits bold SGR: {dump:?}");
+    a.shutdown();
+
+    let b = headless_session_preseeded(
+        Some(("/bin/sh".into(), vec!["-c".into(), "printf 'fresh-prompt'".into()])),
+        std::env::temp_dir(),
+        None,
+        Some(&dump),
+    );
+    drain_until_done(&b);
+    let screen = b.screen_text();
+    let old = screen.find("poppy plain bold").expect("restored content on screen");
+    let divider = screen.find("── restored ──").expect("divider on screen");
+    let fresh = screen.find("fresh-prompt").expect("fresh shell output on screen");
+    assert!(old < divider && divider < fresh, "order: restored < divider < fresh\n{screen}");
+    b.shutdown();
 }
 
 fn find_claude() -> Option<String> {

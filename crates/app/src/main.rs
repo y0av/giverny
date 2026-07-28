@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
+use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
 use giverny_term::pty::{GridSize, SpawnCfg};
@@ -86,27 +87,65 @@ pub struct App {
     pub rename_needs_focus: bool,
     focus_terminal: bool,
     last_info_refresh: Instant,
+    paths: Paths,
+    state_dirty: bool,
+    last_save: Instant,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let theme = Theme::monet_dark();
-        let shared = RenderShared::new(theme, DEFAULT_FONT_SIZE).expect("font discovery");
+        let mut shared = RenderShared::new(theme, DEFAULT_FONT_SIZE).expect("font discovery");
+        let paths = Paths::default_dirs();
+
+        let restored = state::load(&paths);
+        if let Some(st) = &restored {
+            shared.set_font_size(st.font_size);
+        }
+        let ws = restored
+            .map(|st| st.workspace)
+            .filter(|ws| !ws.tabs.is_empty())
+            .unwrap_or_default();
+
         let mut app = App {
             shared,
-            ws: Workspace::default(),
+            ws,
             rt: HashMap::new(),
             rename: None,
             rename_needs_focus: false,
             focus_terminal: true,
             last_info_refresh: Instant::now(),
+            paths,
+            state_dirty: false,
+            last_save: Instant::now(),
         };
-        let cat = app.ws.categories[0].id;
-        app.apply(&cc.egui_ctx, Action::NewTab { category: cat, cwd: None });
+        if app.ws.tabs.is_empty() {
+            let cat = app.ws.categories[0].id;
+            app.apply(&cc.egui_ctx, Action::NewTab { category: cat, cwd: None });
+        }
+        // Sessions for restored tabs spawn lazily on first focus; the state
+        // file is rewritten now with clean_shutdown=false (crash marker).
+        app.save_state(false);
         app
     }
 
+    fn save_state(&mut self, clean_shutdown: bool) {
+        let st = SaveState {
+            version: state::STATE_VERSION,
+            boot_id: state::boot_id(),
+            clean_shutdown,
+            workspace: self.ws.clone(),
+            font_size: self.shared.font_size,
+        };
+        if let Err(err) = state::save(&self.paths, &st) {
+            tracing::error!("state save failed: {err:#}");
+        }
+        self.state_dirty = false;
+        self.last_save = Instant::now();
+    }
+
     pub fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        self.state_dirty = true;
         match action {
             Action::NewTab { category, cwd } => {
                 let cwd = cwd
@@ -115,7 +154,7 @@ impl App {
                     .unwrap_or_else(|| PathBuf::from("/"));
                 let id = self.ws.add_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
-                self.spawn_session(ctx, id);
+                self.spawn_session(ctx, id, None);
                 self.focus_terminal = true;
             }
             Action::NewCategory => {
@@ -132,6 +171,7 @@ impl App {
                     std::thread::spawn(move || session.shutdown());
                 }
                 self.ws.close_tab(id);
+                state::remove_snapshot(&self.paths, id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
@@ -183,7 +223,7 @@ impl App {
                 }
             }
             Action::Respawn(id) => {
-                self.spawn_session(ctx, id);
+                self.spawn_session(ctx, id, None);
                 self.focus_terminal = true;
             }
             Action::DeleteCategory(id) => {
@@ -200,7 +240,7 @@ impl App {
         }
     }
 
-    fn spawn_session(&mut self, ctx: &egui::Context, id: TabId) {
+    fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
         let Some(tab) = self.ws.tab(id) else { return };
         let cwd = tab
             .cwd
@@ -217,7 +257,8 @@ impl App {
             claude_config_dir: None,
             size: GridSize { cols: 120, rows: 30, cell_width: 9, cell_height: 18 },
         };
-        match TermSession::spawn(&cfg, ctx.clone(), self.shared.theme.clone()) {
+        match TermSession::spawn(&cfg, ctx.clone(), self.shared.theme.clone(), preseed.as_deref())
+        {
             Ok(session) => {
                 self.ws.tab_mut(id).unwrap().exited = false;
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
@@ -274,6 +315,7 @@ impl App {
             if let Some(tab) = self.ws.tab_mut(id) {
                 tab.git_branch = giverny_core::git::branch_of(&cwd);
                 tab.cwd = Some(cwd);
+                self.state_dirty = true;
             }
         }
     }
@@ -294,6 +336,9 @@ impl App {
     }
 
     fn periodic_refresh(&mut self) {
+        if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
+            self.save_state(false);
+        }
         if self.last_info_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
@@ -389,6 +434,15 @@ impl eframe::App for App {
                 });
             }
 
+            // Lazy restore: a tab from a previous run spawns its shell on
+            // first focus, pre-seeded with its saved scrollback.
+            if !self.rt.contains_key(&active)
+                && !self.ws.tab(active).is_some_and(|t| t.exited)
+            {
+                let preseed = state::load_snapshot(&self.paths, active);
+                self.spawn_session(&ctx, active, preseed);
+            }
+
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
                     let response = rt.view.show(ui, &mut self.shared, session);
@@ -412,6 +466,17 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Scrollback snapshots for every live tab, then the final state write.
+        let ids: Vec<TabId> = self.rt.keys().copied().collect();
+        for id in ids {
+            if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref())
+                && let Some(dump) = session.snapshot_ansi(4000)
+                && let Err(err) = state::save_snapshot(&self.paths, id, &dump)
+            {
+                tracing::error!("snapshot save failed for {id:?}: {err:#}");
+            }
+        }
+        self.save_state(true);
         for (_, rt) in self.rt.drain() {
             if let Some(session) = rt.session {
                 session.shutdown();

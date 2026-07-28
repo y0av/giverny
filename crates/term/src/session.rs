@@ -32,7 +32,16 @@ pub struct TermSession {
 }
 
 impl TermSession {
-    pub fn spawn(cfg: &SpawnCfg, egui_ctx: egui::Context, theme: Theme) -> anyhow::Result<Self> {
+    /// Spawn a tab. `preseed` is an ANSI dump (from [`Self::snapshot_ansi`])
+    /// advanced into the terminal *before* the shell starts — restored
+    /// scrollback appears above the fresh prompt, colors intact, and re-wraps
+    /// naturally at the current width.
+    pub fn spawn(
+        cfg: &SpawnCfg,
+        egui_ctx: egui::Context,
+        theme: Theme,
+        preseed: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let pty = pty::spawn(cfg, 0)?;
         #[cfg(unix)]
         let child_pid = Some(pty.child().id());
@@ -65,6 +74,19 @@ impl TermSession {
             &TermSize::new(cfg.size.cols as usize, cfg.size.rows as usize),
             proxy.clone(),
         )));
+
+        if let Some(dump) = preseed
+            && !dump.is_empty()
+        {
+            use alacritty_terminal::vte::ansi::Processor;
+            let mut parser: Processor = Processor::new();
+            let mut guard = term.lock();
+            parser.advance(&mut *guard, dump.as_bytes());
+            parser.advance(
+                &mut *guard,
+                "\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n".as_bytes(),
+            );
+        }
 
         let tee = Tee::new(cfg.nonce.clone(), local_hostname());
         let io = IoLoop::new(term.clone(), proxy, pty, tee, write_back.clone(), true)?;
@@ -111,6 +133,86 @@ impl TermSession {
 
     pub fn size(&self) -> GridSize {
         self.size
+    }
+
+    /// Serialize scrollback + screen to an ANSI dump for restore-time
+    /// pre-seeding: logical lines (wrapped rows joined so they re-wrap at any
+    /// width), styles re-emitted as SGR. `None` while on the alt screen
+    /// (vim/fullscreen apps shouldn't persist).
+    pub fn snapshot_ansi(&self, max_rows: usize) -> Option<String> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = term.grid();
+        let cols = grid.columns();
+        let screen = grid.screen_lines() as i32;
+        let history = (grid.total_lines() - grid.screen_lines()) as i32;
+
+        // Last row worth saving: bottom-most screen row with content.
+        let mut last = -1;
+        for l in (0..screen).rev() {
+            let has_content = (0..cols).any(|c| {
+                let cell = &grid[Point::new(Line(l), Column(c))];
+                cell.c != ' ' || cell.bg != alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Background,
+                )
+            });
+            if has_content {
+                last = l;
+                break;
+            }
+        }
+        if last < 0 && history == 0 {
+            return None;
+        }
+
+        let first = (-history).max(last - max_rows as i32 + 1).min(0);
+        let mut out = String::with_capacity(64 * 1024);
+        let mut style = SgrTracker::default();
+
+        for l in first..=last {
+            let line = Line(l);
+            // Trim trailing cells that are blank in every respect.
+            let mut end = 0;
+            for c in (0..cols).rev() {
+                let cell = &grid[Point::new(line, Column(c))];
+                let blank = cell.c == ' '
+                    && cell.bg
+                        == alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Background,
+                        )
+                    && !cell.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT | Flags::INVERSE);
+                if !blank {
+                    end = c + 1;
+                    break;
+                }
+            }
+            for c in 0..end {
+                let cell = &grid[Point::new(line, Column(c))];
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                style.emit_diff(&mut out, cell.fg, cell.bg, cell.flags);
+                out.push(cell.c);
+                if let Some(extra) = cell.zerowidth() {
+                    out.extend(extra.iter());
+                }
+            }
+            let wrapped = cols > 0
+                && grid[Point::new(line, Column(cols - 1))].flags.contains(Flags::WRAPLINE);
+            if !wrapped {
+                out.push_str("\x1b[0m\r\n");
+                style = SgrTracker::default();
+            }
+        }
+        out.push_str("\x1b[0m");
+        Some(out)
     }
 
     /// Visible screen contents as text (row-major, newline-separated).
@@ -161,6 +263,114 @@ impl TermSession {
         let _ = self.sender.send(Msg::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+/// Minimal SGR re-emitter for snapshot serialization: on any style change,
+/// resets and re-applies the full attribute set (simple and always correct).
+#[derive(Default)]
+struct SgrTracker {
+    current: Option<(
+        alacritty_terminal::vte::ansi::Color,
+        alacritty_terminal::vte::ansi::Color,
+        alacritty_terminal::term::cell::Flags,
+    )>,
+}
+
+impl SgrTracker {
+    fn emit_diff(
+        &mut self,
+        out: &mut String,
+        fg: alacritty_terminal::vte::ansi::Color,
+        bg: alacritty_terminal::vte::ansi::Color,
+        flags: alacritty_terminal::term::cell::Flags,
+    ) {
+        use alacritty_terminal::term::cell::Flags;
+        let styled = flags
+            & (Flags::BOLD
+                | Flags::DIM
+                | Flags::ITALIC
+                | Flags::ALL_UNDERLINES
+                | Flags::INVERSE
+                | Flags::HIDDEN
+                | Flags::STRIKEOUT);
+        if self.current == Some((fg, bg, styled)) {
+            return;
+        }
+        self.current = Some((fg, bg, styled));
+
+        out.push_str("\x1b[0");
+        if styled.contains(Flags::BOLD) {
+            out.push_str(";1");
+        }
+        if styled.contains(Flags::DIM) {
+            out.push_str(";2");
+        }
+        if styled.contains(Flags::ITALIC) {
+            out.push_str(";3");
+        }
+        if styled.intersects(Flags::ALL_UNDERLINES) {
+            out.push_str(";4");
+        }
+        if styled.contains(Flags::INVERSE) {
+            out.push_str(";7");
+        }
+        if styled.contains(Flags::HIDDEN) {
+            out.push_str(";8");
+        }
+        if styled.contains(Flags::STRIKEOUT) {
+            out.push_str(";9");
+        }
+        push_color(out, fg, true);
+        push_color(out, bg, false);
+        out.push('m');
+    }
+}
+
+fn push_color(out: &mut String, color: alacritty_terminal::vte::ansi::Color, is_fg: bool) {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    use std::fmt::Write;
+    let named_base = |n: NamedColor| -> Option<u8> {
+        use NamedColor::*;
+        Some(match n {
+            Black | DimBlack => 0,
+            Red | DimRed => 1,
+            Green | DimGreen => 2,
+            Yellow | DimYellow => 3,
+            Blue | DimBlue => 4,
+            Magenta | DimMagenta => 5,
+            Cyan | DimCyan => 6,
+            White | DimWhite => 7,
+            BrightBlack => 8,
+            BrightRed => 9,
+            BrightGreen => 10,
+            BrightYellow => 11,
+            BrightBlue => 12,
+            BrightMagenta => 13,
+            BrightCyan => 14,
+            BrightWhite => 15,
+            _ => return None,
+        })
+    };
+    match color {
+        Color::Named(n) => match named_base(n) {
+            Some(i) if i < 8 => {
+                let _ = write!(out, ";{}", if is_fg { 30 + i } else { 40 + i });
+            }
+            Some(i) => {
+                let _ = write!(out, ";{}", if is_fg { 82 + i } else { 92 + i });
+            }
+            None => {
+                let _ = write!(out, ";{}", if is_fg { 39 } else { 49 });
+            }
+        },
+        Color::Indexed(i) => {
+            let _ = write!(out, ";{};5;{}", if is_fg { 38 } else { 48 }, i);
+        }
+        Color::Spec(rgb) => {
+            let _ =
+                write!(out, ";{};2;{};{};{}", if is_fg { 38 } else { 48 }, rgb.r, rgb.g, rgb.b);
         }
     }
 }

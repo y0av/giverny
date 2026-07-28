@@ -5,5 +5,6 @@
 //! renderer painted as an egui widget. Also owns input encoding (legacy +
 //! kitty keyboard protocol), selection, scrollback and search.
 
+pub mod io_loop;
 pub mod pty;
 pub mod tee;

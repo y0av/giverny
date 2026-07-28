@@ -188,6 +188,69 @@ fn ctrl_byte(key: Key) -> Option<u8> {
     }
 }
 
+/// Mouse buttons/wheel in xterm code space (before modifier/motion offsets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseCode {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    /// Motion with no button held (MOUSE_MOTION mode).
+    NoButton,
+}
+
+impl MouseCode {
+    fn base(self) -> u8 {
+        match self {
+            MouseCode::Left => 0,
+            MouseCode::Middle => 1,
+            MouseCode::Right => 2,
+            MouseCode::WheelUp => 64,
+            MouseCode::WheelDown => 65,
+            MouseCode::NoButton => 3,
+        }
+    }
+}
+
+/// Encode a mouse report. `col`/`line` are 0-based viewport cell coords.
+/// Wheel events are always "pressed"; motion adds 32.
+pub fn encode_mouse(
+    code: MouseCode,
+    col: u16,
+    line: u16,
+    pressed: bool,
+    motion: bool,
+    mods: Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    let mut cb = code.base();
+    if mods.shift {
+        cb += 4;
+    }
+    if mods.alt {
+        cb += 8;
+    }
+    if mods.ctrl || mods.command {
+        cb += 16;
+    }
+    if motion {
+        cb += 32;
+    }
+    let (x, y) = (col as u32 + 1, line as u32 + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let suffix = if pressed { 'M' } else { 'm' };
+        Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
+    } else {
+        // Legacy X10 encoding: release reports button 3; coords cap at 223.
+        if x > 223 || y > 223 {
+            return None;
+        }
+        let cb = if pressed { cb } else { (cb & !0b11) | 3 };
+        Some(vec![0x1b, b'[', b'M', 32 + cb, 32 + x as u8, 32 + y as u8])
+    }
+}
+
 /// Sanitize text (typed or pasted) so it cannot inject escape sequences:
 /// strips ESC and C1 controls; converts `\r\n`/`\n` to `\r`.
 pub fn sanitize_text(text: &str) -> Vec<u8> {
@@ -291,5 +354,42 @@ mod tests {
     fn alt_letter_prefixes_escape() {
         let m = TermMode::empty();
         assert_eq!(encode_key(Key::B, Modifiers::ALT, m).unwrap(), b"\x1bb");
+    }
+
+    #[test]
+    fn sgr_mouse_reports() {
+        let m = TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            encode_mouse(MouseCode::Left, 0, 0, true, false, none(), m).unwrap(),
+            b"\x1b[<0;1;1M"
+        );
+        assert_eq!(
+            encode_mouse(MouseCode::Left, 10, 4, false, false, none(), m).unwrap(),
+            b"\x1b[<0;11;5m"
+        );
+        assert_eq!(
+            encode_mouse(MouseCode::WheelUp, 2, 2, true, false, none(), m).unwrap(),
+            b"\x1b[<64;3;3M"
+        );
+        assert_eq!(
+            encode_mouse(MouseCode::Left, 5, 5, true, true, none(), m).unwrap(),
+            b"\x1b[<32;6;6M",
+            "drag motion adds 32"
+        );
+    }
+
+    #[test]
+    fn legacy_mouse_reports() {
+        let m = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            encode_mouse(MouseCode::Left, 0, 0, true, false, none(), m).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse(MouseCode::Left, 0, 0, false, false, none(), m).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 33, 33],
+            "legacy release is button 3"
+        );
+        assert!(encode_mouse(MouseCode::Left, 250, 0, true, false, none(), m).is_none());
     }
 }

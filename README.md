@@ -4,7 +4,7 @@
 
 Named for [Giverny](https://en.wikipedia.org/wiki/Giverny), Claude Monet's garden village — a home for the other famous Claude.
 
-> Status: early development (M1 — terminal core). Not yet usable.
+> Status: early development. The M1 terminal core works — a real zsh (and Claude Code itself) runs in a single tab with kitty-keyboard input, mouse reporting, selection, and GPU-rendered glyphs. Rail, persistence, Claude state, and usage meters are the next milestones.
 
 ## Why
 

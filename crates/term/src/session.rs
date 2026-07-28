@@ -106,6 +106,26 @@ impl TermSession {
         self.size
     }
 
+    /// Visible screen contents as text (row-major, newline-separated).
+    /// Diagnostics/tests; trims trailing spaces per row.
+    pub fn screen_text(&self) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = self.term.lock();
+        let grid = term.grid();
+        let mut out = String::new();
+        for line in 0..grid.screen_lines() {
+            let mut row = String::new();
+            for col in 0..grid.columns() {
+                let point = Point::new(Line(line as i32), Column(col));
+                row.push(grid[point].c);
+            }
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
     /// Snap the viewport back to the live (bottom) position.
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);

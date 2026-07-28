@@ -7,4 +7,5 @@
 
 pub mod io_loop;
 pub mod pty;
+pub mod render;
 pub mod tee;

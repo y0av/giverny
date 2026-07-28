@@ -22,6 +22,8 @@ pub struct TermSession {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub events: Receiver<TabEvent>,
     pub shared: Arc<SharedTermState>,
+    /// Shell process id (unix), for `/proc/<pid>/cwd` fallback tracking.
+    pub child_pid: Option<u32>,
     sender: LoopSender,
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
@@ -32,6 +34,10 @@ pub struct TermSession {
 impl TermSession {
     pub fn spawn(cfg: &SpawnCfg, egui_ctx: egui::Context, theme: Theme) -> anyhow::Result<Self> {
         let pty = pty::spawn(cfg, 0)?;
+        #[cfg(unix)]
+        let child_pid = Some(pty.child().id());
+        #[cfg(not(unix))]
+        let child_pid = None;
 
         let (tx, events) = crossbeam_channel::unbounded();
         let dirty = Arc::new(AtomicBool::new(true));
@@ -70,6 +76,7 @@ impl TermSession {
             term,
             events,
             shared,
+            child_pid,
             sender,
             notifier,
             dirty,

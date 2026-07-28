@@ -1,5 +1,9 @@
-//! The egui terminal widget: allocates the pane, handles keyboard/mouse
-//! input, selection, scrolling and resize, and paints cached meshes.
+//! The egui terminal widget.
+//!
+//! [`RenderShared`] holds resources common to every tab (fonts, glyph atlas,
+//! theme, font size); [`TabView`] holds one tab's view state (mesh cache,
+//! scroll accumulator, focus). A `generation` counter on the shared state
+//! invalidates every tab's cache when fonts/theme change.
 
 use std::sync::Arc;
 
@@ -21,25 +25,21 @@ use crate::render::metrics::{CellMetrics, FontSet};
 use crate::render::theme::Theme;
 use crate::session::TermSession;
 
-pub struct TermView {
+/// Default font size in logical points (`Ctrl+0` resets to this).
+pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+
+/// Render resources shared by all tabs.
+pub struct RenderShared {
     fonts: FontSet,
     atlas: Atlas,
     pub theme: Theme,
     /// Font size in logical points.
     pub font_size: f32,
     metrics: Option<(u32, CellMetrics)>,
-    scroll_accum: f32,
-    cached: Option<CachedFrame>,
-    had_focus: bool,
-    last_motion_cell: Option<(u16, u16)>,
+    generation: u32,
 }
 
-struct CachedFrame {
-    origin_px: Vec2,
-    meshes: Vec<Arc<Mesh>>,
-}
-
-impl TermView {
+impl RenderShared {
     pub fn new(theme: Theme, font_size: f32) -> anyhow::Result<Self> {
         Ok(Self {
             fonts: FontSet::load(None)?,
@@ -47,10 +47,7 @@ impl TermView {
             theme,
             font_size,
             metrics: None,
-            scroll_accum: 0.0,
-            cached: None,
-            had_focus: false,
-            last_motion_cell: None,
+            generation: 0,
         })
     }
 
@@ -71,9 +68,41 @@ impl TermView {
         m
     }
 
-    pub fn show(&mut self, ui: &mut Ui, session: &mut TermSession) -> Response {
+    /// Change the font size; invalidates every tab's cached meshes.
+    pub fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(7.0, 32.0);
+        if size != self.font_size {
+            self.font_size = size;
+            self.metrics = None;
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+}
+
+/// Per-tab view state.
+#[derive(Default)]
+pub struct TabView {
+    scroll_accum: f32,
+    cached: Option<CachedFrame>,
+    had_focus: bool,
+    last_motion_cell: Option<(u16, u16)>,
+}
+
+struct CachedFrame {
+    origin_px: Vec2,
+    generation: u32,
+    meshes: Vec<Arc<Mesh>>,
+}
+
+impl TabView {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        shared: &mut RenderShared,
+        session: &mut TermSession,
+    ) -> Response {
         let ppp = ui.ctx().pixels_per_point();
-        let metrics = self.metrics_for(self.font_size * ppp);
+        let metrics = shared.metrics_for(shared.font_size * ppp);
         let ch_pt = metrics.cell_h as f32 / ppp;
         let cw_pt = metrics.cell_w as f32 / ppp;
 
@@ -98,9 +127,9 @@ impl TermView {
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mouse_reporting = mode.intersects(TermMode::MOUSE_MODE) && !shift_held;
 
-        self.handle_keyboard(ui, session, &response, mode);
+        self.handle_keyboard(ui, shared, session, &response, mode);
         if mouse_reporting {
-            self.handle_mouse_reporting(ui, session, &response, rect, ppp, metrics, mode);
+            self.handle_mouse_reporting(ui, session, rect, ppp, metrics, mode);
         } else {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);
         }
@@ -110,19 +139,23 @@ impl TermView {
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
         let dirty = session.take_dirty();
-        let needs_rebuild =
-            dirty || self.cached.as_ref().is_none_or(|c| c.origin_px != origin_px);
+        let needs_rebuild = dirty
+            || self
+                .cached
+                .as_ref()
+                .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
         if needs_rebuild {
             let snapshot = {
                 let term = session.term.lock();
-                Snapshot::capture(&term, &self.theme)
+                Snapshot::capture(&term, &shared.theme)
             };
+            let metrics = shared.metrics_for(shared.font_size * ppp);
             let mut params = BuildParams {
                 ctx: ui.ctx(),
-                fonts: &self.fonts,
-                atlas: &mut self.atlas,
+                fonts: &shared.fonts,
+                atlas: &mut shared.atlas,
                 metrics,
-                theme: &self.theme,
+                theme: &shared.theme,
                 origin_px,
                 pixels_per_point: ppp,
             };
@@ -131,11 +164,12 @@ impl TermView {
             meshes.push(Arc::new(built.bg));
             meshes.extend(built.glyphs.into_iter().map(Arc::new));
             meshes.push(Arc::new(built.decor));
-            self.cached = Some(CachedFrame { origin_px, meshes });
+            self.cached =
+                Some(CachedFrame { origin_px, generation: shared.generation, meshes });
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, self.theme.bg);
+        painter.rect_filled(rect, 0.0, shared.theme.bg);
         if let Some(cached) = &self.cached {
             for mesh in &cached.meshes {
                 if !mesh.vertices.is_empty() {
@@ -162,6 +196,7 @@ impl TermView {
     fn handle_keyboard(
         &mut self,
         ui: &mut Ui,
+        shared: &mut RenderShared,
         session: &TermSession,
         response: &Response,
         mode: TermMode,
@@ -182,6 +217,8 @@ impl TermView {
         }
         let mut bytes: Vec<u8> = Vec::new();
         let mut copied = false;
+        let mut zoom: i32 = 0;
+        let mut zoom_reset = false;
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
@@ -191,9 +228,21 @@ impl TermView {
                         }
                     }
                     EguiEvent::Key { key, pressed: true, modifiers, .. } => {
-                        // Terminal-standard clipboard chords first.
+                        // Terminal-standard chords first (never reach the shell).
                         if modifiers.ctrl && modifiers.shift && *key == Key::C {
                             copied = true;
+                            continue;
+                        }
+                        if modifiers.ctrl && matches!(key, Key::Plus | Key::Equals) {
+                            zoom += 1;
+                            continue;
+                        }
+                        if modifiers.ctrl && *key == Key::Minus {
+                            zoom -= 1;
+                            continue;
+                        }
+                        if modifiers.ctrl && *key == Key::Num0 {
+                            zoom_reset = true;
                             continue;
                         }
                         if let Some(seq) = input::encode_key(*key, *modifiers, mode) {
@@ -205,6 +254,15 @@ impl TermView {
                 }
             }
         });
+        if zoom != 0 || zoom_reset {
+            let new_size = if zoom_reset {
+                DEFAULT_FONT_SIZE
+            } else {
+                shared.font_size + zoom as f32
+            };
+            shared.set_font_size(new_size);
+            session.mark_dirty();
+        }
         if copied {
             let text = session.term.lock().selection_to_string();
             if let Some(text) = text
@@ -219,12 +277,10 @@ impl TermView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn handle_mouse_reporting(
         &mut self,
         ui: &mut Ui,
         session: &TermSession,
-        _response: &Response,
         rect: Rect,
         ppp: f32,
         m: CellMetrics,
@@ -270,15 +326,9 @@ impl TermView {
                         } else {
                             MouseCode::NoButton
                         };
-                        if let Some(seq) = input::encode_mouse(
-                            code,
-                            col,
-                            line,
-                            true,
-                            true,
-                            i.modifiers,
-                            mode,
-                        ) {
+                        if let Some(seq) =
+                            input::encode_mouse(code, col, line, true, true, i.modifiers, mode)
+                        {
                             out.extend(seq);
                         }
                     }

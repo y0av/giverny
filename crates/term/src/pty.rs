@@ -60,11 +60,17 @@ pub fn build_env(cfg: &SpawnCfg) -> HashMap<String, String> {
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env.insert("TERM_PROGRAM".into(), "giverny".into());
-    env.insert("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into());
+    env.insert(
+        "TERM_PROGRAM_VERSION".into(),
+        env!("CARGO_PKG_VERSION").into(),
+    );
     env.insert("GIVERNY_TAB_ID".into(), cfg.tab_id.clone());
     env.insert("GIVERNY_NONCE".into(), cfg.nonce.clone());
     if let Some(dir) = &cfg.claude_config_dir {
-        env.insert("CLAUDE_CONFIG_DIR".into(), dir.to_string_lossy().into_owned());
+        env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            dir.to_string_lossy().into_owned(),
+        );
     }
     for (k, v) in &cfg.env_extra {
         env.insert(k.clone(), v.clone());
@@ -126,7 +132,12 @@ mod tests {
             tab_id: "tab-1".into(),
             nonce: "n0nce".into(),
             claude_config_dir: Some(PathBuf::from("/home/u/envs/x/claude")),
-            size: GridSize { cols: 80, rows: 24, cell_width: 9, cell_height: 18 },
+            size: GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 18,
+            },
         }
     }
 
@@ -137,7 +148,10 @@ mod tests {
         assert_eq!(env.get("TERM_PROGRAM").unwrap(), "giverny");
         assert_eq!(env.get("GIVERNY_TAB_ID").unwrap(), "tab-1");
         assert_eq!(env.get("GIVERNY_NONCE").unwrap(), "n0nce");
-        assert_eq!(env.get("CLAUDE_CONFIG_DIR").unwrap(), "/home/u/envs/x/claude");
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR").unwrap(),
+            "/home/u/envs/x/claude"
+        );
         assert_eq!(env.get("FOO").unwrap(), "bar");
     }
 

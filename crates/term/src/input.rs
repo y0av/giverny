@@ -29,10 +29,10 @@ pub fn kitty_active(mode: TermMode) -> bool {
 /// Encode a non-text key press. Plain printable keys return `None` (the
 /// paired `Event::Text` carries them); Ctrl/Alt combos and specials encode.
 pub fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
-    if kitty_active(mode) {
-        if let Some(seq) = encode_kitty(key, mods) {
-            return Some(seq);
-        }
+    if kitty_active(mode)
+        && let Some(seq) = encode_kitty(key, mods)
+    {
+        return Some(seq);
     }
     encode_legacy(key, mods, mode)
 }
@@ -306,7 +306,10 @@ mod tests {
         assert_eq!(encode_key(Key::Enter, none(), m).unwrap(), b"\r");
         assert_eq!(encode_key(Key::Backspace, none(), m).unwrap(), b"\x7f");
         assert_eq!(encode_key(Key::ArrowUp, none(), m).unwrap(), b"\x1b[A");
-        assert_eq!(encode_key(Key::Tab, Modifiers::SHIFT, m).unwrap(), b"\x1b[Z");
+        assert_eq!(
+            encode_key(Key::Tab, Modifiers::SHIFT, m).unwrap(),
+            b"\x1b[Z"
+        );
         assert_eq!(encode_key(Key::PageDown, none(), m).unwrap(), b"\x1b[6~");
     }
 
@@ -326,8 +329,15 @@ mod tests {
         let m = TermMode::empty();
         assert_eq!(encode_key(Key::C, Modifiers::CTRL, m).unwrap(), vec![0x03]);
         assert_eq!(encode_key(Key::A, Modifiers::CTRL, m).unwrap(), vec![0x01]);
-        assert_eq!(encode_key(Key::Space, Modifiers::CTRL, m).unwrap(), vec![0x00]);
-        assert_eq!(encode_key(Key::A, none(), m), None, "plain letters come via Text");
+        assert_eq!(
+            encode_key(Key::Space, Modifiers::CTRL, m).unwrap(),
+            vec![0x00]
+        );
+        assert_eq!(
+            encode_key(Key::A, none(), m),
+            None,
+            "plain letters come via Text"
+        );
     }
 
     #[test]

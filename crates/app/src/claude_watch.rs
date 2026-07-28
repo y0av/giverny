@@ -66,11 +66,17 @@ pub struct ClaudeWatch {
 }
 
 fn needs_you(notification_type: &str) -> bool {
-    matches!(notification_type, "permission_prompt" | "elicitation_dialog" | "agent_needs_input")
+    matches!(
+        notification_type,
+        "permission_prompt" | "elicitation_dialog" | "agent_needs_input"
+    )
 }
 
 fn done_kind(notification_type: &str) -> bool {
-    matches!(notification_type, "idle_prompt" | "agent_completed" | "task_completed")
+    matches!(
+        notification_type,
+        "idle_prompt" | "agent_completed" | "task_completed"
+    )
 }
 
 impl ClaudeWatch {
@@ -120,7 +126,11 @@ impl ClaudeWatch {
             }
         }
         self.hooks_installed = Self::check_installed(&self.profiles);
-        if errs.is_empty() { Ok(ok) } else { Err(errs.join("; ")) }
+        if errs.is_empty() {
+            Ok(ok)
+        } else {
+            Err(errs.join("; "))
+        }
     }
 
     pub fn tab_id_of(msg: &RelayMsg) -> Option<TabId> {
@@ -141,7 +151,9 @@ impl ClaudeWatch {
         tab_title: &str,
         effects: &mut WatchEffects,
     ) {
-        let Some(tab_id) = Self::tab_id_of(msg) else { return };
+        let Some(tab_id) = Self::tab_id_of(msg) else {
+            return;
+        };
         let account = self.account_of(msg.config_dir.as_deref().map(Path::new));
         let entry = self.tabs.entry(tab_id).or_default();
         entry.last_hook = Some(Instant::now());
@@ -162,8 +174,11 @@ impl ClaudeWatch {
             }
             Some("UserPromptSubmit") => entry.state = ClaudeState::Busy,
             Some("Stop") => {
-                entry.state =
-                    if is_active { ClaudeState::Idle } else { ClaudeState::DoneUnseen };
+                entry.state = if is_active {
+                    ClaudeState::Idle
+                } else {
+                    ClaudeState::DoneUnseen
+                };
             }
             Some("Notification") => {
                 if let Some(kind) = msg.notification_type() {
@@ -171,11 +186,16 @@ impl ClaudeWatch {
                         entry.state = ClaudeState::NeedsYou;
                         effects.notify.push((
                             format!("{tab_title} — needs you"),
-                            msg.message().unwrap_or("Claude is waiting for input").to_string(),
+                            msg.message()
+                                .unwrap_or("Claude is waiting for input")
+                                .to_string(),
                         ));
                     } else if done_kind(kind) {
-                        entry.state =
-                            if is_active { ClaudeState::Idle } else { ClaudeState::DoneUnseen };
+                        entry.state = if is_active {
+                            ClaudeState::Idle
+                        } else {
+                            ClaudeState::DoneUnseen
+                        };
                     }
                 }
             }
@@ -218,8 +238,7 @@ impl ClaudeWatch {
             for tab in self.tabs.values_mut() {
                 tab.seen_in_scan = false;
             }
-            let dirs: Vec<PathBuf> =
-                self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+            let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
             for live in registry::scan(dirs) {
                 let Some(tab_id) = shell_pids
                     .iter()
@@ -245,19 +264,20 @@ impl ClaudeWatch {
                     }
                     ClaudeState::DoneUnseen => {}
                     _ => {
-                        entry.state =
-                            if live.entry.busy() { ClaudeState::Busy } else { ClaudeState::Idle };
+                        entry.state = if live.entry.busy() {
+                            ClaudeState::Busy
+                        } else {
+                            ClaudeState::Idle
+                        };
                     }
                 }
             }
             // Sessions gone from the registry: clear unless hooks spoke recently.
             for tab in self.tabs.values_mut() {
-                let hook_recent =
-                    tab.last_hook.is_some_and(|t| t.elapsed() < Duration::from_secs(5));
-                if !tab.seen_in_scan
-                    && !hook_recent
-                    && tab.state != ClaudeState::DoneUnseen
-                {
+                let hook_recent = tab
+                    .last_hook
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(5));
+                if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
                     tab.state = ClaudeState::None;
                     tab.session_name = None;
                 }
@@ -280,7 +300,10 @@ impl ClaudeWatch {
         self.accounts = self
             .profiles
             .iter()
-            .map(|p| AccountPanel { profile: p.clone(), usage: usage::read(&p.config_dir) })
+            .map(|p| AccountPanel {
+                profile: p.clone(),
+                usage: usage::read(&p.config_dir),
+            })
             .collect();
     }
 

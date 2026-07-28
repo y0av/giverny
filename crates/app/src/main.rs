@@ -55,7 +55,11 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    eframe::run_native("Giverny", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native(
+        "Giverny",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +70,10 @@ pub enum RenameTarget {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    NewTab { category: CategoryId, cwd: Option<PathBuf> },
+    NewTab {
+        category: CategoryId,
+        cwd: Option<PathBuf>,
+    },
     NewCategory,
     CloseTab(TabId),
     Select(TabId),
@@ -126,7 +133,9 @@ impl App {
             claude_watch::ClaudeWatch::new(&paths.hook_spool(), move || wake_ctx.request_repaint());
         // Events spooled while the app was closed: keep session captures.
         for msg in &spooled {
-            let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else { continue };
+            let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else {
+                continue;
+            };
             match msg.hook_event() {
                 Some("SessionStart") => {
                     if let Some(tab) = ws.tab_mut(id) {
@@ -161,7 +170,13 @@ impl App {
         };
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
-            app.apply(&cc.egui_ctx, Action::NewTab { category: cat, cwd: None });
+            app.apply(
+                &cc.egui_ctx,
+                Action::NewTab {
+                    category: cat,
+                    cwd: None,
+                },
+            );
         }
         // Sessions for restored tabs spawn lazily on first focus; the state
         // file is rewritten now with clean_shutdown=false (crash marker).
@@ -235,12 +250,16 @@ impl App {
             }
             Action::StartRename(target) => {
                 let current = match &target {
-                    RenameTarget::Tab(id) => {
-                        self.ws.tab(*id).map(|t| t.title().to_string()).unwrap_or_default()
-                    }
-                    RenameTarget::Category(id) => {
-                        self.ws.category(*id).map(|c| c.name.clone()).unwrap_or_default()
-                    }
+                    RenameTarget::Tab(id) => self
+                        .ws
+                        .tab(*id)
+                        .map(|t| t.title().to_string())
+                        .unwrap_or_default(),
+                    RenameTarget::Category(id) => self
+                        .ws
+                        .category(*id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default(),
                 };
                 self.rename = Some((target, current));
                 self.rename_needs_focus = true;
@@ -313,10 +332,19 @@ impl App {
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
             claude_config_dir: profile_dir,
-            size: GridSize { cols: 120, rows: 30, cell_width: 9, cell_height: 18 },
+            size: GridSize {
+                cols: 120,
+                rows: 30,
+                cell_width: 9,
+                cell_height: 18,
+            },
         };
-        match TermSession::spawn(&cfg, ctx.clone(), self.shared.theme.clone(), preseed.as_deref())
-        {
+        match TermSession::spawn(
+            &cfg,
+            ctx.clone(),
+            self.shared.theme.clone(),
+            preseed.as_deref(),
+        ) {
             Ok(session) => {
                 self.ws.tab_mut(id).unwrap().exited = false;
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
@@ -380,8 +408,14 @@ impl App {
 
     /// Refresh cwd (via /proc) and git branch for one tab.
     fn refresh_tab_info(&mut self, id: TabId) {
-        let pid = self.rt.get(&id).and_then(|rt| rt.session.as_ref()).and_then(|s| s.child_pid);
-        let Some(tab) = self.ws.tab_mut(id) else { return };
+        let pid = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .and_then(|s| s.child_pid);
+        let Some(tab) = self.ws.tab_mut(id) else {
+            return;
+        };
         #[cfg(target_os = "linux")]
         if let Some(pid) = pid
             && let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
@@ -410,12 +444,18 @@ impl App {
     /// against a second live resume of the same session.
     fn queue_resume(&mut self, id: TabId) {
         let Some(tab) = self.ws.tab(id) else { return };
-        let Some(sid) = tab.claude_session.clone() else { return };
+        let Some(sid) = tab.claude_session.clone() else {
+            return;
+        };
         if !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return;
         }
-        let dirs: Vec<std::path::PathBuf> =
-            self.claude.profiles.iter().map(|p| p.config_dir.clone()).collect();
+        let dirs: Vec<std::path::PathBuf> = self
+            .claude
+            .profiles
+            .iter()
+            .map(|p| p.config_dir.clone())
+            .collect();
         if giverny_claude::registry::session_is_live(dirs, &sid) {
             tracing::info!("claude session {sid} already live elsewhere — not resuming");
             return;
@@ -456,11 +496,16 @@ impl App {
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
-                && let Some(cat) = self.ws.active_tab().map(|t| t.category).or_else(|| {
-                    self.ws.categories.first().map(|c| c.id)
-                })
+                && let Some(cat) = self
+                    .ws
+                    .active_tab()
+                    .map(|t| t.category)
+                    .or_else(|| self.ws.categories.first().map(|c| c.id))
             {
-                actions.push(Action::NewTab { category: cat, cwd: None });
+                actions.push(Action::NewTab {
+                    category: cat,
+                    cwd: None,
+                });
             }
             if i.consume_key(cs, Key::W)
                 && let Some(id) = self.ws.active
@@ -495,10 +540,19 @@ impl eframe::App for App {
         let shell_pids: HashMap<TabId, u32> = self
             .rt
             .iter()
-            .filter_map(|(&id, rt)| rt.session.as_ref().and_then(|s| s.child_pid).map(|p| (id, p)))
+            .filter_map(|(&id, rt)| {
+                rt.session
+                    .as_ref()
+                    .and_then(|s| s.child_pid)
+                    .map(|p| (id, p))
+            })
             .collect();
-        let titles: HashMap<TabId, String> =
-            self.ws.tabs.iter().map(|t| (t.id, t.title().to_string())).collect();
+        let titles: HashMap<TabId, String> = self
+            .ws
+            .tabs
+            .iter()
+            .map(|t| (t.id, t.title().to_string()))
+            .collect();
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
@@ -566,9 +620,7 @@ impl eframe::App for App {
 
             // Lazy restore: a tab from a previous run spawns its shell on
             // first focus, pre-seeded with its saved scrollback.
-            if !self.rt.contains_key(&active)
-                && !self.ws.tab(active).is_some_and(|t| t.exited)
-            {
+            if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
                 let preseed = state::load_snapshot(&self.paths, active);
                 self.spawn_session(&ctx, active, preseed);
                 // The tab had a live Claude conversation — resume it.

@@ -52,16 +52,25 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
     let mut out = Vec::new();
     for dir in config_dirs {
         let sessions = dir.join("sessions");
-        let Ok(entries) = std::fs::read_dir(&sessions) else { continue };
+        let Ok(entries) = std::fs::read_dir(&sessions) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(entry) = serde_json::from_slice::<SessionEntry>(&bytes) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<SessionEntry>(&bytes) else {
+                continue;
+            };
             if pid_alive(entry.pid) {
-                out.push(LiveSession { entry, config_dir: dir.clone() });
+                out.push(LiveSession {
+                    entry,
+                    config_dir: dir.clone(),
+                });
             }
         }
     }
@@ -71,7 +80,9 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
 /// Is this claude session currently live in ANY of the given config dirs?
 /// (Resuming it twice would interleave two writers into one transcript.)
 pub fn session_is_live(config_dirs: impl IntoIterator<Item = PathBuf>, session_id: &str) -> bool {
-    scan(config_dirs).iter().any(|s| s.entry.session_id == session_id)
+    scan(config_dirs)
+        .iter()
+        .any(|s| s.entry.session_id == session_id)
 }
 
 /// Walk `/proc/<pid>/stat` parent links; true when `ancestor` is in the chain.
@@ -85,13 +96,19 @@ pub fn has_ancestor(mut pid: u32, ancestor: u32) -> bool {
         if pid <= 1 {
             return false;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
         // Field 4 (ppid) comes after the parenthesized comm, which may itself
         // contain spaces/parens — split after the LAST ')'.
-        let Some((_, rest)) = stat.rsplit_once(')') else { return false };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
         let mut fields = rest.split_whitespace();
         let _state = fields.next();
-        let Some(ppid) = fields.next().and_then(|p| p.parse::<u32>().ok()) else { return false };
+        let Some(ppid) = fields.next().and_then(|p| p.parse::<u32>().ok()) else {
+            return false;
+        };
         pid = ppid;
     }
     false

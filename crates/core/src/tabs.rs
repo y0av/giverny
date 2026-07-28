@@ -76,7 +76,12 @@ pub struct Workspace {
 
 impl Default for Workspace {
     fn default() -> Self {
-        let mut ws = Workspace { next_id: 1, categories: Vec::new(), tabs: Vec::new(), active: None };
+        let mut ws = Workspace {
+            next_id: 1,
+            categories: Vec::new(),
+            tabs: Vec::new(),
+            active: None,
+        };
         ws.add_category("main");
         ws
     }
@@ -108,7 +113,9 @@ impl Workspace {
         if self.categories.len() <= 1 {
             return false;
         }
-        let Some(pos) = self.categories.iter().position(|c| c.id == id) else { return false };
+        let Some(pos) = self.categories.iter().position(|c| c.id == id) else {
+            return false;
+        };
         self.categories.remove(pos);
         let fallback = self.categories[0].id;
         for tab in &mut self.tabs {
@@ -157,7 +164,9 @@ impl Workspace {
     /// Close a tab; picks a sensible new active tab (next in rail order,
     /// else previous, else none).
     pub fn close_tab(&mut self, id: TabId) {
-        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
         self.tabs.remove(pos);
         if self.active == Some(id) {
             self.active = self
@@ -208,7 +217,9 @@ impl Workspace {
         if self.category(category).is_none() {
             return;
         }
-        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
         let mut tab = self.tabs.remove(pos);
         tab.category = category;
         let insert_at = self

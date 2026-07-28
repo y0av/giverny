@@ -30,7 +30,10 @@ impl EventListener for ReplyCapture {
 #[test]
 fn probe_replies_are_byte_exact() {
     let capture = ReplyCapture::default();
-    let config = Config { kitty_keyboard: true, ..Config::default() };
+    let config = Config {
+        kitty_keyboard: true,
+        ..Config::default()
+    };
     let mut term = Term::new(config, &TermSize::new(80, 24), capture.clone());
     let mut parser: Processor = Processor::new();
 
@@ -46,7 +49,11 @@ fn probe_replies_are_byte_exact() {
     // DA2 (ESC [ > c) — secondary device attributes: ends in 'c'.
     let da2 = probe(b"\x1b[>0c");
     assert_eq!(da2.len(), 1, "DA2 must reply, got {da2:?}");
-    assert!(da2[0].starts_with("\x1b[>") && da2[0].ends_with('c'), "DA2 shape: {:?}", da2[0]);
+    assert!(
+        da2[0].starts_with("\x1b[>") && da2[0].ends_with('c'),
+        "DA2 shape: {:?}",
+        da2[0]
+    );
 
     // CPR (ESC [ 6 n) — cursor position report, 1-based.
     let cpr = probe(b"\x1b[6n");
@@ -54,7 +61,11 @@ fn probe_replies_are_byte_exact() {
 
     // Kitty keyboard flags query (ESC [ ? u).
     let kitty = probe(b"\x1b[?u");
-    assert_eq!(kitty.len(), 1, "kitty flags query must reply (kitty_keyboard on)");
+    assert_eq!(
+        kitty.len(),
+        1,
+        "kitty flags query must reply (kitty_keyboard on)"
+    );
     assert!(
         kitty[0].starts_with("\x1b[?") && kitty[0].ends_with('u'),
         "kitty reply shape: {:?}",
@@ -67,7 +78,10 @@ fn probe_replies_are_byte_exact() {
     // Encode that contract: silent mid-batch, flushed reply on close.
     probe(b"\x1b[?2026h");
     let mid = probe(b"\x1b[c");
-    assert!(mid.is_empty(), "replies buffer during a sync batch, got {mid:?}");
+    assert!(
+        mid.is_empty(),
+        "replies buffer during a sync batch, got {mid:?}"
+    );
     let flushed = probe(b"\x1b[?2026l");
     assert_eq!(
         flushed,
@@ -76,7 +90,11 @@ fn probe_replies_are_byte_exact() {
     );
 }
 
-fn headless_session(script_shell: Option<(String, Vec<String>)>, cwd: PathBuf, config_dir: Option<PathBuf>) -> TermSession {
+fn headless_session(
+    script_shell: Option<(String, Vec<String>)>,
+    cwd: PathBuf,
+    config_dir: Option<PathBuf>,
+) -> TermSession {
     headless_session_preseeded(script_shell, cwd, config_dir, None)
 }
 
@@ -93,7 +111,12 @@ fn headless_session_preseeded(
         tab_id: "test-tab".into(),
         nonce: "test-nonce".into(),
         claude_config_dir: config_dir,
-        size: GridSize { cols: 100, rows: 30, cell_width: 8, cell_height: 16 },
+        size: GridSize {
+            cols: 100,
+            rows: 30,
+            cell_width: 8,
+            cell_height: 16,
+        },
     };
     TermSession::spawn(&cfg, egui::Context::default(), Theme::monet_dark(), preseed)
         .expect("session spawns")
@@ -115,7 +138,13 @@ fn wait_for<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
 #[test]
 fn flood_keeps_lock_responsive() {
     let session = headless_session(
-        Some(("/bin/sh".into(), vec!["-c".into(), "yes 0123456789abcdef | head -c 20000000".into()])),
+        Some((
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "yes 0123456789abcdef | head -c 20000000".into(),
+            ],
+        )),
         std::env::temp_dir(),
         None,
     );
@@ -166,7 +195,10 @@ fn scrollback_survives_restart_via_preseed() {
     let a = headless_session(
         Some((
             "/bin/sh".into(),
-            vec!["-c".into(), r"printf '\033[31mpoppy\033[0m plain \033[1mbold\033[0m\r\n'".into()],
+            vec![
+                "-c".into(),
+                r"printf '\033[31mpoppy\033[0m plain \033[1mbold\033[0m\r\n'".into(),
+            ],
         )),
         std::env::temp_dir(),
         None,
@@ -174,21 +206,34 @@ fn scrollback_survives_restart_via_preseed() {
     drain_until_done(&a);
     let dump = a.snapshot_ansi(1000).expect("snapshot from session A");
     assert!(dump.contains("poppy"), "dump has text: {dump:?}");
-    assert!(dump.contains("\x1b[0;1"), "dump re-emits bold SGR: {dump:?}");
+    assert!(
+        dump.contains("\x1b[0;1"),
+        "dump re-emits bold SGR: {dump:?}"
+    );
     a.shutdown();
 
     let b = headless_session_preseeded(
-        Some(("/bin/sh".into(), vec!["-c".into(), "printf 'fresh-prompt'".into()])),
+        Some((
+            "/bin/sh".into(),
+            vec!["-c".into(), "printf 'fresh-prompt'".into()],
+        )),
         std::env::temp_dir(),
         None,
         Some(&dump),
     );
     drain_until_done(&b);
     let screen = b.screen_text();
-    let old = screen.find("poppy plain bold").expect("restored content on screen");
+    let old = screen
+        .find("poppy plain bold")
+        .expect("restored content on screen");
     let divider = screen.find("── restored ──").expect("divider on screen");
-    let fresh = screen.find("fresh-prompt").expect("fresh shell output on screen");
-    assert!(old < divider && divider < fresh, "order: restored < divider < fresh\n{screen}");
+    let fresh = screen
+        .find("fresh-prompt")
+        .expect("fresh shell output on screen");
+    assert!(
+        old < divider && divider < fresh,
+        "order: restored < divider < fresh\n{screen}"
+    );
     b.shutdown();
 }
 
@@ -214,7 +259,8 @@ fn claude_tui_renders_in_session() {
         return;
     };
 
-    let scratch = std::env::temp_dir().join(format!("giverny-claude-accept-{}", std::process::id()));
+    let scratch =
+        std::env::temp_dir().join(format!("giverny-claude-accept-{}", std::process::id()));
     let config_dir = scratch.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
 
@@ -235,7 +281,10 @@ fn claude_tui_renders_in_session() {
 
     // A real TUI got composed: several non-empty rows.
     let rows = final_text.lines().filter(|l| !l.trim().is_empty()).count();
-    assert!(rows >= 3, "expected a composed TUI, got {rows} non-empty rows:\n{final_text}");
+    assert!(
+        rows >= 3,
+        "expected a composed TUI, got {rows} non-empty rows:\n{final_text}"
+    );
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&scratch);

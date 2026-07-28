@@ -61,7 +61,10 @@ impl Snapshot {
                 continue;
             }
             let cell = &*indexed;
-            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
                 continue;
             }
 
@@ -74,7 +77,11 @@ impl Snapshot {
                 fg = dim(fg);
             }
             let selected = selection.is_some_and(|s| s.contains(point));
-            let mut bg_opt = if bg == theme.bg && !selected { None } else { Some(bg) };
+            let mut bg_opt = if bg == theme.bg && !selected {
+                None
+            } else {
+                Some(bg)
+            };
             if selected {
                 let s = theme.selection_bg;
                 let base = bg_opt.unwrap_or(theme.bg);
@@ -82,7 +89,12 @@ impl Snapshot {
             }
 
             let blank_char = cell.c == ' ' || cell.flags.contains(Flags::HIDDEN);
-            if blank_char && bg_opt.is_none() && !cell.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+            if blank_char
+                && bg_opt.is_none()
+                && !cell
+                    .flags
+                    .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            {
                 continue;
             }
 
@@ -153,7 +165,12 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
         let y = p.origin_px.y + line as f32 * ch;
         Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw, ch))
     };
-    let to_points = |r: Rect| Rect::from_min_max((r.min.to_vec2() / ppp).to_pos2(), (r.max.to_vec2() / ppp).to_pos2());
+    let to_points = |r: Rect| {
+        Rect::from_min_max(
+            (r.min.to_vec2() / ppp).to_pos2(),
+            (r.max.to_vec2() / ppp).to_pos2(),
+        )
+    };
 
     // Cursor block backdrop paints first so glyphs draw over it.
     let cursor_block = snapshot.cursor.filter(|(.., s)| *s == CursorShape::Block);
@@ -175,7 +192,11 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
             push_solid(&mut bg, to_points(r), bgc);
         }
 
-        let fg = if under_cursor { p.theme.cursor_text } else { cell.fg };
+        let fg = if under_cursor {
+            p.theme.cursor_text
+        } else {
+            cell.fg
+        };
 
         // Glyph.
         if cell.c != ' ' {
@@ -258,33 +279,61 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
         }
     }
 
-    TermMeshes { bg, glyphs: glyph_meshes, decor }
+    TermMeshes {
+        bg,
+        glyphs: glyph_meshes,
+        decor,
+    }
 }
 
 fn mesh_for(meshes: &mut Vec<Mesh>, tex: TextureId) -> &mut Mesh {
     if let Some(i) = meshes.iter().position(|m| m.texture_id == tex) {
         &mut meshes[i]
     } else {
-        let mut m = Mesh::default();
-        m.texture_id = tex;
-        meshes.push(m);
+        meshes.push(Mesh {
+            texture_id: tex,
+            ..Default::default()
+        });
         meshes.last_mut().unwrap()
     }
 }
 
 fn push_solid(mesh: &mut Mesh, rect: Rect, color: Color32) {
-    push_uv(mesh, rect, Vec2::new(WHITE_UV.x, WHITE_UV.y), Vec2::new(WHITE_UV.x, WHITE_UV.y), color);
+    push_uv(
+        mesh,
+        rect,
+        Vec2::new(WHITE_UV.x, WHITE_UV.y),
+        Vec2::new(WHITE_UV.x, WHITE_UV.y),
+        color,
+    );
 }
 
 fn push_uv(mesh: &mut Mesh, rect: Rect, uv_min: Vec2, uv_max: Vec2, color: Color32) {
     let idx = mesh.vertices.len() as u32;
     mesh.vertices.extend_from_slice(&[
-        Vertex { pos: rect.left_top(), uv: Pos2::new(uv_min.x, uv_min.y), color },
-        Vertex { pos: rect.right_top(), uv: Pos2::new(uv_max.x, uv_min.y), color },
-        Vertex { pos: rect.right_bottom(), uv: Pos2::new(uv_max.x, uv_max.y), color },
-        Vertex { pos: rect.left_bottom(), uv: Pos2::new(uv_min.x, uv_max.y), color },
+        Vertex {
+            pos: rect.left_top(),
+            uv: Pos2::new(uv_min.x, uv_min.y),
+            color,
+        },
+        Vertex {
+            pos: rect.right_top(),
+            uv: Pos2::new(uv_max.x, uv_min.y),
+            color,
+        },
+        Vertex {
+            pos: rect.right_bottom(),
+            uv: Pos2::new(uv_max.x, uv_max.y),
+            color,
+        },
+        Vertex {
+            pos: rect.left_bottom(),
+            uv: Pos2::new(uv_min.x, uv_max.y),
+            color,
+        },
     ]);
-    mesh.indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 3]);
+    mesh.indices
+        .extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 3]);
 }
 
 fn blend(base: Color32, over: Color32) -> Color32 {
@@ -369,9 +418,18 @@ mod tests {
 
         assert!(!meshes.glyphs.is_empty(), "glyph mesh expected");
         let glyph_quads: usize = meshes.glyphs.iter().map(|m| m.vertices.len() / 4).sum();
-        assert!(glyph_quads >= 10, "hello_under = 11 glyphs, got {glyph_quads}");
-        assert!(!meshes.decor.vertices.is_empty(), "underline decor expected");
-        assert!(!meshes.bg.vertices.is_empty(), "cursor block expected in bg");
+        assert!(
+            glyph_quads >= 10,
+            "hello_under = 11 glyphs, got {glyph_quads}"
+        );
+        assert!(
+            !meshes.decor.vertices.is_empty(),
+            "underline decor expected"
+        );
+        assert!(
+            !meshes.bg.vertices.is_empty(),
+            "cursor block expected in bg"
+        );
     }
 
     #[test]
@@ -383,7 +441,13 @@ mod tests {
         assert_eq!(snap.display_offset, 3);
         // Topmost visible line should now be "l1" (8 lines, 5 visible, offset 3).
         let top: Vec<&SnapCell> = snap.cells.iter().filter(|c| c.line == 0).collect();
-        assert!(top.iter().any(|c| c.c == 'l'), "top row has scrollback text");
-        assert!(top.iter().any(|c| c.c == '1'), "expected l1 at top, cells: {top:?}");
+        assert!(
+            top.iter().any(|c| c.c == 'l'),
+            "top row has scrollback text"
+        );
+        assert!(
+            top.iter().any(|c| c.c == '1'),
+            "expected l1 at top, cells: {top:?}"
+        );
     }
 }

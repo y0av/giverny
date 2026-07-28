@@ -75,7 +75,11 @@ impl LimitEntry {
     }
 
     pub fn effective_percent(&self, now: jiff::Timestamp) -> f64 {
-        if self.rolled_over(now) { 0.0 } else { self.percent.clamp(0.0, 100.0) }
+        if self.rolled_over(now) {
+            0.0
+        } else {
+            self.percent.clamp(0.0, 100.0)
+        }
     }
 
     pub fn critical(&self) -> bool {
@@ -126,7 +130,10 @@ pub fn read(config_dir: &Path) -> Option<AccountUsage> {
     let parsed: CacheFile = serde_json::from_slice(&bytes).ok()?;
     let cached = parsed.cached?;
     let limits = cached.utilization.map(|u| u.limits).unwrap_or_default();
-    Some(AccountUsage { fetched_at_ms: cached.fetched_at_ms, limits })
+    Some(AccountUsage {
+        fetched_at_ms: cached.fetched_at_ms,
+        limits,
+    })
 }
 
 /// Cache age in minutes given the current wall clock.
@@ -186,7 +193,11 @@ mod tests {
         let u = fixture_usage();
         // "now" after the 5h reset but before the weekly reset.
         let now: jiff::Timestamp = "2026-07-28T19:00:00+00:00".parse().unwrap();
-        assert_eq!(u.limits[0].effective_percent(now), 0.0, "lapsed 5h window → 0%");
+        assert_eq!(
+            u.limits[0].effective_percent(now),
+            0.0,
+            "lapsed 5h window → 0%"
+        );
         assert_eq!(u.limits[1].effective_percent(now), 15.0);
         let cd = u.limits[1].reset_countdown(now).unwrap();
         assert!(cd.ends_with('h'), "countdown in days+hours: {cd}");

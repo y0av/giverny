@@ -211,8 +211,14 @@ impl vte::Perform for TeePerform {
             b"777" => {
                 // 777;notify;title;body
                 if params.get(1).copied() == Some(b"notify") {
-                    let title = params.get(2).map(|t| clean_text(t, NOTIFY_CAP)).unwrap_or_default();
-                    let body = params.get(3).map(|b| clean_text(b, NOTIFY_CAP)).unwrap_or_default();
+                    let title = params
+                        .get(2)
+                        .map(|t| clean_text(t, NOTIFY_CAP))
+                        .unwrap_or_default();
+                    let body = params
+                        .get(3)
+                        .map(|b| clean_text(b, NOTIFY_CAP))
+                        .unwrap_or_default();
                     self.events.push(TeeEvent::Notify { title, body });
                 }
             }
@@ -284,14 +290,20 @@ mod tests {
     fn split_across_chunks() {
         let mut t = tee();
         // Escape sequence split into 4 chunks, including mid-"file://".
-        let ev = collect(&mut t, &[b"hello \x1b]7;fi", b"le://", b"myhost/x", b"\x07 tail"]);
+        let ev = collect(
+            &mut t,
+            &[b"hello \x1b]7;fi", b"le://", b"myhost/x", b"\x07 tail"],
+        );
         assert_eq!(ev, vec![TeeEvent::CwdChanged(PathBuf::from("/x"))]);
     }
 
     #[test]
     fn prompt_marks() {
         let mut t = tee();
-        let ev = collect(&mut t, &[b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07"]);
+        let ev = collect(
+            &mut t,
+            &[b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07"],
+        );
         assert_eq!(
             ev,
             vec![
@@ -323,12 +335,21 @@ mod tests {
     #[test]
     fn notifications() {
         let mut t = tee();
-        let ev = collect(&mut t, &[b"\x1b]9;done!\x07\x1b]777;notify;Build;finished ok\x1b\\"]);
+        let ev = collect(
+            &mut t,
+            &[b"\x1b]9;done!\x07\x1b]777;notify;Build;finished ok\x1b\\"],
+        );
         assert_eq!(
             ev,
             vec![
-                TeeEvent::Notify { title: String::new(), body: "done!".into() },
-                TeeEvent::Notify { title: "Build".into(), body: "finished ok".into() },
+                TeeEvent::Notify {
+                    title: String::new(),
+                    body: "done!".into()
+                },
+                TeeEvent::Notify {
+                    title: "Build".into(),
+                    body: "finished ok".into()
+                },
             ]
         );
     }
@@ -337,14 +358,23 @@ mod tests {
     fn notify_strips_controls_and_caps() {
         let mut t = tee();
         let ev = collect(&mut t, &[b"\x1b]9;a\rb\x07"]);
-        assert_eq!(ev, vec![TeeEvent::Notify { title: String::new(), body: "ab".into() }]);
+        assert_eq!(
+            ev,
+            vec![TeeEvent::Notify {
+                title: String::new(),
+                body: "ab".into()
+            }]
+        );
     }
 
     #[test]
     fn alt_screen_toggle() {
         let mut t = tee();
         let ev = collect(&mut t, &[b"\x1b[?1049h vim vim \x1b[?1049l"]);
-        assert_eq!(ev, vec![TeeEvent::AltScreen(true), TeeEvent::AltScreen(false)]);
+        assert_eq!(
+            ev,
+            vec![TeeEvent::AltScreen(true), TeeEvent::AltScreen(false)]
+        );
     }
 
     #[test]

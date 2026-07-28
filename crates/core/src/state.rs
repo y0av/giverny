@@ -37,7 +37,9 @@ impl Paths {
     pub fn default_dirs() -> Self {
         let base = dirs::config_dir()
             .unwrap_or_else(|| {
-                dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".config")
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".config")
             })
             .join("giverny");
         Paths { base }
@@ -53,7 +55,10 @@ impl Paths {
     }
 
     pub fn snapshot_file(&self, tab: TabId) -> PathBuf {
-        self.base.join("state").join("snapshots").join(format!("{}.ansi", tab.0))
+        self.base
+            .join("state")
+            .join("snapshots")
+            .join(format!("{}.ansi", tab.0))
     }
 
     /// Hook events spooled while the app is closed (drained at launch).
@@ -70,7 +75,9 @@ pub fn boot_id() -> String {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let dir = path.parent().ok_or_else(|| anyhow::anyhow!("no parent dir"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent dir"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
@@ -96,8 +103,15 @@ pub fn load(paths: &Paths) -> Option<SaveState> {
     match serde_json::from_slice::<SaveState>(&bytes) {
         Ok(state) if state.version <= STATE_VERSION => Some(state),
         Ok(state) => {
-            tracing::warn!("state version {} is newer than {}", state.version, STATE_VERSION);
-            let _ = std::fs::rename(&path, path.with_extension(format!("v{}.bak", state.version)));
+            tracing::warn!(
+                "state version {} is newer than {}",
+                state.version,
+                STATE_VERSION
+            );
+            let _ = std::fs::rename(
+                &path,
+                path.with_extension(format!("v{}.bak", state.version)),
+            );
             None
         }
         Err(err) => {
@@ -118,7 +132,9 @@ pub fn load_snapshot(paths: &Paths, tab: TabId) -> Option<String> {
     if meta.len() > SNAPSHOT_READ_CAP {
         return None;
     }
-    std::fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
+    std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 pub fn remove_snapshot(paths: &Paths, tab: TabId) {
@@ -130,8 +146,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> Paths {
-        let dir =
-            std::env::temp_dir().join(format!("giverny-state-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("giverny-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Paths::at(dir)
     }
@@ -172,7 +187,10 @@ mod tests {
         let paths = scratch("snapshot");
         let tab = TabId(7);
         save_snapshot(&paths, tab, "\x1b[31mhello\x1b[0m\r\n").unwrap();
-        assert_eq!(load_snapshot(&paths, tab).unwrap(), "\x1b[31mhello\x1b[0m\r\n");
+        assert_eq!(
+            load_snapshot(&paths, tab).unwrap(),
+            "\x1b[31mhello\x1b[0m\r\n"
+        );
         remove_snapshot(&paths, tab);
         assert!(load_snapshot(&paths, tab).is_none());
     }

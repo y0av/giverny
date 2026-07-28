@@ -87,7 +87,12 @@ impl FontSet {
         families.push(Family::Monospace);
 
         let query = |weight: Weight, style: Style, fams: &[Family<'_>]| {
-            db.query(&Query { families: fams, weight, stretch: Stretch::Normal, style })
+            db.query(&Query {
+                families: fams,
+                weight,
+                stretch: Stretch::Normal,
+                style,
+            })
         };
 
         let regular_id = query(Weight::NORMAL, Style::Normal, &families)
@@ -117,7 +122,13 @@ impl FontSet {
             }
         }
 
-        Ok(FontSet { fonts, bold, italic, bold_italic, charmap_cache: RefCell::new(HashMap::new()) })
+        Ok(FontSet {
+            fonts,
+            bold,
+            italic,
+            bold_italic,
+            charmap_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn font(&self, slot: u16) -> &LoadedFont {
@@ -173,9 +184,7 @@ impl FontSet {
         if italic {
             synth |= SYNTH_ITALIC;
         }
-        for slot in std::iter::once(0u16)
-            .chain((0..self.fonts.len() as u16).filter(|s| *s != 0))
-        {
+        for slot in std::iter::once(0u16).chain((0..self.fonts.len() as u16).filter(|s| *s != 0)) {
             let glyph = self.glyph_in(slot, ch);
             if glyph != 0 {
                 return Some(Resolved { slot, glyph, synth });
@@ -195,7 +204,11 @@ fn push_face(
         return None;
     }
     let face = db.face(id)?;
-    let family = face.families.first().map(|(n, _)| n.clone()).unwrap_or_default();
+    let family = face
+        .families
+        .first()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default();
     let font = load_face(db, id, family)?;
     fonts.push(font);
     Some((fonts.len() - 1) as u16)
@@ -210,7 +223,11 @@ fn load_face(db: &Database, id: fontdb::ID, family: String) -> Option<LoadedFont
     };
     // Validate the face parses before accepting it.
     FontRef::from_index(&data, index as usize)?;
-    Some(LoadedFont { family, data, index })
+    Some(LoadedFont {
+        family,
+        data,
+        index,
+    })
 }
 
 /// Integer physical-pixel cell geometry for a font at a pixel size.
@@ -229,11 +246,20 @@ impl CellMetrics {
         let m = font.metrics(&[]).scale(px);
         let gm = font.glyph_metrics(&[]).scale(px);
         let reference = font.charmap().map('M');
-        let advance = if reference != 0 { gm.advance_width(reference) } else { px * 0.6 };
+        let advance = if reference != 0 {
+            gm.advance_width(reference)
+        } else {
+            px * 0.6
+        };
         let cell_w = advance.round().max(1.0) as u32;
         let cell_h = (m.ascent + m.descent + m.leading).ceil().max(1.0) as u32;
         let baseline = (m.ascent + m.leading / 2.0).round().min(cell_h as f32) as u32;
-        CellMetrics { cell_w, cell_h, baseline, ppem: px }
+        CellMetrics {
+            cell_w,
+            cell_h,
+            baseline,
+            ppem: px,
+        }
     }
 }
 
@@ -272,7 +298,11 @@ mod tests {
         let r = s.resolve('B', true, false).expect("bold B must resolve");
         assert_ne!(r.glyph, 0);
         if r.slot == 0 {
-            assert_eq!(r.synth & SYNTH_BOLD, SYNTH_BOLD, "regular face ⇒ synthetic bold");
+            assert_eq!(
+                r.synth & SYNTH_BOLD,
+                SYNTH_BOLD,
+                "regular face ⇒ synthetic bold"
+            );
         }
     }
 

@@ -145,7 +145,10 @@ where
     }
 
     pub fn channel(&self) -> LoopSender {
-        LoopSender { sender: self.tx.clone(), poller: self.poll.clone() }
+        LoopSender {
+            sender: self.tx.clone(),
+            poller: self.poll.clone(),
+        }
     }
 
     /// Drain the channel; `false` when a shutdown message was received.
@@ -179,7 +182,7 @@ where
                     // terminal state advances and independent of locking.
                     self.tee.observe(&buf[unprocessed..unprocessed + got]);
                     unprocessed += got;
-                },
+                }
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => {
                         // Go back to polling if we're caught up and the PTY
@@ -187,7 +190,7 @@ where
                         if unprocessed == 0 {
                             break;
                         }
-                    },
+                    }
                     _ => return Err(err),
                 },
             }
@@ -241,21 +244,21 @@ where
                     Ok(0) => {
                         state.set_current(Some(current));
                         break 'write_many;
-                    },
+                    }
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
                             state.goto_next();
                             break 'write_one;
                         }
-                    },
+                    }
                     Err(err) => {
                         state.set_current(Some(current));
                         match err.kind() {
                             ErrorKind::Interrupted | ErrorKind::WouldBlock => break 'write_many,
                             _ => return Err(err),
                         }
-                    },
+                    }
                 }
             }
         }
@@ -284,8 +287,9 @@ where
             'event_loop: loop {
                 // Wake up when a synchronized-update timeout is reached.
                 let handler = state.parser.sync_timeout();
-                let timeout =
-                    handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
+                let timeout = handler
+                    .sync_timeout()
+                    .map(|st| st.saturating_duration_since(Instant::now()));
 
                 events.clear();
                 if let Err(err) = self.poll.wait(&mut events, timeout) {
@@ -294,7 +298,7 @@ where
                         _ => {
                             tracing::error!("io loop polling error: {err}");
                             break 'event_loop;
-                        },
+                        }
                     }
                 }
 
@@ -330,7 +334,7 @@ where
                                 self.event_proxy.send_event(Event::Wakeup);
                                 break 'event_loop;
                             }
-                        },
+                        }
 
                         PTY_READ_WRITE_TOKEN => {
                             if event.is_interrupt() {
@@ -338,29 +342,29 @@ where
                                 continue;
                             }
 
-                            if event.readable {
-                                if let Err(err) = self.pty_read(&mut state, &mut buf) {
-                                    // On Linux, a `read` on the master side of
-                                    // a PTY can fail with `EIO` if the client
-                                    // side hangs up; loop back around for the
-                                    // inevitable `Exited` event.
-                                    #[cfg(target_os = "linux")]
-                                    if err.raw_os_error() == Some(libc::EIO) {
-                                        continue;
-                                    }
-
-                                    tracing::error!("error reading from pty: {err}");
-                                    break 'event_loop;
+                            if event.readable
+                                && let Err(err) = self.pty_read(&mut state, &mut buf)
+                            {
+                                // On Linux, a `read` on the master side of
+                                // a PTY can fail with `EIO` if the client
+                                // side hangs up; loop back around for the
+                                // inevitable `Exited` event.
+                                #[cfg(target_os = "linux")]
+                                if err.raw_os_error() == Some(libc::EIO) {
+                                    continue;
                                 }
+
+                                tracing::error!("error reading from pty: {err}");
+                                break 'event_loop;
                             }
 
-                            if event.writable {
-                                if let Err(err) = self.pty_write(&mut state) {
-                                    tracing::error!("error writing to pty: {err}");
-                                    break 'event_loop;
-                                }
+                            if event.writable
+                                && let Err(err) = self.pty_write(&mut state)
+                            {
+                                tracing::error!("error writing to pty: {err}");
+                                break 'event_loop;
                             }
-                        },
+                        }
                         _ => (),
                     }
                 }
@@ -369,7 +373,9 @@ where
                 let needs_write = state.needs_write();
                 if needs_write != interest.writable {
                     interest.writable = needs_write;
-                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                    self.pty
+                        .reregister(&self.poll, interest, poll_opts)
+                        .unwrap();
                 }
             }
 
@@ -479,7 +485,10 @@ struct Writing {
 impl Writing {
     #[inline]
     fn new(c: Cow<'static, [u8]>) -> Writing {
-        Writing { source: c, written: 0 }
+        Writing {
+            source: c,
+            written: 0,
+        }
     }
 
     #[inline]
@@ -538,7 +547,7 @@ mod tests {
 
     #[derive(Debug)]
     enum TestMsg {
-        Event(String),
+        Event(#[allow(dead_code, reason = "kept for debug printing")] String),
         Tee(Vec<TeeEvent>),
         Done(Option<ExitStatus>),
     }
@@ -584,23 +593,42 @@ mod tests {
             tab_id: "t".into(),
             nonce: "n".into(),
             claude_config_dir: None,
-            size: GridSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 },
+            size: GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
         };
         let pty = pty::spawn(&cfg, 0).expect("spawn pty");
         let (tx, rx) = unbounded();
         let write_back = Arc::new(WriteBack::default());
-        let proxy = TestProxy { tx, write_back: clone_arc(&write_back) };
+        let proxy = TestProxy {
+            tx,
+            write_back: clone_arc(&write_back),
+        };
         let term = Arc::new(FairMutex::new(Term::new(
             Config::default(),
             &TermSize::new(80, 24),
             proxy.clone(),
         )));
-        let looper =
-            IoLoop::new(term.clone(), proxy, pty, Tee::new("n".into(), Some(hostname.into())), write_back, true)
-                .expect("io loop");
+        let looper = IoLoop::new(
+            term.clone(),
+            proxy,
+            pty,
+            Tee::new("n".into(), Some(hostname.into())),
+            write_back,
+            true,
+        )
+        .expect("io loop");
         let sender = looper.channel();
         let handle = looper.spawn();
-        Harness { term, rx, _sender: sender, handle }
+        Harness {
+            term,
+            rx,
+            _sender: sender,
+            handle,
+        }
     }
 
     fn clone_arc(a: &Arc<WriteBack>) -> Arc<WriteBack> {
@@ -615,7 +643,7 @@ mod tests {
             match h.rx.recv_timeout(remaining) {
                 Ok(TestMsg::Done(exit)) => return (tees, exit),
                 Ok(TestMsg::Tee(ev)) => tees.push(ev),
-                Ok(TestMsg::Event(_)) => {},
+                Ok(TestMsg::Event(_)) => {}
                 Err(_) => panic!("io loop did not finish in time"),
             }
         }
@@ -642,15 +670,24 @@ mod tests {
     fn child_output_reaches_term_and_loop_finishes() {
         let h = run("printf 'giverny-hello'", "testhost");
         let (_tees, exit) = wait_done(&h);
-        assert!(exit.is_some_and(|s| s.success()), "child should exit cleanly");
+        assert!(
+            exit.is_some_and(|s| s.success()),
+            "child should exit cleanly"
+        );
         let text = screen_text(&h.term);
-        assert!(text.contains("giverny-hello"), "grid should contain output, got:\n{text}");
+        assert!(
+            text.contains("giverny-hello"),
+            "grid should contain output, got:\n{text}"
+        );
         h.handle.join().unwrap();
     }
 
     #[test]
     fn tee_sees_osc7_from_child() {
-        let h = run(r#"printf '\033]7;file://testhost/tmp/tee-dir\007after'"#, "testhost");
+        let h = run(
+            r#"printf '\033]7;file://testhost/tmp/tee-dir\007after'"#,
+            "testhost",
+        );
         let (tees, exit) = wait_done(&h);
         assert!(exit.is_some_and(|s| s.success()));
         let all: Vec<TeeEvent> = tees.into_iter().flatten().collect();
@@ -682,7 +719,10 @@ mod tests {
         let (_tees, exit) = wait_done(&h);
         assert!(exit.is_some_and(|s| s.success()));
         let text = screen_text(&h.term);
-        assert!(text.contains("reply-ok"), "child never saw the DA1 reply; grid:\n{text}");
+        assert!(
+            text.contains("reply-ok"),
+            "child never saw the DA1 reply; grid:\n{text}"
+        );
         h.handle.join().unwrap();
     }
 

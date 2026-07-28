@@ -34,8 +34,11 @@ fn find_git(dir: &Path) -> Option<PathBuf> {
             let content = std::fs::read_to_string(&dotgit).ok()?;
             let target = content.trim().strip_prefix("gitdir: ")?.trim();
             let path = Path::new(target);
-            let resolved =
-                if path.is_absolute() { path.to_path_buf() } else { ancestor.join(path) };
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                ancestor.join(path)
+            };
             return Some(resolved);
         }
     }
@@ -70,8 +73,11 @@ mod tests {
     fn detached_head_shows_short_sha() {
         let dir = scratch("detached");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        std::fs::write(dir.join(".git/HEAD"), "0123abcd0123abcd0123abcd0123abcd0123abcd\n")
-            .unwrap();
+        std::fs::write(
+            dir.join(".git/HEAD"),
+            "0123abcd0123abcd0123abcd0123abcd0123abcd\n",
+        )
+        .unwrap();
         assert_eq!(branch_of(&dir).as_deref(), Some("@0123abcd"));
         let _ = std::fs::remove_dir_all(&dir);
     }

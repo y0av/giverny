@@ -10,8 +10,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Hook events Giverny consumes.
-pub const RELAY_EVENTS: &[&str] =
-    &["SessionStart", "UserPromptSubmit", "Stop", "Notification", "SessionEnd"];
+pub const RELAY_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "Notification",
+    "SessionEnd",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayMsg {
@@ -56,14 +61,15 @@ pub fn socket_path() -> PathBuf {
 pub fn run_relay(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
-    let event: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let msg = RelayMsg {
         tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
         config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
         event,
     };
-    let Ok(line) = serde_json::to_string(&msg) else { return };
+    let Ok(line) = serde_json::to_string(&msg) else {
+        return;
+    };
 
     #[cfg(unix)]
     {
@@ -80,8 +86,10 @@ pub fn run_relay(spool: &Path) {
     if let Some(dir) = spool.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) =
-        std::fs::OpenOptions::new().create(true).append(true).open(spool)
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool)
     {
         let _ = writeln!(f, "{line}");
     }
@@ -114,20 +122,22 @@ pub fn spawn_listener(
     let listener = UnixListener::bind(&path)?;
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    std::thread::Builder::new().name("giverny hook listener".into()).spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let tx = tx.clone();
-            let reader = std::io::BufReader::new(stream);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                if let Ok(msg) = serde_json::from_str::<RelayMsg>(&line) {
-                    let _ = tx.send(msg);
-                    wake();
+    std::thread::Builder::new()
+        .name("giverny hook listener".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let tx = tx.clone();
+                let reader = std::io::BufReader::new(stream);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(msg) = serde_json::from_str::<RelayMsg>(&line) {
+                        let _ = tx.send(msg);
+                        wake();
+                    }
                 }
             }
-        }
-    })?;
+        })?;
 
     Ok((rx, spooled))
 }
@@ -156,9 +166,15 @@ fn is_our_entry(v: &serde_json::Value) -> bool {
 
 /// Is the relay present (for any exe path) in this settings file?
 pub fn installed_in(settings_path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(settings_path) else { return false };
-    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
-    let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
     RELAY_EVENTS.iter().all(|ev| {
         hooks
             .get(*ev)
@@ -229,7 +245,9 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 
 /// Remove our relay entries from one settings file.
 pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
-    let Ok(bytes) = std::fs::read(settings_path) else { return Ok(()) };
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return Ok(());
+    };
     let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
     if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_, v) in hooks.iter_mut() {
@@ -250,8 +268,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("giverny-hooks-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("giverny-hooks-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("settings.json")
@@ -274,8 +291,15 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(root["effortLevel"], "xhigh", "unrelated settings preserved");
         let notif = root["hooks"]["Notification"].as_array().unwrap();
-        assert_eq!(notif.len(), 2, "user's notify.sh entry survives next to ours");
-        assert!(path.with_extension("json.giverny-bak").exists(), "backup created");
+        assert_eq!(
+            notif.len(),
+            2,
+            "user's notify.sh entry survives next to ours"
+        );
+        assert!(
+            path.with_extension("json.giverny-bak").exists(),
+            "backup created"
+        );
     }
 
     #[test]
@@ -287,7 +311,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for ev in RELAY_EVENTS {
             let arr = root["hooks"][ev].as_array().unwrap();
-            assert_eq!(arr.len(), 1, "{ev}: exactly one giverny entry after reinstall");
+            assert_eq!(
+                arr.len(),
+                1,
+                "{ev}: exactly one giverny entry after reinstall"
+            );
         }
         assert!(installed_in(&path));
     }

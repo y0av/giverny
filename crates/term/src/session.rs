@@ -158,9 +158,11 @@ impl TermSession {
         for l in (0..screen).rev() {
             let has_content = (0..cols).any(|c| {
                 let cell = &grid[Point::new(Line(l), Column(c))];
-                cell.c != ' ' || cell.bg != alacritty_terminal::vte::ansi::Color::Named(
-                    alacritty_terminal::vte::ansi::NamedColor::Background,
-                )
+                cell.c != ' '
+                    || cell.bg
+                        != alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Background,
+                        )
             });
             if has_content {
                 last = l;
@@ -186,7 +188,9 @@ impl TermSession {
                         == alacritty_terminal::vte::ansi::Color::Named(
                             alacritty_terminal::vte::ansi::NamedColor::Background,
                         )
-                    && !cell.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT | Flags::INVERSE);
+                    && !cell
+                        .flags
+                        .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT | Flags::INVERSE);
                 if !blank {
                     end = c + 1;
                     break;
@@ -194,7 +198,9 @@ impl TermSession {
             }
             for c in 0..end {
                 let cell = &grid[Point::new(line, Column(c))];
-                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
                 {
                     continue;
                 }
@@ -205,7 +211,9 @@ impl TermSession {
                 }
             }
             let wrapped = cols > 0
-                && grid[Point::new(line, Column(cols - 1))].flags.contains(Flags::WRAPLINE);
+                && grid[Point::new(line, Column(cols - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE);
             if !wrapped {
                 out.push_str("\x1b[0m\r\n");
                 style = SgrTracker::default();
@@ -369,8 +377,14 @@ fn push_color(out: &mut String, color: alacritty_terminal::vte::ansi::Color, is_
             let _ = write!(out, ";{};5;{}", if is_fg { 38 } else { 48 }, i);
         }
         Color::Spec(rgb) => {
-            let _ =
-                write!(out, ";{};2;{};{};{}", if is_fg { 38 } else { 48 }, rgb.r, rgb.g, rgb.b);
+            let _ = write!(
+                out,
+                ";{};2;{};{};{}",
+                if is_fg { 38 } else { 48 },
+                rgb.r,
+                rgb.g,
+                rgb.b
+            );
         }
     }
 }

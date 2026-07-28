@@ -46,8 +46,12 @@ pub fn identity_path(config_dir: &Path) -> PathBuf {
 
 fn read_identity(config_dir: &Path) -> (Option<String>, Option<String>) {
     let path = identity_path(config_dir);
-    let Ok(bytes) = std::fs::read(&path) else { return (None, None) };
-    let Ok(parsed) = serde_json::from_slice::<ClaudeJson>(&bytes) else { return (None, None) };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (None, None);
+    };
+    let Ok(parsed) = serde_json::from_slice::<ClaudeJson>(&bytes) else {
+        return (None, None);
+    };
     match parsed.oauth_account {
         Some(acc) => (acc.email_address, acc.account_uuid),
         None => (None, None),
@@ -66,7 +70,12 @@ fn profile_for(config_dir: PathBuf) -> Profile {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "claude".into())
         });
-    Profile { name, config_dir, email, account_uuid }
+    Profile {
+        name,
+        config_dir,
+        email,
+        account_uuid,
+    }
 }
 
 /// Discover profiles: the default `~/.claude`, plus any dirs in the

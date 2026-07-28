@@ -90,7 +90,11 @@ pub struct Atlas {
 
 impl Default for Atlas {
     fn default() -> Self {
-        Self { scale_ctx: ScaleContext::new(), pages: Vec::new(), map: HashMap::new() }
+        Self {
+            scale_ctx: ScaleContext::new(),
+            pages: Vec::new(),
+            map: HashMap::new(),
+        }
     }
 }
 
@@ -109,12 +113,7 @@ impl Atlas {
     }
 
     /// Get (or rasterize + upload) the sprite for a glyph.
-    pub fn get(
-        &mut self,
-        ctx: &egui::Context,
-        fonts: &FontSet,
-        key: GlyphKey,
-    ) -> Sprite {
+    pub fn get(&mut self, ctx: &egui::Context, fonts: &FontSet, key: GlyphKey) -> Sprite {
         if let Some(sprite) = self.map.get(&key) {
             return *sprite;
         }
@@ -140,7 +139,9 @@ impl Atlas {
         };
 
         let ppem = f32::from_bits(key.ppem_bits);
-        let Some(font) = fonts.font(key.slot).as_font() else { return blank };
+        let Some(font) = fonts.font(key.slot).as_font() else {
+            return blank;
+        };
 
         let mut scaler = self.scale_ctx.builder(font).size(ppem).hint(true).build();
         let mut render = Render::new(&[
@@ -152,7 +153,9 @@ impl Atlas {
         if key.synth & SYNTH_BOLD != 0 {
             render.embolden(ppem / 16.0);
         }
-        let Some(image) = render.render(&mut scaler, key.glyph) else { return blank };
+        let Some(image) = render.render(&mut scaler, key.glyph) else {
+            return blank;
+        };
 
         let (w, h) = (image.placement.width, image.placement.height);
         if w == 0 || h == 0 {
@@ -167,15 +170,21 @@ impl Atlas {
                 false
             }
             Content::Color => {
-                pixels.extend(image.data.chunks_exact(4).map(|px| {
-                    Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3])
-                }));
+                pixels.extend(
+                    image
+                        .data
+                        .chunks_exact(4)
+                        .map(|px| Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3])),
+                );
                 true
             }
             Content::SubpixelMask => {
                 // We never request subpixel; treat the green channel as coverage.
                 pixels.extend(
-                    image.data.chunks_exact(4).map(|px| Color32::from_white_alpha(px[1])),
+                    image
+                        .data
+                        .chunks_exact(4)
+                        .map(|px| Color32::from_white_alpha(px[1])),
                 );
                 false
             }
@@ -222,10 +231,13 @@ impl Atlas {
             ImageData::Color(Arc::new(image)),
             TextureOptions::NEAREST,
         );
-        let mut page = Page { tex, shelf_x: 0, shelf_y: 0, shelf_h: 0 };
-        let (x, y) = page
-            .reserve(w, h)
-            .expect("glyph larger than an atlas page");
+        let mut page = Page {
+            tex,
+            shelf_x: 0,
+            shelf_y: 0,
+            shelf_h: 0,
+        };
+        let (x, y) = page.reserve(w, h).expect("glyph larger than an atlas page");
         self.pages.push(page);
         (self.pages.len() - 1, x, y)
     }
@@ -266,11 +278,19 @@ mod tests {
         let ctx = egui::Context::default();
         let fonts = FontSet::load(None).unwrap();
         let r = fonts.resolve(' ', false, false).unwrap();
-        let key =
-            GlyphKey { slot: r.slot, glyph: r.glyph, ppem_bits: 16.0f32.to_bits(), synth: 0 };
+        let key = GlyphKey {
+            slot: r.slot,
+            glyph: r.glyph,
+            ppem_bits: 16.0f32.to_bits(),
+            synth: 0,
+        };
         let mut atlas = Atlas::default();
         assert!(atlas.get(&ctx, &fonts, key).is_blank());
-        assert_eq!(atlas.page_count(), 0, "blank glyphs must not allocate pages");
+        assert_eq!(
+            atlas.page_count(),
+            0,
+            "blank glyphs must not allocate pages"
+        );
     }
 
     #[test]
@@ -290,6 +310,10 @@ mod tests {
             }
         }
         assert!(atlas.len() > 90);
-        assert_eq!(atlas.page_count(), 1, "ascii + box drawing fits one 1024² page");
+        assert_eq!(
+            atlas.page_count(),
+            1,
+            "ascii + box drawing fits one 1024² page"
+        );
     }
 }

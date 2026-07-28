@@ -133,7 +133,17 @@ impl TabView {
         } else {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);
         }
-        self.handle_wheel(ui, session, &response, rect, ppp, metrics, mode, mouse_reporting, ch_pt);
+        self.handle_wheel(
+            ui,
+            session,
+            &response,
+            rect,
+            ppp,
+            metrics,
+            mode,
+            mouse_reporting,
+            ch_pt,
+        );
         self.handle_focus_reporting(session, &response, mode);
 
         // Paint.
@@ -164,8 +174,11 @@ impl TabView {
             meshes.push(Arc::new(built.bg));
             meshes.extend(built.glyphs.into_iter().map(Arc::new));
             meshes.push(Arc::new(built.decor));
-            self.cached =
-                Some(CachedFrame { origin_px, generation: shared.generation, meshes });
+            self.cached = Some(CachedFrame {
+                origin_px,
+                generation: shared.generation,
+                meshes,
+            });
         }
 
         let painter = ui.painter_at(rect);
@@ -227,7 +240,12 @@ impl TabView {
                             bytes.extend(input::sanitize_text(t));
                         }
                     }
-                    EguiEvent::Key { key, pressed: true, modifiers, .. } => {
+                    EguiEvent::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
                         // Terminal-standard chords first (never reach the shell).
                         if modifiers.ctrl && modifiers.shift && *key == Key::C {
                             copied = true;
@@ -290,11 +308,18 @@ impl TabView {
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
-                    EguiEvent::PointerButton { pos, button, pressed, modifiers } => {
+                    EguiEvent::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } => {
                         if !rect.contains(*pos) && *pressed {
                             continue;
                         }
-                        let Some(code) = button_code(*button) else { continue };
+                        let Some(code) = button_code(*button) else {
+                            continue;
+                        };
                         let (col, line, _) = cell_at(rect, ppp, m, *pos);
                         if let Some(seq) =
                             input::encode_mouse(code, col, line, *pressed, false, *modifiers, mode)
@@ -363,7 +388,11 @@ impl TabView {
                 sel.include_all();
             }
             term.selection = Some(sel);
-            let text = if copy { term.selection_to_string() } else { None };
+            let text = if copy {
+                term.selection_to_string()
+            } else {
+                None
+            };
             drop(term);
             session.mark_dirty();
             if let Some(text) = text
@@ -435,7 +464,11 @@ impl TabView {
         if mouse_reporting {
             let pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.min);
             let (col, line, _) = cell_at(rect, ppp, m, pos);
-            let code = if lines > 0 { MouseCode::WheelUp } else { MouseCode::WheelDown };
+            let code = if lines > 0 {
+                MouseCode::WheelUp
+            } else {
+                MouseCode::WheelDown
+            };
             let mods = ui.input(|i| i.modifiers);
             let mut out = Vec::new();
             for _ in 0..lines.unsigned_abs() {
@@ -445,7 +478,11 @@ impl TabView {
             }
             session.write(out);
         } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
-            let key = if lines > 0 { Key::ArrowUp } else { Key::ArrowDown };
+            let key = if lines > 0 {
+                Key::ArrowUp
+            } else {
+                Key::ArrowDown
+            };
             if let Some(seq) = input::encode_key(key, Modifiers::NONE, mode) {
                 let mut all = Vec::new();
                 for _ in 0..lines.unsigned_abs() {
@@ -467,7 +504,11 @@ impl TabView {
         let has = response.has_focus();
         if has != self.had_focus {
             if mode.contains(TermMode::FOCUS_IN_OUT) {
-                session.write(if has { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
+                session.write(if has {
+                    b"\x1b[I".to_vec()
+                } else {
+                    b"\x1b[O".to_vec()
+                });
             }
             self.had_focus = has;
         }
@@ -490,6 +531,10 @@ fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) 
     let col = (x_px / m.cell_w as f32).floor() as u16;
     let line = (y_px / m.cell_h as f32).floor() as u16;
     let within = x_px - col as f32 * m.cell_w as f32;
-    let side = if within < m.cell_w as f32 / 2.0 { Side::Left } else { Side::Right };
+    let side = if within < m.cell_w as f32 / 2.0 {
+        Side::Left
+    } else {
+        Side::Right
+    };
     (col, line, side)
 }

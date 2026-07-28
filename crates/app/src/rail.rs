@@ -102,30 +102,32 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             usage_panel(app, ui, dim, fg);
         });
 
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(6.0);
-        for cat in &cats {
-            category_header(app, ui, cat, dim, &mut actions);
-            if !cat.collapsed {
-                for row in &cat.rows {
-                    tab_row(app, ui, row, fg, dim, &mut actions);
-                }
-            }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             ui.add_space(6.0);
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if ui
-                .small_button("+ category")
-                .on_hover_text("add a category")
-                .clicked()
-            {
-                actions.push(Action::NewCategory);
+            for cat in &cats {
+                category_header(app, ui, cat, dim, &mut actions);
+                if !cat.collapsed {
+                    for row in &cat.rows {
+                        tab_row(app, ui, row, fg, dim, &mut actions);
+                    }
+                }
+                ui.add_space(6.0);
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if ui
+                    .small_button("+ category")
+                    .on_hover_text("add a category")
+                    .clicked()
+                {
+                    actions.push(Action::NewCategory);
+                }
+            });
+            ui.add_space(8.0);
         });
-        ui.add_space(8.0);
-    });
 
     actions
 }
@@ -149,7 +151,10 @@ fn category_header(
             Pos2::new(rect.min.x + 22.0, rect.min.y + 2.0),
             Vec2::new(width - 30.0, HEADER_H - 4.0),
         );
-        let te = ui.put(edit_rect, TextEdit::singleline(buf).font(FontId::monospace(12.0)));
+        let te = ui.put(
+            edit_rect,
+            TextEdit::singleline(buf).font(FontId::monospace(12.0)),
+        );
         if app.rename_needs_focus {
             te.request_focus();
             app.rename_needs_focus = false;
@@ -160,7 +165,10 @@ fn category_header(
             actions.push(Action::CommitRename(RenameTarget::Category(cat.id), None));
         } else if enter || te.lost_focus() {
             let value = buf.clone();
-            actions.push(Action::CommitRename(RenameTarget::Category(cat.id), Some(value)));
+            actions.push(Action::CommitRename(
+                RenameTarget::Category(cat.id),
+                Some(value),
+            ));
         }
         return;
     }
@@ -172,7 +180,10 @@ fn category_header(
             ui.close();
         }
         if ui.button("new tab here").clicked() {
-            actions.push(Action::NewTab { category: cat.id, cwd: None });
+            actions.push(Action::NewTab {
+                category: cat.id,
+                cwd: None,
+            });
             ui.close();
         }
         ui.menu_button("account", |ui| {
@@ -182,8 +193,10 @@ fn category_header(
             }
             for p in &app.claude.profiles {
                 if ui.button(format!("@{}", p.name)).clicked() {
-                    actions
-                        .push(Action::SetCategoryProfile(cat.id, Some(p.config_dir.clone())));
+                    actions.push(Action::SetCategoryProfile(
+                        cat.id,
+                        Some(p.config_dir.clone()),
+                    ));
                     ui.close();
                 }
             }
@@ -214,7 +227,11 @@ fn category_header(
         FontId::monospace(10.0),
         dim,
     );
-    p.circle_filled(Pos2::new(rect.min.x + 24.0, rect.center().y), 4.0, cat.color);
+    p.circle_filled(
+        Pos2::new(rect.min.x + 24.0, rect.center().y),
+        4.0,
+        cat.color,
+    );
     p.text(
         Pos2::new(rect.min.x + 34.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -231,9 +248,15 @@ fn category_header(
     );
 
     // "+" new-tab zone at the right edge.
-    let plus_rect =
-        Rect::from_min_size(Pos2::new(rect.max.x - 22.0, rect.min.y + 3.0), Vec2::splat(20.0));
-    let plus = ui.interact(plus_rect, ui.id().with(("cat-plus", cat.id.0)), Sense::click());
+    let plus_rect = Rect::from_min_size(
+        Pos2::new(rect.max.x - 22.0, rect.min.y + 3.0),
+        Vec2::splat(20.0),
+    );
+    let plus = ui.interact(
+        plus_rect,
+        ui.id().with(("cat-plus", cat.id.0)),
+        Sense::click(),
+    );
     p.text(
         plus_rect.center(),
         Align2::CENTER_CENTER,
@@ -242,7 +265,10 @@ fn category_header(
         if plus.hovered() { cat.color } else { dim },
     );
     if plus.clicked() {
-        actions.push(Action::NewTab { category: cat.id, cwd: None });
+        actions.push(Action::NewTab {
+            category: cat.id,
+            cwd: None,
+        });
     } else if resp.clicked() {
         actions.push(Action::ToggleCollapse(cat.id));
     }
@@ -267,7 +293,11 @@ fn tab_row(
     let hovered = ui.rect_contains_pointer(rect);
 
     if row.active {
-        p.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, row.color.gamma_multiply(0.16));
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            row.color.gamma_multiply(0.16),
+        );
         p.rect_filled(
             Rect::from_min_size(rect.min + Vec2::new(4.0, 1.0), Vec2::new(3.0, ROW_H - 2.0)),
             2.0,
@@ -287,7 +317,13 @@ fn tab_row(
     match row.claude {
         ClaudeState::Busy => {
             let glyph = SPINNER[(time * 10.0) as usize % SPINNER.len()];
-            p.text(dot, Align2::CENTER_CENTER, glyph, FontId::monospace(13.0), row.color);
+            p.text(
+                dot,
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::monospace(13.0),
+                row.color,
+            );
         }
         ClaudeState::NeedsYou => {
             let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
@@ -300,10 +336,22 @@ fn tab_row(
             );
         }
         ClaudeState::DoneUnseen => {
-            p.text(dot, Align2::CENTER_CENTER, "✓", FontId::monospace(12.0), TEAL);
+            p.text(
+                dot,
+                Align2::CENTER_CENTER,
+                "✓",
+                FontId::monospace(12.0),
+                TEAL,
+            );
         }
         ClaudeState::Idle => {
-            p.text(dot, Align2::CENTER_CENTER, "✳", FontId::monospace(11.0), dim);
+            p.text(
+                dot,
+                Align2::CENTER_CENTER,
+                "✳",
+                FontId::monospace(11.0),
+                dim,
+            );
         }
         ClaudeState::None => {
             if row.exited {
@@ -322,7 +370,10 @@ fn tab_row(
             Pos2::new(rect.min.x + 28.0, rect.min.y + 3.0),
             Vec2::new(width - 40.0, 20.0),
         );
-        let te = ui.put(edit_rect, TextEdit::singleline(buf).font(FontId::monospace(12.0)));
+        let te = ui.put(
+            edit_rect,
+            TextEdit::singleline(buf).font(FontId::monospace(12.0)),
+        );
         if app.rename_needs_focus {
             te.request_focus();
             app.rename_needs_focus = false;
@@ -345,7 +396,11 @@ fn tab_row(
         Align2::LEFT_CENTER,
         truncate_chars(&row.title, char_budget),
         FontId::monospace(12.5),
-        if row.active { fg } else { fg.gamma_multiply(0.8) },
+        if row.active {
+            fg
+        } else {
+            fg.gamma_multiply(0.8)
+        },
     );
     if !row.sub.is_empty() {
         p.text(
@@ -359,15 +414,25 @@ fn tab_row(
 
     // Close button on hover.
     if hovered {
-        let close_rect =
-            Rect::from_min_size(Pos2::new(rect.max.x - 24.0, rect.min.y + 4.0), Vec2::splat(18.0));
-        let close = ui.interact(close_rect, ui.id().with(("tab-close", row.id.0)), Sense::click());
+        let close_rect = Rect::from_min_size(
+            Pos2::new(rect.max.x - 24.0, rect.min.y + 4.0),
+            Vec2::splat(18.0),
+        );
+        let close = ui.interact(
+            close_rect,
+            ui.id().with(("tab-close", row.id.0)),
+            Sense::click(),
+        );
         p.text(
             close_rect.center(),
             Align2::CENTER_CENTER,
             "×",
             FontId::monospace(13.0),
-            if close.hovered() { Color32::from_rgb(0xd9, 0x7f, 0x70) } else { dim },
+            if close.hovered() {
+                Color32::from_rgb(0xd9, 0x7f, 0x70)
+            } else {
+                dim
+            },
         );
         if close.clicked() {
             actions.push(Action::CloseTab(row.id));
@@ -382,7 +447,13 @@ fn tab_row(
             ui.close();
         }
         ui.menu_button("move to", |ui| {
-            for (id, name) in &app.ws.categories.iter().map(|c| (c.id, c.name.clone())).collect::<Vec<_>>() {
+            for (id, name) in &app
+                .ws
+                .categories
+                .iter()
+                .map(|c| (c.id, c.name.clone()))
+                .collect::<Vec<_>>()
+            {
                 if ui.button(name).clicked() {
                     actions.push(Action::MoveTab(row.id, *id));
                     ui.close();
@@ -436,7 +507,11 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("ACCOUNTS").font(FontId::monospace(9.5)).color(dim));
+        ui.label(
+            egui::RichText::new("ACCOUNTS")
+                .font(FontId::monospace(9.5))
+                .color(dim),
+        );
     });
     if app.claude.accounts.is_empty() {
         ui.horizontal(|ui| {
@@ -469,7 +544,9 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
                         format!("{age}m old")
                     };
                     ui.label(
-                        egui::RichText::new(label).font(FontId::monospace(9.0)).color(dim),
+                        egui::RichText::new(label)
+                            .font(FontId::monospace(9.0))
+                            .color(dim),
                     );
                 }
             }
@@ -528,7 +605,11 @@ fn usage_bar(
         Pos2::new(rect.max.x - 74.0, rect.center().y + 3.0),
     );
     if track.width() > 10.0 {
-        p.rect_filled(track, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+        p.rect_filled(
+            track,
+            3.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+        );
         let mut fill = track;
         fill.set_right(track.min.x + track.width() * (pct as f32 / 100.0));
         if fill.width() > 0.5 {

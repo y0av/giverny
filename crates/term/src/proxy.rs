@@ -52,7 +52,13 @@ impl EventProxy {
         write_back: Arc<WriteBack>,
         shared: Arc<SharedTermState>,
     ) -> Self {
-        Self { tx, ctx, dirty, write_back, shared }
+        Self {
+            tx,
+            ctx,
+            dirty,
+            write_back,
+            shared,
+        }
     }
 
     fn wake(&self) {
@@ -95,7 +101,11 @@ impl EventListener for EventProxy {
                     258 => theme.cursor,
                     _ => theme.fg,
                 };
-                let rgb = alacritty_terminal::vte::ansi::Rgb { r: c.r(), g: c.g(), b: c.b() };
+                let rgb = alacritty_terminal::vte::ansi::Rgb {
+                    r: c.r(),
+                    g: c.g(),
+                    b: c.b(),
+                };
                 self.write_back.push(formatter(rgb).into_bytes().into());
             }
             Event::TextAreaSizeRequest(formatter) => {

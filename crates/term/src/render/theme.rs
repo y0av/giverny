@@ -20,9 +20,8 @@ pub struct Theme {
 impl Theme {
     /// Default dark theme, tinted after Monet's lily pond.
     pub fn monet_dark() -> Self {
-        let hex = |v: u32| {
-            Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8)
-        };
+        let hex =
+            |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8);
         Theme {
             bg: hex(0x0e1417),
             fg: hex(0xd7dde2),

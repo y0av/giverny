@@ -1,0 +1,18 @@
+[package]
+name = "giverny-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+sysinfo.workspace = true
+notify.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+crossbeam-channel.workspace = true

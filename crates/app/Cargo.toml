@@ -1,0 +1,22 @@
+[package]
+name = "giverny"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A native GPU terminal built around Claude Code"
+
+[[bin]]
+name = "giverny"
+path = "src/main.rs"
+
+[dependencies]
+giverny-term.workspace = true
+giverny-core.workspace = true
+giverny-claude.workspace = true
+eframe.workspace = true
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true

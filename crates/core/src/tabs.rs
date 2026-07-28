@@ -21,6 +21,10 @@ pub struct Category {
     /// Index into the app's category palette (custom colors come with config).
     pub color_index: usize,
     pub collapsed: bool,
+    /// Default Claude account for tabs in this category: a
+    /// `CLAUDE_CONFIG_DIR` injected at spawn. `None` = inherit environment.
+    #[serde(default)]
+    pub profile_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +37,13 @@ pub struct Tab {
     #[serde(default)]
     pub auto_title: String,
     pub cwd: Option<PathBuf>,
+    /// Live Claude Code session in this tab (captured via hooks) — the
+    /// resume target after a restart.
+    #[serde(default)]
+    pub claude_session: Option<String>,
+    /// The `CLAUDE_CONFIG_DIR` that session ran under (multi-account).
+    #[serde(default)]
+    pub claude_config_dir: Option<PathBuf>,
     #[serde(skip)]
     pub git_branch: Option<String>,
     #[serde(skip)]
@@ -86,6 +97,7 @@ impl Workspace {
             name: name.to_string(),
             color_index,
             collapsed: false,
+            profile_dir: None,
         });
         id
     }
@@ -132,6 +144,8 @@ impl Workspace {
                 custom_title: None,
                 auto_title: String::new(),
                 cwd: None,
+                claude_session: None,
+                claude_config_dir: None,
                 git_branch: None,
                 exited: false,
             },

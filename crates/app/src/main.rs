@@ -1,5 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod claude_watch;
 mod rail;
 
 use std::collections::HashMap;
@@ -33,6 +34,12 @@ pub fn category_color(index: usize) -> Color32 {
 }
 
 fn main() -> eframe::Result {
+    // `giverny relay` — the Claude Code hook entrypoint. Never opens a window.
+    if std::env::args().nth(1).as_deref() == Some("relay") {
+        giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -71,6 +78,9 @@ pub enum Action {
     DeleteCategory(CategoryId),
     SetCategoryColor(CategoryId, usize),
     MoveTab(TabId, CategoryId),
+    InstallHooks,
+    DismissHooksBanner,
+    SetCategoryProfile(CategoryId, Option<PathBuf>),
 }
 
 pub struct TabRuntime {
@@ -90,6 +100,10 @@ pub struct App {
     paths: Paths,
     state_dirty: bool,
     last_save: Instant,
+    pub claude: claude_watch::ClaudeWatch,
+    pub hooks_banner_dismissed: bool,
+    /// Deferred PTY writes (auto-resume commands) with their due time.
+    pending_inject: Vec<(Instant, TabId, Vec<u8>)>,
 }
 
 impl App {
@@ -102,10 +116,33 @@ impl App {
         if let Some(st) = &restored {
             shared.set_font_size(st.font_size);
         }
-        let ws = restored
+        let mut ws = restored
             .map(|st| st.workspace)
             .filter(|ws| !ws.tabs.is_empty())
             .unwrap_or_default();
+
+        let wake_ctx = cc.egui_ctx.clone();
+        let (claude, spooled) =
+            claude_watch::ClaudeWatch::new(&paths.hook_spool(), move || wake_ctx.request_repaint());
+        // Events spooled while the app was closed: keep session captures.
+        for msg in &spooled {
+            let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else { continue };
+            match msg.hook_event() {
+                Some("SessionStart") => {
+                    if let Some(tab) = ws.tab_mut(id) {
+                        tab.claude_session = msg.session_id().map(str::to_string);
+                        tab.claude_config_dir =
+                            msg.config_dir.as_deref().map(std::path::PathBuf::from);
+                    }
+                }
+                Some("SessionEnd") => {
+                    if let Some(tab) = ws.tab_mut(id) {
+                        tab.claude_session = None;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         let mut app = App {
             shared,
@@ -118,6 +155,9 @@ impl App {
             paths,
             state_dirty: false,
             last_save: Instant::now(),
+            claude,
+            hooks_banner_dismissed: false,
+            pending_inject: Vec::new(),
         };
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
@@ -177,12 +217,14 @@ impl App {
             Action::Select(id) => {
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
+                self.claude.mark_viewed(id);
                 self.focus_terminal = true;
             }
             Action::Cycle(delta) => {
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
+                    self.claude.mark_viewed(id);
                 }
                 self.focus_terminal = true;
             }
@@ -224,7 +266,18 @@ impl App {
             }
             Action::Respawn(id) => {
                 self.spawn_session(ctx, id, None);
+                self.queue_resume(id);
                 self.focus_terminal = true;
+            }
+            Action::InstallHooks => match self.claude.install_hooks() {
+                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                Err(e) => tracing::error!("hook install: {e}"),
+            },
+            Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
+            Action::SetCategoryProfile(id, dir) => {
+                if let Some(cat) = self.ws.category_mut(id) {
+                    cat.profile_dir = dir;
+                }
             }
             Action::DeleteCategory(id) => {
                 self.ws.remove_category(id);
@@ -248,13 +301,18 @@ impl App {
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
+        let profile_dir = self
+            .ws
+            .tab(id)
+            .and_then(|t| self.ws.category(t.category))
+            .and_then(|c| c.profile_dir.clone());
         let cfg = SpawnCfg {
             shell: None,
             cwd,
             env_extra: vec![],
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
-            claude_config_dir: None,
+            claude_config_dir: profile_dir,
             size: GridSize { cols: 120, rows: 30, cell_width: 9, cell_height: 18 },
         };
         match TermSession::spawn(&cfg, ctx.clone(), self.shared.theme.clone(), preseed.as_deref())
@@ -348,6 +406,51 @@ impl App {
         }
     }
 
+    /// Queue the auto-resume command for a freshly restored tab, guarded
+    /// against a second live resume of the same session.
+    fn queue_resume(&mut self, id: TabId) {
+        let Some(tab) = self.ws.tab(id) else { return };
+        let Some(sid) = tab.claude_session.clone() else { return };
+        if !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return;
+        }
+        let dirs: Vec<std::path::PathBuf> =
+            self.claude.profiles.iter().map(|p| p.config_dir.clone()).collect();
+        if giverny_claude::registry::session_is_live(dirs, &sid) {
+            tracing::info!("claude session {sid} already live elsewhere — not resuming");
+            return;
+        }
+        let mut cmd = String::new();
+        if let Some(dir) = &tab.claude_config_dir {
+            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{}\" ", dir.display()));
+        }
+        // `command` bypasses shell wrapper functions named `claude`.
+        cmd.push_str(&format!("command claude --resume {sid}\r"));
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(900),
+            id,
+            cmd.into_bytes(),
+        ));
+    }
+
+    fn process_pending(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.pending_inject.len() {
+            if self.pending_inject[i].0 <= now {
+                let (_, id, bytes) = self.pending_inject.remove(i);
+                if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) {
+                    session.write(bytes);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if !self.pending_inject.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
@@ -386,6 +489,33 @@ impl eframe::App for App {
         self.periodic_refresh();
 
         let ctx = ui.ctx().clone();
+        self.process_pending(&ctx);
+
+        // Claude awareness: hooks + registry + usage.
+        let shell_pids: HashMap<TabId, u32> = self
+            .rt
+            .iter()
+            .filter_map(|(&id, rt)| rt.session.as_ref().and_then(|s| s.child_pid).map(|p| (id, p)))
+            .collect();
+        let titles: HashMap<TabId, String> =
+            self.ws.tabs.iter().map(|t| (t.id, t.title().to_string())).collect();
+        let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        for (id, session, config_dir) in effects.captured {
+            if let Some(tab) = self.ws.tab_mut(id) {
+                tab.claude_session = session;
+                if config_dir.is_some() {
+                    tab.claude_config_dir = config_dir;
+                }
+                self.state_dirty = true;
+            }
+        }
+        for (summary, body) in effects.notify {
+            desktop_notify(summary, body);
+        }
+        if effects.animating {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
         let mut actions = self.shortcuts(&ctx);
 
         egui::Panel::left("rail")
@@ -441,6 +571,8 @@ impl eframe::App for App {
             {
                 let preseed = state::load_snapshot(&self.paths, active);
                 self.spawn_session(&ctx, active, preseed);
+                // The tab had a live Claude conversation — resume it.
+                self.queue_resume(active);
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
@@ -483,6 +615,16 @@ impl Drop for App {
             }
         }
     }
+}
+
+fn desktop_notify(summary: String, body: String) {
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("Giverny")
+            .summary(&summary)
+            .body(&body)
+            .show();
+    });
 }
 
 fn fresh_nonce(salt: u64) -> String {

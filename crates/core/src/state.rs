@@ -55,6 +55,11 @@ impl Paths {
     pub fn snapshot_file(&self, tab: TabId) -> PathBuf {
         self.base.join("state").join("snapshots").join(format!("{}.ansi", tab.0))
     }
+
+    /// Hook events spooled while the app is closed (drained at launch).
+    pub fn hook_spool(&self) -> PathBuf {
+        self.base.join("state").join("hook-spool.jsonl")
+    }
 }
 
 /// Linux boot id (used later to distinguish restart from reboot).
@@ -124,15 +129,16 @@ pub fn remove_snapshot(paths: &Paths, tab: TabId) {
 mod tests {
     use super::*;
 
-    fn scratch() -> Paths {
-        let dir = std::env::temp_dir().join(format!("giverny-state-{}", std::process::id()));
+    fn scratch(name: &str) -> Paths {
+        let dir =
+            std::env::temp_dir().join(format!("giverny-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Paths::at(dir)
     }
 
     #[test]
     fn roundtrip() {
-        let paths = scratch();
+        let paths = scratch("roundtrip");
         let mut ws = Workspace::default();
         let cat = ws.categories[0].id;
         let tab = ws.add_tab(cat);
@@ -154,7 +160,7 @@ mod tests {
 
     #[test]
     fn corrupt_state_is_sidelined() {
-        let paths = scratch();
+        let paths = scratch("corrupt");
         std::fs::create_dir_all(paths.state_file().parent().unwrap()).unwrap();
         std::fs::write(paths.state_file(), b"{ not json").unwrap();
         assert!(load(&paths).is_none());
@@ -163,7 +169,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip_and_remove() {
-        let paths = scratch();
+        let paths = scratch("snapshot");
         let tab = TabId(7);
         save_snapshot(&paths, tab, "\x1b[31mhello\x1b[0m\r\n").unwrap();
         assert_eq!(load_snapshot(&paths, tab).unwrap(), "\x1b[31mhello\x1b[0m\r\n");

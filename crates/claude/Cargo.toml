@@ -16,3 +16,4 @@ thiserror.workspace = true
 tracing.workspace = true
 jiff.workspace = true
 crossbeam-channel.workspace = true
+libc = "0.2.189"

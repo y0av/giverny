@@ -5,10 +5,15 @@ use eframe::egui::{
 };
 use giverny_core::tabs::{CategoryId, TabId};
 
+use crate::claude_watch::ClaudeState;
 use crate::{Action, App, RenameTarget, category_color};
 
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const AMBER: Color32 = Color32::from_rgb(0xd9, 0xb5, 0x5f);
+const TEAL: Color32 = Color32::from_rgb(0x5f, 0xa3, 0xa3);
+const POPPY: Color32 = Color32::from_rgb(0xd9, 0x7f, 0x70);
 
 struct RowData {
     id: TabId,
@@ -17,6 +22,7 @@ struct RowData {
     active: bool,
     exited: bool,
     color: Color32,
+    claude: ClaudeState,
 }
 
 struct CatData {
@@ -54,6 +60,14 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                             format!("{sub} ·  {branch}")
                         };
                     }
+                    let ct = app.claude.tabs.get(&t.id);
+                    if let Some(account) = ct.and_then(|c| c.account.as_deref()) {
+                        sub = if sub.is_empty() {
+                            format!("@{account}")
+                        } else {
+                            format!("{sub} · @{account}")
+                        };
+                    }
                     RowData {
                         id: t.id,
                         title: t.title().to_string(),
@@ -61,6 +75,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                         active: app.ws.active == Some(t.id),
                         exited: t.exited,
                         color,
+                        claude: ct.map(|c| c.state).unwrap_or_default(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -77,6 +92,15 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
 
     let dim = Color32::from_rgb(0x6b, 0x78, 0x80);
     let fg = Color32::from_rgb(0xd7, 0xdd, 0xe2);
+
+    // Bottom section first (panel-inside-panel): hooks banner + usage meters.
+    egui::Panel::bottom("rail-bottom")
+        .resizable(false)
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            hooks_banner(app, ui, &mut actions);
+            usage_panel(app, ui, dim, fg);
+        });
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(6.0);
@@ -151,6 +175,19 @@ fn category_header(
             actions.push(Action::NewTab { category: cat.id, cwd: None });
             ui.close();
         }
+        ui.menu_button("account", |ui| {
+            if ui.button("(inherit)").clicked() {
+                actions.push(Action::SetCategoryProfile(cat.id, None));
+                ui.close();
+            }
+            for p in &app.claude.profiles {
+                if ui.button(format!("@{}", p.name)).clicked() {
+                    actions
+                        .push(Action::SetCategoryProfile(cat.id, Some(p.config_dir.clone())));
+                    ui.close();
+                }
+            }
+        });
         ui.menu_button("color", |ui| {
             ui.horizontal(|ui| {
                 for (i, c) in crate::CATEGORY_PALETTE.iter().enumerate() {
@@ -244,12 +281,37 @@ fn tab_row(
         );
     }
 
-    // Status dot.
+    // Status glyph: Claude state wins over the plain shell dot.
     let dot = Pos2::new(rect.min.x + 18.0, rect.min.y + 13.0);
-    if row.exited {
-        p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
-    } else {
-        p.circle_filled(dot, 3.5, Color32::from_rgb(0x7b, 0xa2, 0x5a));
+    let time = ui.input(|i| i.time);
+    match row.claude {
+        ClaudeState::Busy => {
+            let glyph = SPINNER[(time * 10.0) as usize % SPINNER.len()];
+            p.text(dot, Align2::CENTER_CENTER, glyph, FontId::monospace(13.0), row.color);
+        }
+        ClaudeState::NeedsYou => {
+            let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
+            p.text(
+                dot,
+                Align2::CENTER_CENTER,
+                "⚑",
+                FontId::monospace(13.0),
+                AMBER.gamma_multiply(pulse as f32),
+            );
+        }
+        ClaudeState::DoneUnseen => {
+            p.text(dot, Align2::CENTER_CENTER, "✓", FontId::monospace(12.0), TEAL);
+        }
+        ClaudeState::Idle => {
+            p.text(dot, Align2::CENTER_CENTER, "✳", FontId::monospace(11.0), dim);
+        }
+        ClaudeState::None => {
+            if row.exited {
+                p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
+            } else {
+                p.circle_filled(dot, 3.5, Color32::from_rgb(0x7b, 0xa2, 0x5a));
+            }
+        }
     }
 
     // Inline rename?
@@ -344,6 +406,147 @@ fn tab_row(
     if hovered {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
+}
+
+fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    if app.claude.hooks_installed || app.hooks_banner_dismissed {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("⚑ live Claude states need hooks")
+                .font(FontId::monospace(10.0))
+                .color(AMBER),
+        );
+        if ui.small_button("install").on_hover_text(format!(
+            "adds `giverny relay` to {} event(s) in each profile's settings.json\n(existing hooks preserved; a .giverny-bak backup is written)",
+            giverny_claude::hooks::RELAY_EVENTS.len()
+        )).clicked() {
+            actions.push(Action::InstallHooks);
+        }
+        if ui.small_button("×").clicked() {
+            actions.push(Action::DismissHooksBanner);
+        }
+    });
+}
+
+fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("ACCOUNTS").font(FontId::monospace(9.5)).color(dim));
+    });
+    if app.claude.accounts.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("no claude profiles found")
+                    .font(FontId::monospace(10.0))
+                    .color(dim),
+            );
+        });
+        ui.add_space(6.0);
+        return;
+    }
+    let now = jiff::Timestamp::now();
+    for acc in &app.claude.accounts {
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("@{}", acc.profile.name))
+                    .font(FontId::monospace(10.5))
+                    .color(fg),
+            );
+            if let Some(u) = &acc.usage {
+                let age = giverny_claude::usage::age_minutes(u, now);
+                if age > 30 {
+                    let label = if age >= 120 {
+                        format!("{}h old", age / 60)
+                    } else {
+                        format!("{age}m old")
+                    };
+                    ui.label(
+                        egui::RichText::new(label).font(FontId::monospace(9.0)).color(dim),
+                    );
+                }
+            }
+        });
+        match &acc.usage {
+            Some(u) if !u.limits.is_empty() => {
+                for limit in &u.limits {
+                    usage_bar(ui, limit, now, dim, fg);
+                }
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("no usage data yet")
+                            .font(FontId::monospace(9.5))
+                            .color(dim),
+                    );
+                });
+            }
+        }
+    }
+    ui.add_space(6.0);
+}
+
+fn usage_bar(
+    ui: &mut Ui,
+    limit: &giverny_claude::usage::LimitEntry,
+    now: jiff::Timestamp,
+    dim: Color32,
+    fg: Color32,
+) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    let pct = limit.effective_percent(now);
+    let color = if limit.critical() || pct >= 95.0 {
+        POPPY
+    } else if pct >= 80.0 {
+        AMBER
+    } else {
+        Color32::from_rgb(0x5b, 0x7f, 0xa6)
+    };
+
+    // Label.
+    p.text(
+        Pos2::new(rect.min.x + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate_chars(&limit.label(), 6),
+        FontId::monospace(9.5),
+        if limit.is_active { fg } else { dim },
+    );
+    // Track + fill.
+    let track = Rect::from_min_max(
+        Pos2::new(rect.min.x + 58.0, rect.center().y - 3.0),
+        Pos2::new(rect.max.x - 74.0, rect.center().y + 3.0),
+    );
+    if track.width() > 10.0 {
+        p.rect_filled(track, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+        let mut fill = track;
+        fill.set_right(track.min.x + track.width() * (pct as f32 / 100.0));
+        if fill.width() > 0.5 {
+            p.rect_filled(fill, 3.0, color);
+        }
+    }
+    // Numbers.
+    let mut right = format!("{:>3.0}%", pct);
+    if let Some(cd) = limit.reset_countdown(now) {
+        right = format!("{right} {cd:>6}");
+    }
+    p.text(
+        Pos2::new(rect.max.x - 6.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        right,
+        FontId::monospace(9.0),
+        if limit.critical() { POPPY } else { dim },
+    );
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {

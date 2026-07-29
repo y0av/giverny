@@ -23,6 +23,8 @@ crates/
 
 `~/.config/giverny/state/tabs.json` (versioned, atomic tmp+rename, corruption sidelined) plus per-tab ANSI scrollback dumps. Restore **pre-seeds** the fresh `Term` with the dump before the shell spawns — scrollback returns with colors and re-wraps naturally because dumps store *logical* lines (WRAPLINE rows joined). Alt-screen content is never snapshotted. Sessions spawn lazily on first focus.
 
+Window size, maximized state and rail width live in the same file under `layout`, read by `state::load_layout` *before* the window is built so the size is what the window opens at rather than a resize the user watches happen. The size comes from egui's viewport rect, not `ViewportInfo::inner_rect` — the latter is computed from the window's position, which Wayland never reports to clients, so it is `None` on the primary platform. Window *position* is not persisted for the same reason: Wayland gives clients no way to place their own windows.
+
 ## Claude integration (`crates/claude` + `app/claude_watch.rs`)
 
 Two independent state sources, merged per tab:

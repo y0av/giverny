@@ -152,10 +152,130 @@ pub fn spawn_listener(
 
 /// The hook command for this running binary.
 pub fn relay_command() -> String {
-    let exe = std::env::current_exe()
+    format!("{} relay", exe_path())
+}
+
+fn exe_path() -> String {
+    std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "giverny".into());
-    format!("{exe} relay")
+        .unwrap_or_else(|_| "giverny".into())
+}
+
+/// Synthetic event name for statusline pushes (not a Claude hook event).
+pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
+
+/// The `giverny statusline` entrypoint: Claude Code runs this after every
+/// assistant message and displays our stdout. We forward the payload's
+/// official `rate_limits` to the app (fresh usage without any API call) and
+/// print a compact line back.
+pub fn run_statusline() {
+    let mut input = String::new();
+    let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
+    let payload: serde_json::Value =
+        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+
+    let mut event = serde_json::Map::new();
+    event.insert(
+        "hook_event_name".into(),
+        serde_json::Value::String(STATUSLINE_EVENT.into()),
+    );
+    if let Some(limits) = payload.get("rate_limits") {
+        event.insert("rate_limits".into(), limits.clone());
+    }
+    if let Some(sid) = payload.get("session_id") {
+        event.insert("session_id".into(), sid.clone());
+    }
+    let msg = RelayMsg {
+        tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
+        config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        event: serde_json::Value::Object(event),
+    };
+    #[cfg(unix)]
+    if let Ok(line) = serde_json::to_string(&msg) {
+        use std::os::unix::net::UnixStream;
+        if let Ok(mut stream) = UnixStream::connect(socket_path()) {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = writeln!(stream, "{line}");
+        }
+    }
+
+    // What Claude displays. Keep it short and useful.
+    let pct = |key: &str| -> Option<i64> {
+        payload
+            .get("rate_limits")?
+            .get(key)?
+            .get("used_percentage")?
+            .as_f64()
+            .map(|v| v.round() as i64)
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = payload
+        .get("model")
+        .and_then(|m| m.get("display_name"))
+        .and_then(|d| d.as_str())
+    {
+        parts.push(model.to_string());
+    }
+    if let Some(p) = pct("five_hour") {
+        parts.push(format!("5h {p}%"));
+    }
+    if let Some(p) = pct("seven_day") {
+        parts.push(format!("wk {p}%"));
+    }
+    println!("{}", parts.join("  ·  "));
+}
+
+/// Is the Giverny statusline configured in this settings file?
+pub fn statusline_installed_in(settings_path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains("giverny") && c.trim_end().ends_with("statusline"))
+}
+
+/// Install/remove the Giverny statusline. Refuses to replace a statusline
+/// the user configured themselves.
+pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
+    let mut root: serde_json::Value = match std::fs::read(settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(_) => serde_json::json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings root is not an object"))?;
+    let existing_is_foreign = obj
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.contains("giverny"));
+    if existing_is_foreign {
+        anyhow::bail!("a custom statusLine is already configured — leaving it alone");
+    }
+    if enable {
+        obj.insert(
+            "statusLine".into(),
+            serde_json::json!({
+                "type": "command",
+                "command": format!("{} statusline", exe_path()),
+                "padding": 0,
+            }),
+        );
+    } else {
+        obj.remove("statusLine");
+    }
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&root)?)?;
+    std::fs::rename(&tmp, settings_path)?;
+    Ok(())
 }
 
 fn is_our_entry(v: &serde_json::Value) -> bool {
@@ -343,6 +463,25 @@ mod tests {
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "user's entry kept");
         assert_eq!(stop[0]["hooks"][0]["command"], "echo mine");
+    }
+
+    #[test]
+    fn statusline_install_and_respect_existing() {
+        let path = scratch("statusline");
+        set_statusline(&path, true).unwrap();
+        assert!(statusline_installed_in(&path));
+        set_statusline(&path, false).unwrap();
+        assert!(!statusline_installed_in(&path));
+
+        std::fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"my-own-script.sh"}}"#,
+        )
+        .unwrap();
+        assert!(
+            set_statusline(&path, true).is_err(),
+            "must not clobber a user statusline"
+        );
     }
 
     #[test]

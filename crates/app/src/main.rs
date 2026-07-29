@@ -35,10 +35,31 @@ pub fn category_color(index: usize) -> Color32 {
 }
 
 fn main() -> eframe::Result {
-    // `giverny relay` — the Claude Code hook entrypoint. Never opens a window.
-    if std::env::args().nth(1).as_deref() == Some("relay") {
-        giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
-        return Ok(());
+    // Subcommands that never open a window.
+    match std::env::args().nth(1).as_deref() {
+        Some("relay") => {
+            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            return Ok(());
+        }
+        Some("statusline") => {
+            giverny_claude::hooks::run_statusline();
+            return Ok(());
+        }
+        Some("doctor") => {
+            doctor();
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "giverny — a native terminal built around Claude Code\n\n\
+                 USAGE:\n  giverny            launch the terminal\n  \
+                 giverny doctor     diagnose Claude integration\n  \
+                 giverny relay      (internal) Claude Code hook entrypoint\n  \
+                 giverny statusline (internal) Claude Code statusline entrypoint"
+            );
+            return Ok(());
+        }
+        _ => {}
     }
 
     tracing_subscriber::fmt()
@@ -92,6 +113,7 @@ pub enum Action {
     /// Jump to the next tab where Claude needs attention (then done-unseen).
     JumpAttention,
     TogglePalette,
+    ToggleStatusline(bool),
     OpenSessions(TabId),
     /// Resume a specific past conversation in a tab.
     ResumeSpecific(TabId, String, PathBuf),
@@ -345,6 +367,13 @@ impl App {
                     self.apply(ctx, Action::Select(id));
                 }
             }
+            Action::ToggleStatusline(enable) => match self.claude.set_statusline(enable) {
+                Ok(()) => tracing::info!(
+                    "statusline {}",
+                    if enable { "installed" } else { "removed" }
+                ),
+                Err(e) => tracing::error!("statusline: {e}"),
+            },
             Action::TogglePalette => {
                 self.palette = if self.palette.is_some() {
                     None
@@ -823,6 +852,94 @@ impl Drop for App {
             }
         }
     }
+}
+
+/// `giverny doctor` — print exactly what the app sees of your Claude setup.
+fn doctor() {
+    use giverny_claude::{hooks, profiles, registry, usage};
+
+    println!("giverny doctor\n");
+
+    let socket = hooks::socket_path();
+    let app_running = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+    println!("app socket   {}", socket.display());
+    println!(
+        "app running  {}\n",
+        if app_running {
+            "yes (relay will deliver live)"
+        } else {
+            "no (events spool to disk)"
+        }
+    );
+
+    let profs = profiles::discover(&[]);
+    if profs.is_empty() {
+        println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
+        return;
+    }
+    println!(
+        "profiles ({} found via ~/.claude + CCTOP_CONFIG_DIRS):",
+        profs.len()
+    );
+    let now = jiff::Timestamp::now();
+    for p in &profs {
+        let settings = p.config_dir.join("settings.json");
+        let hooks_ok = hooks::installed_in(&settings);
+        let sl_ok = hooks::statusline_installed_in(&settings);
+        println!(
+            "\n  @{}  {}",
+            p.name,
+            p.email.as_deref().unwrap_or("(identity unknown)")
+        );
+        println!("    dir        {}", p.config_dir.display());
+        println!(
+            "    hooks      {}",
+            if hooks_ok {
+                "installed ✓"
+            } else {
+                "MISSING — click 'install' in the rail"
+            }
+        );
+        println!(
+            "    statusline {}",
+            if sl_ok {
+                "installed ✓ (live usage)"
+            } else {
+                "not installed (usage from cache only)"
+            }
+        );
+        match usage::read(&p.config_dir) {
+            Some(u) => {
+                let age = usage::age_minutes(&u, now);
+                let buckets: Vec<String> = u
+                    .limits
+                    .iter()
+                    .map(|l| format!("{} {}%", l.label(), l.effective_percent(now).round()))
+                    .collect();
+                println!("    usage      {} (cache {age}m old)", buckets.join(", "));
+            }
+            None => println!("    usage      no cache yet — run /usage once in this account"),
+        }
+    }
+
+    let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
+    let live = registry::scan(dirs);
+    println!("\nlive claude sessions ({}):", live.len());
+    for s in &live {
+        println!(
+            "  pid {:<8} {:<6} {:<28} {}",
+            s.entry.pid,
+            s.entry.status,
+            s.entry.name.as_deref().unwrap_or("-"),
+            s.entry.cwd.display()
+        );
+    }
+
+    println!(
+        "\nnotes\n  · hooks load when a claude session STARTS — restart claude after installing\n  \
+         · notifications fire when claude needs YOU (permission prompts, questions),\n    \
+         not when it merely finishes"
+    );
 }
 
 fn desktop_notify(summary: String, body: String) {

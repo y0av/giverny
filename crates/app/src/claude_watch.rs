@@ -42,6 +42,18 @@ pub struct ClaudeTab {
 pub struct AccountPanel {
     pub profile: Profile,
     pub usage: Option<AccountUsage>,
+    /// Fresher percentages pushed by the statusline (official `rate_limits`),
+    /// overriding the on-disk cache for the windows they cover.
+    pub live: Option<LiveUsage>,
+    pub statusline_on: bool,
+}
+
+/// Push-based usage from Claude Code's statusline payload.
+#[derive(Debug, Clone)]
+pub struct LiveUsage {
+    pub at: Instant,
+    pub five_hour: Option<f64>,
+    pub seven_day: Option<f64>,
 }
 
 /// Side effects for the app to apply after a tick.
@@ -151,6 +163,11 @@ impl ClaudeWatch {
         tab_title: &str,
         effects: &mut WatchEffects,
     ) {
+        // Statusline pushes carry usage, not tab state.
+        if msg.hook_event() == Some(hooks::STATUSLINE_EVENT) {
+            self.apply_statusline(msg);
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -307,16 +324,115 @@ impl ClaudeWatch {
         effects
     }
 
+    /// A statusline push: official `rate_limits` for one account.
+    fn apply_statusline(&mut self, msg: &RelayMsg) {
+        let pct = |key: &str| -> Option<f64> {
+            msg.event
+                .get("rate_limits")?
+                .get(key)?
+                .get("used_percentage")?
+                .as_f64()
+        };
+        let live = LiveUsage {
+            at: Instant::now(),
+            five_hour: pct("five_hour"),
+            seven_day: pct("seven_day"),
+        };
+        if live.five_hour.is_none() && live.seven_day.is_none() {
+            return;
+        }
+        // Attribute to the account: explicit config dir, else the default profile.
+        let dir = msg
+            .config_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+        let Some(dir) = dir else { return };
+        if let Some(acc) = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.profile.config_dir == dir)
+        {
+            acc.live = Some(live);
+        }
+    }
+
     fn refresh_usage(&mut self) {
         self.last_usage = Instant::now();
+        let previous: HashMap<PathBuf, (Option<LiveUsage>, bool)> = self
+            .accounts
+            .drain(..)
+            .map(|a| (a.profile.config_dir, (a.live, a.statusline_on)))
+            .collect();
         self.accounts = self
             .profiles
             .iter()
-            .map(|p| AccountPanel {
-                profile: p.clone(),
-                usage: usage::read(&p.config_dir),
+            .map(|p| {
+                let (live, _) = previous
+                    .get(&p.config_dir)
+                    .cloned()
+                    .unwrap_or((None, false));
+                AccountPanel {
+                    usage: usage::read(&p.config_dir),
+                    live,
+                    statusline_on: hooks::statusline_installed_in(
+                        &p.config_dir.join("settings.json"),
+                    ),
+                    profile: p.clone(),
+                }
             })
             .collect();
+    }
+
+    /// Turn the live-usage statusline on/off for every profile.
+    pub fn set_statusline(&mut self, enable: bool) -> Result<(), String> {
+        let mut errs = Vec::new();
+        for p in &self.profiles {
+            if let Err(e) = hooks::set_statusline(&p.config_dir.join("settings.json"), enable) {
+                errs.push(format!("{}: {e}", p.name));
+            }
+        }
+        self.refresh_usage();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs.join("; "))
+        }
+    }
+
+    /// Do all profiles have the live-usage statusline?
+    pub fn statusline_on(&self) -> bool {
+        !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
+    }
+
+    /// Percent to display for one bucket: the statusline push when it is
+    /// fresher than the on-disk cache, else the cache value.
+    pub fn display_percent(
+        acc: &AccountPanel,
+        limit: &giverny_claude::usage::LimitEntry,
+        now: jiff::Timestamp,
+    ) -> (f64, bool) {
+        let cached = limit.effective_percent(now);
+        let Some(live) = &acc.live else {
+            return (cached, false);
+        };
+        let cache_age_ms = acc
+            .usage
+            .as_ref()
+            .map(|u| (now.as_millisecond() - u.fetched_at_ms as i64).max(0))
+            .unwrap_or(i64::MAX);
+        if live.at.elapsed().as_millis() as i64 >= cache_age_ms {
+            return (cached, false);
+        }
+        let fresh = match limit.kind.as_str() {
+            "session" => live.five_hour,
+            "weekly_all" => live.seven_day,
+            _ => None,
+        };
+        match fresh {
+            Some(p) => (p.clamp(0.0, 100.0), true),
+            None => (cached, false),
+        }
     }
 
     /// The user looked at the tab: done-markers clear.
@@ -332,8 +448,181 @@ impl ClaudeWatch {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
 
+    /// Test seam: a watcher with no listener and no profiles.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        ClaudeWatch {
+            profiles: Vec::new(),
+            tabs: HashMap::new(),
+            accounts: Vec::new(),
+            hooks_installed: true,
+            hook_rx: None,
+            last_scan: Instant::now(),
+            last_usage: Instant::now(),
+        }
+    }
+
     /// Is the hook relay socket actually listening?
     pub fn relay_listening(&self) -> bool {
         self.hook_rx.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TAB: TabId = TabId(7);
+
+    fn msg(json: &str) -> RelayMsg {
+        serde_json::from_str(json).expect("relay msg fixture")
+    }
+
+    fn hook(event: &str, extra: &str) -> RelayMsg {
+        msg(&format!(
+            r#"{{"tab_id":"giverny-7","config_dir":null,
+                "event":{{"hook_event_name":"{event}","session_id":"s-1"{extra}}}}}"#
+        ))
+    }
+
+    fn feed(w: &mut ClaudeWatch, m: &RelayMsg, active: Option<TabId>) -> WatchEffects {
+        let mut fx = WatchEffects::default();
+        w.handle_msg(m, active, "tab", &mut fx);
+        fx
+    }
+
+    #[test]
+    fn turn_lifecycle_drives_states() {
+        let mut w = ClaudeWatch::for_tests();
+        assert_eq!(w.state_of(TAB), ClaudeState::None);
+
+        let fx = feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert_eq!(fx.captured.len(), 1, "session id captured for resume");
+
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "spinner while working");
+
+        // Finishing in the FOCUSED tab returns to idle...
+        feed(&mut w, &hook("Stop", ""), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // ...but finishing in a background tab leaves a done marker.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TabId(1)));
+        feed(&mut w, &hook("Stop", ""), Some(TabId(1)));
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        w.mark_viewed(TAB);
+        assert_eq!(
+            w.state_of(TAB),
+            ClaudeState::Idle,
+            "viewing clears the marker"
+        );
+    }
+
+    #[test]
+    fn attention_notifications_only_for_needs_you() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TabId(1)));
+
+        for kind in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "agent_needs_input",
+        ] {
+            let m = hook("Notification", &format!(r#","notification_type":"{kind}""#));
+            let fx = feed(&mut w, &m, Some(TabId(1)));
+            assert_eq!(w.state_of(TAB), ClaudeState::NeedsYou, "{kind}");
+            assert_eq!(
+                fx.notify.len(),
+                1,
+                "{kind} must raise a desktop notification"
+            );
+        }
+
+        // Completion kinds never notify; they only mark done.
+        let m = hook("Notification", r#","notification_type":"agent_completed""#);
+        let fx = feed(&mut w, &m, Some(TabId(1)));
+        assert!(fx.notify.is_empty(), "completions must not notify");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+    }
+
+    #[test]
+    fn session_end_clears_state_and_resume_target() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let fx = feed(&mut w, &hook("SessionEnd", ""), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::None);
+        assert_eq!(
+            fx.captured,
+            vec![(TAB, None, None)],
+            "resume target cleared"
+        );
+    }
+
+    #[test]
+    fn statusline_push_updates_live_usage_not_tab_state() {
+        let mut w = ClaudeWatch::for_tests();
+        w.accounts.push(AccountPanel {
+            profile: Profile {
+                name: "acct".into(),
+                config_dir: PathBuf::from("/tmp/giverny-test-acct"),
+                email: None,
+                account_uuid: None,
+            },
+            usage: None,
+            live: None,
+            statusline_on: true,
+        });
+        let m = msg(
+            r#"{"tab_id":"giverny-7","config_dir":"/tmp/giverny-test-acct",
+                "event":{"hook_event_name":"GivernyStatusLine",
+                         "rate_limits":{"five_hour":{"used_percentage":42.0},
+                                        "seven_day":{"used_percentage":13.0}}}}"#,
+        );
+        feed(&mut w, &m, Some(TAB));
+        let live = w.accounts[0].live.as_ref().expect("live usage recorded");
+        assert_eq!(live.five_hour, Some(42.0));
+        assert_eq!(live.seven_day, Some(13.0));
+        assert_eq!(
+            w.state_of(TAB),
+            ClaudeState::None,
+            "statusline is not tab state"
+        );
+    }
+
+    #[test]
+    fn live_percent_wins_only_when_fresher_than_cache() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now = jiff::Timestamp::now();
+        let limit: LimitEntry = serde_json::from_str(
+            r#"{"kind":"session","percent":5,"severity":"normal","is_active":true}"#,
+        )
+        .unwrap();
+
+        let mk = |cache_age_min: i64, live: Option<f64>| AccountPanel {
+            profile: Profile {
+                name: "a".into(),
+                config_dir: PathBuf::from("/tmp/x"),
+                email: None,
+                account_uuid: None,
+            },
+            usage: Some(AccountUsage {
+                fetched_at_ms: (now.as_millisecond() - cache_age_min * 60_000) as u64,
+                limits: vec![],
+            }),
+            live: live.map(|p| LiveUsage {
+                at: Instant::now(),
+                five_hour: Some(p),
+                seven_day: None,
+            }),
+            statusline_on: true,
+        };
+
+        // Stale cache + fresh push ⇒ push wins and is flagged live.
+        let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, Some(77.0)), &limit, now);
+        assert_eq!((pct, is_live), (77.0, true));
+        // No push ⇒ cache value, not flagged.
+        let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, None), &limit, now);
+        assert_eq!((pct, is_live), (5.0, false));
     }
 }

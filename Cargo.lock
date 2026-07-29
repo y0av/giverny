@@ -1404,6 +1404,7 @@ dependencies = [
  "giverny-term",
  "jiff",
  "notify-rust",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

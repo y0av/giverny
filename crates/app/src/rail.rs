@@ -5,7 +5,7 @@ use eframe::egui::{
 };
 use giverny_core::tabs::{CategoryId, TabId};
 
-use crate::claude_watch::ClaudeState;
+use crate::claude_watch::{ClaudeState, ClaudeWatch};
 use crate::{Action, App, RenameTarget, category_color};
 
 const ROW_H: f32 = 40.0;
@@ -111,7 +111,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .show_separator_line(true)
         .show(ui, |ui| {
             hooks_banner(app, ui, &mut actions);
-            usage_panel(app, ui, dim, fg);
+            usage_panel(app, ui, dim, fg, &mut actions);
         });
 
     egui::ScrollArea::vertical()
@@ -554,7 +554,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     });
 }
 
-fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
+fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
@@ -563,12 +563,30 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
-        if app.claude.hooks_installed && app.claude.relay_listening() {
-            ui.label(
-                egui::RichText::new("· hooks ✓")
-                    .font(FontId::monospace(9.0))
-                    .color(dim),
-            );
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let live = app.claude.hooks_installed && app.claude.relay_listening();
+        ui.label(
+            egui::RichText::new(if live { "● claude states live" } else { "○ states degraded" })
+                .font(FontId::monospace(9.5))
+                .color(if live { TEAL } else { POPPY }),
+        )
+        .on_hover_text(if live {
+            "hooks installed and the relay is connected\n(restart a claude session for its hooks to load)"
+        } else {
+            "install hooks below, or run `giverny doctor` in a tab"
+        });
+        let sl = app.claude.statusline_on();
+        if ui
+            .small_button(if sl { "live usage ✓" } else { "live usage" })
+            .on_hover_text(
+                "adds a tiny statusline to claude that pushes usage to Giverny\n\
+                 (official rate_limits field — no API calls). Click to toggle.",
+            )
+            .clicked()
+        {
+            actions.push(Action::ToggleStatusline(!sl));
         }
     });
     if app.claude.accounts.is_empty() {
@@ -612,7 +630,8 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
         match &acc.usage {
             Some(u) if !u.limits.is_empty() => {
                 for limit in &u.limits {
-                    usage_bar(ui, limit, now, dim, fg);
+                    let (pct, live) = ClaudeWatch::display_percent(acc, limit, now);
+                    usage_bar(ui, limit, pct, live, now, dim, fg);
                 }
             }
             _ => {
@@ -630,9 +649,12 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
     ui.add_space(6.0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn usage_bar(
     ui: &mut Ui,
     limit: &giverny_claude::usage::LimitEntry,
+    pct: f64,
+    live: bool,
     now: jiff::Timestamp,
     dim: Color32,
     fg: Color32,
@@ -640,7 +662,6 @@ fn usage_bar(
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
     let p = ui.painter_at(rect);
-    let pct = limit.effective_percent(now);
     let color = if limit.critical() || pct >= 95.0 {
         POPPY
     } else if pct >= 80.0 {
@@ -674,8 +695,8 @@ fn usage_bar(
             p.rect_filled(fill, 3.0, color);
         }
     }
-    // Numbers.
-    let mut right = format!("{:>3.0}%", pct);
+    // Numbers. A leading dot marks a value pushed live by the statusline.
+    let mut right = format!("{}{:>3.0}%", if live { "·" } else { " " }, pct);
     if let Some(cd) = limit.reset_countdown(now) {
         right = format!("{right} {cd:>6}");
     }

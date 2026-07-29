@@ -74,7 +74,7 @@ Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI 
 
 ## Docs
 
-[Architecture](docs/architecture.md) · [What it touches in Claude Code](docs/claude-integration.md) · [Changelog](CHANGELOG.md)
+[Architecture](docs/architecture.md) · [All options](docs/options.md) · [What it touches in Claude Code](docs/claude-integration.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

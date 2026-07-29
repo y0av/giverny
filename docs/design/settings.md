@@ -1,6 +1,7 @@
 # Settings — design
 
-Status: proposal. Nothing here is built yet.
+Status: built, except where §9 says otherwise. Kept as the record of why it is
+shaped this way.
 
 Giverny has no settings screen. Preferences live in `config.toml` (hot-reloaded),
 object properties live in right-click menus, and a few things — font size, rail
@@ -231,16 +232,26 @@ already exist.
 
 ## 9. Build order
 
-1. The options schema (§4) and `toml_edit` write-back, with the generated
-   template replacing the hand-written one. Nothing visible yet; everything
-   after this is rows.
-2. The overlay shell: sections, search, key hint bar, `Ctrl+,`, `Esc`. Wire
-   appearance and terminal — the rows that are plain scalars.
-3. Titles section, including strip-prefix (display-time transform) and path
-   shortening.
-4. Restore section with the list editor and its suggestions.
-5. Keys: the keymap table, the settings section, the `F1` overlay, palette hints.
-6. Theme picker with live preview and the extra built-ins.
-7. Claude, updates, about — mostly links into what already exists.
+1. ✅ The options schema (§4) and `toml_edit` write-back, with the generated
+   template replacing the hand-written one.
+2. ✅ The overlay shell: sections, search, key hint bar, `Ctrl+,`, `Esc`,
+   appearance and terminal rows.
+3. ✅ Titles, including strip-prefix and path shortening as display-time
+   transforms.
+4. ✅ Restore, with the list editor and suggestions from what tabs have run.
+5. ✅ Keys: one table, the settings section and the `F1` overlay.
+6. ✅ Theme picker and the extra built-ins.
+7. ✅ Claude, updates, about.
 
-Steps 2–7 are independently shippable, which is the point of doing 1 first.
+Still open, deliberately:
+
+- **Live preview on hover.** Themes apply on click, which is instant and
+  reversible by clicking back; hovering to preview and reverting on `Esc` would
+  be better and is not built.
+- **Font family needs a restart.** The row changes the config, but the atlas is
+  built once at startup. The screen should say so on that row; today it only
+  logs.
+- **Palette chord hints.** The keymap table exists to feed them; the palette
+  does not read it yet.
+- **Rebinding**, per §6.
+- Stage 2 theming (`~/.config/giverny/themes/*.toml`), per §6.

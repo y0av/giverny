@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-07-29
 
 ### Settings
 - A settings screen (`Ctrl+,`), drawn over the terminal with the rail still
@@ -21,6 +21,13 @@
   to recolour the grid and leave a Monet-blue rail around it.
 - Settings → about links to the repo, and a ⚙ next to the accounts refresh
   opens settings without knowing the chord.
+- Options that only load at startup (font family, extra account directories)
+  say so once you change them, instead of looking like a row that does
+  nothing.
+
+### Not yet
+Live theme preview on hover, chord hints in the command palette, key
+rebinding, and theme files loaded from `~/.config/giverny/themes/`.
 - Font size now lives only in `config.toml`. `Ctrl` `+`/`−`/`0` writes it
   there; a size saved by an older build is migrated on first run.
 

@@ -109,8 +109,19 @@ pub struct App {
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
     pub hooks_banner_dismissed: bool,
-    /// Deferred PTY writes (auto-resume commands) with their due time.
-    pending_inject: Vec<(Instant, TabId, Vec<u8>)>,
+    /// Deferred automated actions (cwd fix, auto-resume) with due times.
+    pending_inject: Vec<(Instant, TabId, Inject)>,
+}
+
+/// Automated per-tab injections. All stand down once the user has typed.
+#[derive(Debug, Clone)]
+enum Inject {
+    /// Raw bytes typed into the shell (the resume command).
+    Raw(Vec<u8>),
+    /// Verify the shell is in the expected directory; shell rc files that
+    /// `cd` on startup (e.g. `cd ~/Dev`) override our spawn cwd — type a
+    /// visible `cd` back when that happened.
+    CwdFix(PathBuf),
 }
 
 impl App {
@@ -327,7 +338,7 @@ impl App {
             .and_then(|c| c.profile_dir.clone());
         let cfg = SpawnCfg {
             shell: None,
-            cwd,
+            cwd: cwd.clone(),
             env_extra: vec![],
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
@@ -352,6 +363,13 @@ impl App {
                     view: TabView::default(),
                 });
                 entry.session = Some(session);
+                // Startup rc files may `cd` away from the spawn dir; verify
+                // and correct once the shell has settled.
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(900),
+                    id,
+                    Inject::CwdFix(cwd),
+                ));
             }
             Err(err) => {
                 tracing::error!("spawn failed for tab {id:?}: {err:#}");
@@ -499,7 +517,7 @@ impl App {
         self.pending_inject.push((
             Instant::now() + Duration::from_millis(1300),
             id,
-            cmd.into_bytes(),
+            Inject::Raw(cmd.into_bytes()),
         ));
     }
 
@@ -508,9 +526,22 @@ impl App {
         let mut i = 0;
         while i < self.pending_inject.len() {
             if self.pending_inject[i].0 <= now {
-                let (_, id, bytes) = self.pending_inject.remove(i);
-                if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) {
-                    session.write(bytes);
+                let (_, id, inject) = self.pending_inject.remove(i);
+                let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) else {
+                    continue;
+                };
+                // The user took over — automated typing stands down.
+                if session.had_user_input() {
+                    continue;
+                }
+                match inject {
+                    Inject::Raw(bytes) => session.write(bytes),
+                    Inject::CwdFix(expected) => {
+                        let actual = session.proc_cwd();
+                        if actual.as_ref().is_some_and(|a| *a != expected) && expected.is_dir() {
+                            session.write(format!("cd \"{}\"\r", expected.display()).into_bytes());
+                        }
+                    }
                 }
             } else {
                 i += 1;

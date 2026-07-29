@@ -290,6 +290,7 @@ impl TabView {
             }
         }
         if !bytes.is_empty() {
+            session.note_user_input();
             session.scroll_to_bottom();
             session.write(bytes);
         }
@@ -362,6 +363,7 @@ impl TabView {
             }
         });
         if !out.is_empty() {
+            session.note_user_input();
             session.write(out);
         }
     }

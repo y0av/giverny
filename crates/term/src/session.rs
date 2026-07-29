@@ -24,6 +24,9 @@ pub struct TermSession {
     pub shared: Arc<SharedTermState>,
     /// Shell process id (unix), for `/proc/<pid>/cwd` fallback tracking.
     pub child_pid: Option<u32>,
+    /// Set once the user has interacted with this session (typing, clicks) —
+    /// automated injections must stand down after that.
+    user_input: Arc<AtomicBool>,
     sender: LoopSender,
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
@@ -99,6 +102,7 @@ impl TermSession {
             events,
             shared,
             child_pid,
+            user_input: Arc::new(AtomicBool::new(false)),
             sender,
             notifier,
             dirty,
@@ -108,6 +112,29 @@ impl TermSession {
     }
 
     /// Write user input to the PTY.
+    /// The user interacted with this session (typed, clicked) — automated
+    /// injections (cwd fix, auto-resume) must stand down.
+    pub fn note_user_input(&self) {
+        self.user_input.store(true, Ordering::Release);
+    }
+
+    pub fn had_user_input(&self) -> bool {
+        self.user_input.load(Ordering::Acquire)
+    }
+
+    /// Shell's live working directory via `/proc` (linux).
+    pub fn proc_cwd(&self) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.child_pid?;
+            std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     pub fn write(&self, bytes: impl Into<std::borrow::Cow<'static, [u8]>>) {
         self.notifier.notify(bytes.into());
     }

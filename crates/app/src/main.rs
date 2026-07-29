@@ -114,6 +114,10 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
+        Some("--version" | "-V") => {
+            println!("giverny {}", update::CURRENT);
+            return Ok(());
+        }
         Some("--help" | "-h") => {
             println!(
                 "giverny — a native terminal built around Claude Code\n\n\
@@ -124,7 +128,9 @@ fn main() -> eframe::Result {
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
                  giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint"
+                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+                 FLAGS:\n  -V, --version  print the version\n  \
+                 -h, --help     print this help"
             );
             return Ok(());
         }

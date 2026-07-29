@@ -1,6 +1,48 @@
 # Changelog
 
-## v0.1.0 — unreleased
+## v0.2.0 — 2026-07-29
+
+Everything since the first release: installers, an update check, and the fixes
+found by actually living in it.
+
+### Install & update
+- One-line installers for Linux, macOS and Windows, with signed-by-checksum
+  release archives built for x86_64/aarch64 Linux, both Macs, and Windows.
+- Giverny checks GitHub once a day for a newer version and offers a one-click
+  update; `giverny update` does it from the shell. Opt out with
+  `[update] check = false` or `GIVERNY_NO_UPDATE=1`.
+- `giverny install-desktop` installs the icon and `.desktop` entry (needed for
+  a proper taskbar icon on Wayland).
+
+### Restore
+- Tabs restart the full-screen program they were running (btop, k9s, lazygit…).
+  Anything outside `behavior.restore_apps` is remembered but never re-run —
+  replaying an arbitrary last command could deploy or delete something.
+- Window size, maximized state and rail width reopen where you left them.
+
+### Claude integration
+- Usage refreshes on its own by asking Claude Code to update its own cache, so
+  the meters no longer need you to run `/usage` by hand.
+- Usage caches are read once a minute (immediately after a refresh), and each
+  account has a backoff — an account with no readable cache used to retry
+  forever.
+- Claude session markers inherited from a parent Claude are scrubbed from tab
+  environments; without this, tabs launched from inside a Claude session
+  reported "Transcript saving is off" and silently could not resume.
+- Resume runs in the directory the transcript recorded, not the tab's current
+  one, which is why some resumes reported "No conversation found".
+- A declined permission prompt no longer leaves the attention flag stuck.
+- Hook and statusline paths self-heal after `cargo install` or a moved binary,
+  and a second instance never steals a live instance's hook socket.
+
+### Fixes
+- Rail glyphs (spinner, flag, ✓) rendered as tofu boxes — egui's built-in
+  fonts have no braille or symbol coverage; the terminal faces are now
+  installed for UI text too.
+- `doctor` and the statusline no longer assume Unix, so Windows builds.
+- Release workflow creates the GitHub release before uploading to it.
+
+## v0.1.0 — 2026-07-29
 
 First public release. Built and daily-driven against Claude Code 2.1.220 on Linux.
 

@@ -43,7 +43,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("statusline") => {
-            giverny_claude::hooks::run_statusline();
+            giverny_claude::hooks::run_statusline(&Paths::default_dirs().hook_spool());
             return Ok(());
         }
         Some("doctor") => {
@@ -941,17 +941,29 @@ fn doctor() {
 
     println!("giverny doctor\n");
 
-    let socket = hooks::socket_path();
-    let app_running = std::os::unix::net::UnixStream::connect(&socket).is_ok();
-    println!("app socket   {}", socket.display());
-    println!(
-        "app running  {}\n",
-        if app_running {
-            "yes (relay will deliver live)"
-        } else {
-            "no (events spool to disk)"
-        }
-    );
+    // Hook transport differs by platform: a unix socket where one exists,
+    // otherwise the spool file the relay always falls back to.
+    #[cfg(unix)]
+    {
+        let socket = hooks::socket_path();
+        let app_running = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        println!("relay        unix socket {}", socket.display());
+        println!(
+            "app running  {}\n",
+            if app_running {
+                "yes (hooks deliver live)"
+            } else {
+                "no (events spool to disk until it starts)"
+            }
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        println!(
+            "relay        spool file {}\n",
+            Paths::default_dirs().hook_spool().display()
+        );
+    }
 
     let profs = profiles::discover(&[]);
     if profs.is_empty() {

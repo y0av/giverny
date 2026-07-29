@@ -73,7 +73,14 @@ pub fn run_relay(spool: &Path) {
         config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
         event,
     };
-    let Ok(line) = serde_json::to_string(&msg) else {
+    deliver(&msg, spool);
+}
+
+/// Send one message to the app: unix socket when available, else append to
+/// the spool file. A running app polls the spool; a closed one drains it at
+/// next launch, so session-id captures are never lost.
+fn deliver(msg: &RelayMsg, spool: &Path) {
+    let Ok(line) = serde_json::to_string(msg) else {
         return;
     };
 
@@ -87,9 +94,6 @@ pub fn run_relay(spool: &Path) {
             }
         }
     }
-    // No socket (Windows, or the app is closed): spool to disk. A running app
-    // polls this file; a closed one drains it at next launch, so session-id
-    // captures are never lost.
     if let Some(dir) = spool.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -205,7 +209,7 @@ pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 /// assistant message and displays our stdout. We forward the payload's
 /// official `rate_limits` to the app (fresh usage without any API call) and
 /// print a compact line back.
-pub fn run_statusline() {
+pub fn run_statusline(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
     let payload: serde_json::Value =
@@ -227,14 +231,7 @@ pub fn run_statusline() {
         config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
         event: serde_json::Value::Object(event),
     };
-    #[cfg(unix)]
-    if let Ok(line) = serde_json::to_string(&msg) {
-        use std::os::unix::net::UnixStream;
-        if let Ok(mut stream) = UnixStream::connect(socket_path()) {
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-            let _ = writeln!(stream, "{line}");
-        }
-    }
+    deliver(&msg, spool);
 
     // What Claude displays. Keep it short and useful.
     let pct = |key: &str| -> Option<i64> {

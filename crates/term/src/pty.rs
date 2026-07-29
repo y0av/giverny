@@ -2,7 +2,9 @@
 //! `alacritty_terminal::tty` construction for a Giverny tab.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, Options, Shell};

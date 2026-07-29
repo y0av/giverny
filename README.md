@@ -8,7 +8,7 @@ Named for [Giverny](https://en.wikipedia.org/wiki/Giverny), Claude Monet's garde
 
 ![Giverny: categorised tabs with live Claude state and multi-account usage meters](assets/demo.gif)
 
-*One tab is working (spinner), one finished while you were away (✓), one is waiting on you (⚑) — and every account's limits are in the corner. Mock data; regenerate with [`tools/demo`](tools/demo).*
+*One tab is working (spinner), one finished while you were away (✓), one is waiting on you (⚑) — and every account's limits are in the corner.*
 
 ## Why
 
@@ -47,16 +47,12 @@ irm https://github.com/y0av/giverny/releases/latest/download/install.ps1 | iex
 ```sh
 git clone https://github.com/y0av/giverny && cd giverny
 cargo install --path crates/app
-giverny install-desktop     # launcher entry + icons (Linux)
+giverny install-desktop     # launcher entry + icons; on Wayland this is what puts the icon in the dock
 ```
 
-Giverny checks GitHub once a day for a newer release and offers a one-click update in the rail; clicking it opens a tab and runs the install command above, so you watch exactly what happens. `giverny update` does the same from a shell, and `[update] check = false` in the config (or `GIVERNY_NO_UPDATE=1`) turns it off entirely.
-
-Giverny also rewrites its own hook paths in `settings.json` whenever you move or reinstall the binary, so switching between a source build and an installed one keeps working.
+Giverny checks GitHub once a day for a newer release and offers a one-click update in the rail; clicking it opens a tab and runs the install command above, so you watch exactly what happens. `giverny update` does the same from a shell, and `[update] check = false` in `~/.config/giverny/config.toml` (or `GIVERNY_NO_UPDATE=1`) turns it off entirely. The config file is written with comments on first run and hot-reloads on save.
 
 Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
-
-Tagged releases upload prebuilt binaries via GitHub Actions.
 
 ## Keys
 
@@ -74,21 +70,9 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | middle-click on a tab | close it |
 | right-click tab / category | full menu (move, color, account, …) |
 
-## Linux desktop integration
+## Docs
 
-```sh
-giverny install-desktop      # --remove to undo
-```
-
-Installs `giverny.desktop` and the icon set under `~/.local/share` (the one-line installer does this for you). **On Wayland this is what puts the icon in the dock** — Wayland gives a client no way to hand the compositor its own icon, so the shell matches the window's `app_id` to an installed desktop entry instead. X11 and Windows use the icon compiled into the binary and need no setup. The entry records the binary's current path; re-run it if you move or rebuild elsewhere. `giverny doctor` reports whether it is in place.
-
-## Configuration
-
-`~/.config/giverny/config.toml` is written with comments on first run and hot-reloads on save: font family and size, theme (`monet-dark`, `monet-light`, `ink`), whether restored tabs re-run `claude --resume`, notifications, scrollback depth, and extra account directories. A broken file is reported and ignored rather than blocking startup.
-
-## Status
-
-Early but daily-drivable, and built against Claude Code 2.1.220. Not yet done: split panes, SSH/remote tabs, a plugin system, and hardware passes on macOS/Windows. See [`docs/architecture.md`](docs/architecture.md) for how the terminal engine and Claude integration fit together, [`docs/claude-integration.md`](docs/claude-integration.md) for exactly which Claude Code files are touched, and [`CHANGELOG.md`](CHANGELOG.md) for what landed.
+[Architecture](docs/architecture.md) · [What it touches in Claude Code](docs/claude-integration.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

@@ -43,6 +43,10 @@ found by actually living in it.
 - `doctor` and the statusline no longer assume Unix, so Windows builds.
 - Release workflow creates the GitHub release before uploading to it.
 
+### Not yet
+Split panes, SSH/remote tabs, a plugin system, a settings screen, and hardware
+passes on macOS and Windows.
+
 ## v0.1.0 — 2026-07-29
 
 First public release. Built and daily-driven against Claude Code 2.1.220 on Linux.

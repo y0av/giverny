@@ -44,6 +44,10 @@ pub struct Tab {
     /// The `CLAUDE_CONFIG_DIR` that session ran under (multi-account).
     #[serde(default)]
     pub claude_config_dir: Option<PathBuf>,
+    /// Command last seen running in this tab, so a restored tab can start it
+    /// again (only when it is on the restore allowlist).
+    #[serde(default)]
+    pub foreground: Option<String>,
     #[serde(skip)]
     pub git_branch: Option<String>,
     #[serde(skip)]
@@ -151,6 +155,7 @@ impl Workspace {
                 custom_title: None,
                 auto_title: String::new(),
                 cwd: None,
+                foreground: None,
                 claude_session: None,
                 claude_config_dir: None,
                 git_branch: None,

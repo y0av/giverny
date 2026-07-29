@@ -72,6 +72,10 @@ pub struct BehaviorConfig {
     pub scrollback_lines: usize,
     /// Extra `CLAUDE_CONFIG_DIR`s to treat as accounts.
     pub extra_profile_dirs: Vec<PathBuf>,
+    /// Programs a restored tab may start again by itself. Anything not
+    /// listed is remembered but never re-run — replaying an arbitrary last
+    /// command could deploy, delete or push something.
+    pub restore_apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +110,10 @@ impl Default for BehaviorConfig {
             notifications: true,
             scrollback_lines: 10_000,
             extra_profile_dirs: Vec::new(),
+            restore_apps: crate::procs::DEFAULT_RESTORE_APPS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -130,6 +138,10 @@ scrollback_lines = 10000
 # Extra CLAUDE_CONFIG_DIRs to show as accounts (beyond ~/.claude and
 # anything in $CCTOP_CONFIG_DIRS).
 extra_profile_dirs = []
+# Full-screen programs a restored tab may relaunch on its own (btop, k9s,
+# lazygit and friends by default). Everything else is remembered but never
+# re-run, since replaying a last command could deploy or delete something.
+# restore_apps = ["btop", "htop", "k9s"]
 
 [usage]
 # Refresh account usage by asking Claude Code to update its own cache

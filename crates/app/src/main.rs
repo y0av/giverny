@@ -752,6 +752,26 @@ impl App {
         tracing::info!("config reloaded");
     }
 
+    /// Remember what each tab is running, so a restart can bring it back.
+    fn track_foreground(&mut self) {
+        let seen: Vec<(TabId, Option<String>)> = self
+            .rt
+            .iter()
+            .filter_map(|(&id, rt)| {
+                let pid = rt.session.as_ref()?.child_pid?;
+                Some((id, giverny_core::procs::foreground_command(pid)))
+            })
+            .collect();
+        for (id, cmd) in seen {
+            if let Some(tab) = self.ws.tab_mut(id)
+                && tab.foreground != cmd
+            {
+                tab.foreground = cmd;
+                self.state_dirty = true;
+            }
+        }
+    }
+
     fn periodic_refresh(&mut self) {
         self.reload_config_if_changed();
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
@@ -767,6 +787,7 @@ impl App {
             self.update = found;
             self.update_rx = None;
         }
+        self.track_foreground();
         self.stale_sessions = self.claude.sessions_predate_settings();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
         self.claude
@@ -774,6 +795,30 @@ impl App {
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
         }
+    }
+
+    /// Restart the full-screen program this tab was running, when it is one
+    /// Giverny is allowed to start by itself.
+    fn queue_app_restore(&mut self, id: TabId) {
+        let Some(tab) = self.ws.tab(id) else { return };
+        // A tab with a Claude session resumes that instead.
+        if tab.claude_session.is_some() {
+            return;
+        }
+        let Some(cmd) = tab.foreground.clone() else {
+            return;
+        };
+        if !giverny_core::procs::is_restorable(&cmd, &self.cfg.behavior.restore_apps) {
+            tracing::info!("tab {id:?}: not restarting {cmd:?} (not on the restore list)");
+            return;
+        }
+        let mut bytes = cmd.into_bytes();
+        bytes.push(b'\r');
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(1200),
+            id,
+            Inject::Raw(bytes),
+        ));
     }
 
     /// Queue the auto-resume command for a freshly restored tab.
@@ -1038,8 +1083,10 @@ impl eframe::App for App {
             if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
                 let preseed = state::load_snapshot(&self.paths, active);
                 self.spawn_session(&ctx, active, preseed);
-                // The tab had a live Claude conversation — resume it.
+                // The tab had a live Claude conversation — resume it; or a
+                // full-screen app worth starting again.
                 self.queue_resume(active);
+                self.queue_app_restore(active);
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {

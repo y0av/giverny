@@ -1,6 +1,7 @@
 //! Giverny — a native terminal built around Claude Code.
 
 mod capture;
+mod chrome;
 mod claude_watch;
 mod desktop;
 mod icon;
@@ -252,6 +253,8 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    /// Theme-derived colours for Giverny's own chrome.
+    pub chrome: chrome::Chrome,
     pub settings: Option<settings_ui::SettingsState>,
     pub keys_overlay: Option<keymap::KeysOverlay>,
     capture: Option<capture::Capture>,
@@ -286,6 +289,8 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        let chrome = chrome::Chrome::from_theme(&Theme::by_name(&cfg.theme.name));
+        chrome.apply(&cc.egui_ctx, &Theme::by_name(&cfg.theme.name));
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -377,6 +382,7 @@ impl App {
             update: None,
             update_rx,
             update_dismissed: false,
+            chrome,
             settings: None,
             keys_overlay: None,
             capture: capture::Capture::from_env(),
@@ -573,7 +579,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(config::load(self.paths.base()));
+                        self.apply_config(ctx, config::load(self.paths.base()));
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -819,7 +825,7 @@ impl App {
     }
 
     /// Hot-reload `config.toml` when it changes on disk.
-    fn reload_config_if_changed(&mut self) {
+    fn reload_config_if_changed(&mut self, ctx: &egui::Context) {
         if self.last_cfg_check.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -830,19 +836,24 @@ impl App {
         }
         self.cfg_mtime = mtime;
         let cfg = config::load(self.paths.base());
-        self.apply_config(cfg);
+        self.apply_config(ctx, cfg);
     }
 
     /// Adopt a freshly loaded config, applying what can be applied live.
-    fn apply_config(&mut self, cfg: config::Config) {
+    fn apply_config(&mut self, ctx: &egui::Context, cfg: config::Config) {
         if cfg.theme.name != self.cfg.theme.name {
-            self.shared.set_theme(Theme::by_name(&cfg.theme.name));
+            let theme = Theme::by_name(&cfg.theme.name);
+            self.shared.set_theme(theme.clone());
             for rt in self.rt.values() {
                 if let Some(session) = &rt.session {
                     *session.shared.theme.write() = Theme::by_name(&cfg.theme.name);
                     session.mark_dirty();
                 }
             }
+            // The chrome is themed too, so the rail does not stay Monet-blue
+            // around a Gruvbox grid.
+            self.chrome = chrome::Chrome::from_theme(&theme);
+            self.chrome.apply(ctx, &theme);
         }
         if cfg.font.size != self.cfg.font.size {
             self.shared.set_font_size(cfg.font.size);
@@ -945,8 +956,8 @@ impl App {
         }
     }
 
-    fn periodic_refresh(&mut self) {
-        self.reload_config_if_changed();
+    fn periodic_refresh(&mut self, ctx: &egui::Context) {
+        self.reload_config_if_changed(ctx);
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_state(false);
         }
@@ -1153,9 +1164,9 @@ impl eframe::App for App {
             }
         }
         self.drain_events();
-        self.periodic_refresh();
 
         let ctx = ui.ctx().clone();
+        self.periodic_refresh(&ctx);
         self.process_pending(&ctx);
 
         // Claude awareness: hooks + registry + usage.

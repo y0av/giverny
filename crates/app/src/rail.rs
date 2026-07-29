@@ -11,9 +11,8 @@ use crate::{Action, App, RenameTarget, category_color};
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const AMBER: Color32 = Color32::from_rgb(0xd9, 0xb5, 0x5f);
-const TEAL: Color32 = Color32::from_rgb(0x5f, 0xa3, 0xa3);
-const POPPY: Color32 = Color32::from_rgb(0xd9, 0x7f, 0x70);
+// Chrome colours come from the active theme (see `chrome`), reached through
+// `app.chrome`. Only geometry is constant here.
 
 struct RowData {
     id: TabId,
@@ -102,8 +101,8 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         })
         .collect();
 
-    let dim = Color32::from_rgb(0x6b, 0x78, 0x80);
-    let fg = Color32::from_rgb(0xd7, 0xdd, 0xe2);
+    let dim = app.chrome.dim;
+    let fg = app.chrome.fg;
 
     // Bottom section first (panel-inside-panel): hooks banner + usage meters.
     egui::Panel::bottom("rail-bottom")
@@ -171,11 +170,8 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         if let Some((_, _, y)) = drop_target {
             let x0 = ui.min_rect().min.x + 6.0;
             let x1 = ui.min_rect().max.x - 6.0;
-            ui.painter().hline(
-                x0..=x1,
-                y,
-                egui::Stroke::new(2.0, Color32::from_rgb(0x5f, 0xa3, 0xa3)),
-            );
+            ui.painter()
+                .hline(x0..=x1, y, egui::Stroke::new(2.0, app.chrome.accent));
         }
         ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
         if ui.input(|i| i.pointer.any_released()) {
@@ -196,6 +192,7 @@ fn category_header(
     dim: Color32,
     actions: &mut Vec<Action>,
 ) -> Rect {
+    let c = app.chrome;
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_H), Sense::click());
     let p = ui.painter_at(rect);
@@ -324,7 +321,7 @@ fn category_header(
             Align2::RIGHT_CENTER,
             format!("{}⚑", cat.needs),
             FontId::monospace(10.0),
-            AMBER,
+            c.amber,
         );
     }
 
@@ -367,6 +364,7 @@ fn tab_row(
     dim: Color32,
     actions: &mut Vec<Action>,
 ) -> Rect {
+    let c = app.chrome;
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click_and_drag());
     let p = ui.painter_at(rect);
@@ -414,7 +412,7 @@ fn tab_row(
                 Align2::CENTER_CENTER,
                 "⚑",
                 FontId::monospace(13.0),
-                AMBER.gamma_multiply(pulse as f32),
+                c.amber.gamma_multiply(pulse as f32),
             );
         }
         ClaudeState::DoneUnseen => {
@@ -423,7 +421,7 @@ fn tab_row(
                 Align2::CENTER_CENTER,
                 "✓",
                 FontId::monospace(12.0),
-                TEAL,
+                c.accent,
             );
         }
         ClaudeState::Idle => {
@@ -579,6 +577,7 @@ fn tab_row(
 
 /// Offer the new release, if the daily check found one.
 fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let c = app.chrome;
     let Some(available) = &app.update else { return };
     if app.update_dismissed {
         return;
@@ -589,7 +588,7 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(
             egui::RichText::new(format!("▲ v{} available", available.version))
                 .font(FontId::monospace(10.0))
-                .color(TEAL),
+                .color(c.accent),
         )
         .on_hover_text(available.url.clone());
         if ui
@@ -608,6 +607,7 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let c = app.chrome;
     // Installed, but every running session predates it — claude reads
     // settings at startup, so none of them will report anything.
     if app.claude.hooks_installed && app.stale_sessions {
@@ -617,7 +617,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
             ui.label(
                 egui::RichText::new("⟳ restart claude for live states")
                     .font(FontId::monospace(10.0))
-                    .color(AMBER),
+                    .color(c.amber),
             )
             .on_hover_text(
                 "hooks and the usage statusline load when a claude session starts.\n\
@@ -633,7 +633,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
             ui.label(
                 egui::RichText::new("⚠ hook relay socket failed — states degraded")
                     .font(FontId::monospace(10.0))
-                    .color(POPPY),
+                    .color(c.poppy),
             );
         });
     }
@@ -646,7 +646,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(
             egui::RichText::new("⚑ live Claude states need hooks")
                 .font(FontId::monospace(10.0))
-                .color(AMBER),
+                .color(c.amber),
         );
         if ui.small_button("install").on_hover_text(format!(
             "adds `giverny relay` to {} event(s) plus a compact statusline for live usage,\nin each profile's settings.json (existing hooks and any statusline of your own\nare preserved; a .giverny-bak backup is written)",
@@ -661,6 +661,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
 }
 
 fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+    let c = app.chrome;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
@@ -680,7 +681,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             .add(egui::Button::new(
                 egui::RichText::new(label)
                     .font(FontId::monospace(10.0))
-                    .color(if spinning { TEAL } else { dim }),
+                    .color(if spinning { c.accent } else { dim }),
             ))
             .on_hover_text(
                 "refresh usage now\n(asks Claude Code to update its own cache;\nGiverny makes no API call)",
@@ -712,7 +713,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         ui.label(
             egui::RichText::new(if live { "● claude states live" } else { "○ states degraded" })
                 .font(FontId::monospace(9.5))
-                .color(if live { TEAL } else { POPPY }),
+                .color(if live { c.accent } else { c.poppy }),
         )
         .on_hover_text(if live {
             "hooks installed and the relay is connected\n(restart a claude session for its hooks to load)"
@@ -774,7 +775,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                             format!("· live {}", human(m))
                         })
                         .font(FontId::monospace(9.0))
-                        .color(TEAL),
+                        .color(c.accent),
                     )
                     .on_hover_text("pushed by claude's statusline");
                 }
@@ -800,7 +801,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             Some(u) if !u.limits.is_empty() => {
                 for limit in &u.limits {
                     let (pct, live) = ClaudeWatch::display_percent(acc, limit, now);
-                    usage_bar(ui, limit, pct, live, now, dim, fg);
+                    usage_bar(ui, limit, pct, live, now, dim, fg, c);
                 }
             }
             _ => {
@@ -827,16 +828,17 @@ fn usage_bar(
     now: jiff::Timestamp,
     dim: Color32,
     fg: Color32,
+    c: crate::chrome::Chrome,
 ) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
     let p = ui.painter_at(rect);
     let color = if limit.critical() || pct >= 95.0 {
-        POPPY
+        c.poppy
     } else if pct >= 80.0 {
-        AMBER
+        c.amber
     } else {
-        Color32::from_rgb(0x5b, 0x7f, 0xa6)
+        c.dim
     };
 
     // Label.
@@ -874,7 +876,7 @@ fn usage_bar(
         Align2::RIGHT_CENTER,
         right,
         FontId::monospace(9.0),
-        if limit.critical() { POPPY } else { dim },
+        if limit.critical() { c.poppy } else { dim },
     );
 }
 

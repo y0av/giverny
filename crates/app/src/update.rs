@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// The project's home, shown in settings → about.
+pub const REPO_URL: &str = "https://github.com/y0av/giverny";
 const RELEASES_API: &str = "https://api.github.com/repos/y0av/giverny/releases/latest";
 const INSTALL_SH: &str = "https://github.com/y0av/giverny/releases/latest/download/install.sh";
 const INSTALL_PS1: &str = "https://github.com/y0av/giverny/releases/latest/download/install.ps1";

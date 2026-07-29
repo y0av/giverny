@@ -7,9 +7,6 @@ use giverny_core::tabs::TabId;
 
 use crate::{Action, App};
 
-const DIM: Color32 = Color32::from_rgb(0x6b, 0x78, 0x80);
-const AMBER: Color32 = Color32::from_rgb(0xd9, 0xb5, 0x5f);
-
 // ---- fuzzy tab palette -----------------------------------------------------
 
 pub struct PaletteState {
@@ -58,6 +55,7 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let Some(mut st) = app.palette.take() else {
         return actions;
     };
+    let c = app.chrome;
 
     let mut close = false;
     let mut commit = false;
@@ -144,7 +142,7 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 ui.label(
                     RichText::new("no matches")
                         .font(FontId::monospace(11.0))
-                        .color(DIM),
+                        .color(c.dim),
                 );
             }
         });
@@ -167,6 +165,7 @@ pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let Some(picker) = app.session_picker.take() else {
         return actions;
     };
+    let c = app.chrome;
 
     let mut close = false;
     ctx.input_mut(|i| {
@@ -184,14 +183,14 @@ pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             ui.label(
                 RichText::new("RESUME A CONVERSATION")
                     .font(FontId::monospace(10.0))
-                    .color(DIM),
+                    .color(c.dim),
             );
             ui.add_space(4.0);
             if picker.sessions.is_empty() {
                 ui.label(
                     RichText::new("no past sessions in this directory")
                         .font(FontId::monospace(11.5))
-                        .color(DIM),
+                        .color(c.dim),
                 );
             }
             for s in &picker.sessions {
@@ -208,7 +207,7 @@ pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 let text = RichText::new(label)
                     .font(FontId::monospace(11.5))
                     .color(if s.live {
-                        DIM
+                        c.dim
                     } else {
                         Color32::from_rgb(0xd7, 0xdd, 0xe2)
                     });
@@ -230,7 +229,7 @@ pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             ui.label(
                 RichText::new("esc to close")
                     .font(FontId::monospace(9.5))
-                    .color(AMBER),
+                    .color(c.amber),
             );
         });
 

@@ -8,12 +8,11 @@
 //! the part that actually bites, a rule for when a binding may shadow a key
 //! the shell or Claude needs; the table is shaped so that drops in behind it.
 
-use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText};
+use eframe::egui::{self, FontId, Key, Modifiers, RichText};
 
 use crate::{Action, App};
 
-const DIM: Color32 = Color32::from_rgb(0x6b, 0x78, 0x80);
-const ACCENT: Color32 = Color32::from_rgb(0x5f, 0xa3, 0xa3);
+use crate::chrome::Chrome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
@@ -135,7 +134,7 @@ fn matches(b: &Binding, needle: &str) -> bool {
 }
 
 /// The table itself, grouped by scope. Shared by both views.
-pub fn table_ui(ui: &mut egui::Ui, filter: &str) {
+pub fn table_ui(ui: &mut egui::Ui, filter: &str, c: Chrome) {
     let mut any = false;
     for scope in [Scope::Global, Scope::Terminal, Scope::Rail] {
         let rows: Vec<&Binding> = BINDINGS
@@ -150,7 +149,7 @@ pub fn table_ui(ui: &mut egui::Ui, filter: &str) {
         ui.label(
             RichText::new(scope.label())
                 .font(FontId::monospace(10.5))
-                .color(ACCENT),
+                .color(c.accent),
         );
         for b in rows {
             ui.horizontal(|ui| {
@@ -158,7 +157,7 @@ pub fn table_ui(ui: &mut egui::Ui, filter: &str) {
                 ui.label(
                     RichText::new(b.action)
                         .font(FontId::monospace(11.5))
-                        .color(DIM),
+                        .color(c.dim),
                 );
             });
         }
@@ -167,7 +166,7 @@ pub fn table_ui(ui: &mut egui::Ui, filter: &str) {
         ui.label(
             RichText::new("no matching keys")
                 .font(FontId::monospace(11.0))
-                .color(DIM),
+                .color(c.dim),
         );
     }
 }
@@ -192,6 +191,7 @@ pub fn overlay_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let Some(mut state) = app.keys_overlay.take() else {
         return actions;
     };
+    let c = app.chrome;
     let mut close = ctx.input_mut(|i| {
         i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::F1)
     });
@@ -206,7 +206,7 @@ pub fn overlay_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 ui.label(
                     RichText::new("keys")
                         .font(FontId::monospace(12.5))
-                        .color(ACCENT),
+                        .color(c.accent),
                 );
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut state.filter)
@@ -222,19 +222,19 @@ pub fn overlay_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             ui.separator();
             egui::ScrollArea::vertical()
                 .max_height(420.0)
-                .show(ui, |ui| table_ui(ui, &state.filter));
+                .show(ui, |ui| table_ui(ui, &state.filter, c));
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("esc close")
                         .font(FontId::monospace(10.0))
-                        .color(DIM),
+                        .color(c.dim),
                 );
                 if ui
                     .link(
                         RichText::new("· settings")
                             .font(FontId::monospace(10.0))
-                            .color(DIM),
+                            .color(c.dim),
                     )
                     .clicked()
                 {

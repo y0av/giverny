@@ -15,10 +15,7 @@ use giverny_core::settings::{self, Kind, Section, SettingDef, Value};
 
 use crate::{Action, App};
 
-const DIM: Color32 = Color32::from_rgb(0x6b, 0x78, 0x80);
-const KEY_COLOR: Color32 = Color32::from_rgb(0x7d, 0x8a, 0x94);
-const ACCENT: Color32 = Color32::from_rgb(0x5f, 0xa3, 0xa3);
-const MOD_DOT: Color32 = Color32::from_rgb(0xd9, 0xb5, 0x5f);
+use crate::chrome::Chrome;
 
 pub struct SettingsState {
     pub section: Section,
@@ -82,6 +79,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
     });
 
     let cfg = app.cfg.clone();
+    let c = app.chrome;
     let rows = visible(&state);
     // Suggestions for the restore list, from what tabs have actually run.
     let allowed: Vec<String> = cfg.behavior.restore_apps.clone();
@@ -90,7 +88,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            header(ui, &mut state, &mut close);
+            header(ui, &mut state, &mut close, c);
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);
@@ -99,7 +97,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
             let body_h = (ui.available_height() - footer_h).max(80.0);
             ui.horizontal_top(|ui| {
                 ui.set_height(body_h);
-                sections(ui, &mut state, &cfg);
+                sections(ui, &mut state, &cfg, c);
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(10.0);
@@ -109,12 +107,21 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
                         // The scroll area sits inside a horizontal layout, so
                         // without this its rows would run left-to-right.
                         ui.vertical(|ui| {
-                            body(app, ui, &mut state, &cfg, &rows, &suggestions, &mut actions);
+                            body(
+                                app,
+                                ui,
+                                &mut state,
+                                &cfg,
+                                &rows,
+                                &suggestions,
+                                &mut actions,
+                                c,
+                            );
                         });
                     });
             });
             ui.separator();
-            footer(ui, &mut actions, &mut close);
+            footer(ui, &mut actions, &mut close, c);
         });
 
     if !close {
@@ -123,12 +130,12 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
     actions
 }
 
-fn header(ui: &mut egui::Ui, state: &mut SettingsState, close: &mut bool) {
+fn header(ui: &mut egui::Ui, state: &mut SettingsState, close: &mut bool, c: Chrome) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("settings")
                 .font(FontId::monospace(13.0))
-                .color(ACCENT),
+                .color(c.accent),
         );
         ui.add_space(12.0);
         let search = ui.add(
@@ -152,7 +159,12 @@ fn header(ui: &mut egui::Ui, state: &mut SettingsState, close: &mut bool) {
     });
 }
 
-fn sections(ui: &mut egui::Ui, state: &mut SettingsState, cfg: &giverny_core::config::Config) {
+fn sections(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    c: Chrome,
+) {
     ui.vertical(|ui| {
         ui.set_width(120.0);
         for section in Section::ALL {
@@ -165,7 +177,7 @@ fn sections(ui: &mut egui::Ui, state: &mut SettingsState, cfg: &giverny_core::co
                     selected,
                     RichText::new(label)
                         .font(FontId::monospace(12.0))
-                        .color(if selected { ACCENT } else { Color32::GRAY }),
+                        .color(if selected { c.accent } else { Color32::GRAY }),
                 )
                 .clicked()
             {
@@ -185,12 +197,13 @@ fn body(
     rows: &[&'static SettingDef],
     suggestions: &[String],
     actions: &mut Vec<Action>,
+    c: Chrome,
 ) {
     // Sections with no options of their own still have something to say.
     if state.search.is_empty() {
         match state.section {
-            Section::Keys => return keys_section(ui),
-            Section::About => return about_section(app, ui, actions),
+            Section::Keys => return keys_section(ui, c),
+            Section::About => return about_section(app, ui, actions, c),
             _ => {}
         }
     }
@@ -199,7 +212,7 @@ fn body(
         ui.label(
             RichText::new("nothing here yet")
                 .font(FontId::monospace(11.0))
-                .color(DIM),
+                .color(c.dim),
         );
         return;
     }
@@ -213,13 +226,13 @@ fn body(
                  Everything else is remembered but never re-run.",
             )
             .font(FontId::monospace(10.0))
-            .color(DIM),
+            .color(c.dim),
         );
         ui.add_space(8.0);
     }
 
     for def in rows {
-        row(ui, state, cfg, def, suggestions, actions);
+        row(ui, state, cfg, def, suggestions, actions, c);
         ui.add_space(10.0);
     }
 }
@@ -231,6 +244,7 @@ fn row(
     def: &'static SettingDef,
     suggestions: &[String],
     actions: &mut Vec<Action>,
+    c: Chrome,
 ) {
     let Some(value) = settings::current(cfg, def) else {
         return;
@@ -245,23 +259,23 @@ fn row(
             ui.label(
                 RichText::new(def.key)
                     .font(FontId::monospace(10.0))
-                    .color(KEY_COLOR),
+                    .color(c.dim),
             );
         });
 
         ui.vertical(|ui| {
-            widget(ui, state, def, &value, suggestions, actions);
+            widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(def.doc)
                         .font(FontId::monospace(10.0))
-                        .color(DIM),
+                        .color(c.dim),
                 );
                 if modified {
                     ui.label(
                         RichText::new("●")
                             .font(FontId::monospace(9.0))
-                            .color(MOD_DOT),
+                            .color(c.amber),
                     )
                     .on_hover_text("changed from the default");
                     if ui
@@ -285,6 +299,7 @@ fn widget(
     value: &Value,
     suggestions: &[String],
     actions: &mut Vec<Action>,
+    c: Chrome,
 ) {
     match &def.kind {
         Kind::Bool { .. } => {
@@ -295,7 +310,7 @@ fn widget(
                 .button(
                     RichText::new(text)
                         .font(FontId::monospace(12.0))
-                        .color(if on { ACCENT } else { DIM }),
+                        .color(if on { c.accent } else { c.dim }),
                 )
                 .clicked()
             {
@@ -312,7 +327,7 @@ fn widget(
                             selected,
                             RichText::new(*opt)
                                 .font(FontId::monospace(12.0))
-                                .color(if selected { ACCENT } else { Color32::GRAY }),
+                                .color(if selected { c.accent } else { Color32::GRAY }),
                         )
                         .clicked()
                         && !selected
@@ -372,7 +387,7 @@ fn widget(
                 state.editing = None;
             }
         }
-        Kind::StringList { .. } => list_widget(ui, state, def, value, suggestions, actions),
+        Kind::StringList { .. } => list_widget(ui, state, def, value, suggestions, actions, c),
     }
 }
 
@@ -385,6 +400,7 @@ fn list_widget(
     value: &Value,
     suggestions: &[String],
     actions: &mut Vec<Action>,
+    c: Chrome,
 ) {
     let items: Vec<String> = value.as_list().unwrap_or_default().to_vec();
     let add_key = format!("{}::add", def.key);
@@ -397,7 +413,7 @@ fn list_widget(
             ui.label(
                 RichText::new(format!("{} programs", items.len()))
                     .font(FontId::monospace(10.0))
-                    .color(DIM),
+                    .color(c.dim),
             );
         }
         egui::ScrollArea::vertical()
@@ -423,7 +439,7 @@ fn list_widget(
                     ui.label(
                         RichText::new("(empty)")
                             .font(FontId::monospace(11.0))
-                            .color(DIM),
+                            .color(c.dim),
                     );
                 }
             });
@@ -465,7 +481,7 @@ fn list_widget(
             ui.label(
                 RichText::new("seen in your tabs")
                     .font(FontId::monospace(10.0))
-                    .color(DIM),
+                    .color(c.dim),
             );
             ui.horizontal_wrapped(|ui| {
                 for program in suggestions {
@@ -506,23 +522,23 @@ pub fn restore_suggestions(app: &App, allowed: &[String]) -> Vec<String> {
     seen
 }
 
-fn keys_section(ui: &mut egui::Ui) {
+fn keys_section(ui: &mut egui::Ui, c: Chrome) {
     ui.label(
         RichText::new("F1 shows this without leaving what you are doing.")
             .font(FontId::monospace(10.5))
-            .color(DIM),
+            .color(c.dim),
     );
     ui.add_space(8.0);
-    crate::keymap::table_ui(ui, "");
+    crate::keymap::table_ui(ui, "", c);
 }
 
-fn about_section(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+fn about_section(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>, c: Chrome) {
     let line = |ui: &mut egui::Ui, k: &str, v: String| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("{k:<10}"))
                     .font(FontId::monospace(11.5))
-                    .color(DIM),
+                    .color(c.dim),
             );
             ui.label(RichText::new(v).font(FontId::monospace(11.5)));
         });
@@ -536,6 +552,18 @@ fn about_section(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             .to_string(),
     );
     line(ui, "state", app.paths.state_file().display().to_string());
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{:<10}", "repo"))
+                .font(FontId::monospace(11.5))
+                .color(c.dim),
+        );
+        ui.hyperlink_to(
+            RichText::new(crate::update::REPO_URL).font(FontId::monospace(11.5)),
+            crate::update::REPO_URL,
+        )
+        .on_hover_text("opens in your browser");
+    });
     ui.add_space(10.0);
     if ui
         .button(RichText::new("open config.toml in a tab").font(FontId::monospace(11.5)))
@@ -545,31 +573,31 @@ fn about_section(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     }
 }
 
-fn footer(ui: &mut egui::Ui, actions: &mut Vec<Action>, close: &mut bool) {
+fn footer(ui: &mut egui::Ui, actions: &mut Vec<Action>, close: &mut bool, c: Chrome) {
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("/ search")
                     .font(FontId::monospace(10.5))
-                    .color(DIM),
+                    .color(c.dim),
             );
-            ui.label(RichText::new("·").color(DIM));
+            ui.label(RichText::new("·").color(c.dim));
             if ui
                 .link(
                     RichText::new("⇧⏎ edit config.toml")
                         .font(FontId::monospace(10.5))
-                        .color(DIM),
+                        .color(c.dim),
                 )
                 .clicked()
             {
                 actions.push(Action::EditConfig);
             }
-            ui.label(RichText::new("·").color(DIM));
+            ui.label(RichText::new("·").color(c.dim));
             if ui
                 .link(
                     RichText::new("esc back")
                         .font(FontId::monospace(10.5))
-                        .color(DIM),
+                        .color(c.dim),
                 )
                 .clicked()
             {

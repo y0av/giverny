@@ -16,6 +16,11 @@
   all but the last directory. Both apply at display time, so toggling either
   updates existing tabs at once.
 - Four more themes: Tokyo Night, Gruvbox, Nord, Catppuccin.
+- The theme now colours Giverny's own chrome too — rail, settings, overlays —
+  taking its accents from the theme's own ANSI palette. Picking Gruvbox used
+  to recolour the grid and leave a Monet-blue rail around it.
+- Settings → about links to the repo, and a ⚙ next to the accounts refresh
+  opens settings without knowing the chord.
 - Font size now lives only in `config.toml`. `Ctrl` `+`/`−`/`0` writes it
   there; a size saved by an older build is migrated on first run.
 

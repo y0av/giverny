@@ -110,6 +110,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .resizable(false)
         .show_separator_line(true)
         .show(ui, |ui| {
+            update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
             usage_panel(app, ui, dim, fg, &mut actions);
         });
@@ -574,6 +575,36 @@ fn tab_row(
         );
     }
     rect
+}
+
+/// Offer the new release, if the daily check found one.
+fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let Some(available) = &app.update else { return };
+    if app.update_dismissed {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("▲ v{} available", available.version))
+                .font(FontId::monospace(10.0))
+                .color(TEAL),
+        )
+        .on_hover_text(available.url.clone());
+        if ui
+            .small_button("update")
+            .on_hover_text(
+                "opens a tab and runs the official install command,\nso you see exactly what runs",
+            )
+            .clicked()
+        {
+            actions.push(Action::RunUpdate);
+        }
+        if ui.small_button("×").clicked() {
+            actions.push(Action::DismissUpdate);
+        }
+    });
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {

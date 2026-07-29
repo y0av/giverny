@@ -22,20 +22,33 @@ Running many concurrent Claude Code sessions across projects — and across mult
 
 ### Privacy & security
 
-Giverny **never calls any network API and never reads credential files**. Usage meters come from `.claude.json` — a cache Claude Code itself writes; session states come from hook events and Claude Code's local session registry. Hook installation edits `settings.json` only after showing what it adds, keeps your existing hooks, and writes a `.giverny-bak` backup. Pasted text is stripped of raw escape bytes before it reaches the PTY, and Giverny's in-band control channel is nonce-authenticated so terminal output can't forge Claude states.
+Giverny **never contacts Anthropic and never reads credential files**. Usage meters come from `.claude.json` — a cache Claude Code itself writes; session states come from hook events and Claude Code's local session registry. The only network request Giverny can make is the daily update check against GitHub's releases API, which sends nothing but a User-Agent and can be switched off; with `[update] check = false` it makes no requests at all. Hook installation edits `settings.json` only after showing what it adds, keeps your existing hooks, and writes a `.giverny-bak` backup. Pasted text is stripped of raw escape bytes before it reaches the PTY, and Giverny's in-band control channel is nonce-authenticated so terminal output can't forge Claude states.
 
 ## Install
 
+**Linux / macOS**
+
 ```sh
-git clone https://github.com/y0av/giverny && cd giverny
-cargo install --path crates/app   # Rust 1.90+; puts `giverny` on your PATH
-giverny install-desktop           # launcher entry + icons (Linux)
-giverny
+curl -fsSL https://github.com/y0av/giverny/releases/latest/download/install.sh | sh
 ```
 
-Or grab a binary from [the latest release](https://github.com/y0av/giverny/releases/latest). To run from the source tree without installing: `cargo run --release`.
+**Windows**
 
-Giverny rewrites its own hook paths in `settings.json` whenever you move or reinstall the binary, so switching between a source build and an installed one keeps working.
+```powershell
+irm https://github.com/y0av/giverny/releases/latest/download/install.ps1 | iex
+```
+
+**From source** (Rust 1.90+):
+
+```sh
+git clone https://github.com/y0av/giverny && cd giverny
+cargo install --path crates/app
+giverny install-desktop     # launcher entry + icons (Linux)
+```
+
+Giverny checks GitHub once a day for a newer release and offers a one-click update in the rail; clicking it opens a tab and runs the install command above, so you watch exactly what happens. `giverny update` does the same from a shell, and `[update] check = false` in the config (or `GIVERNY_NO_UPDATE=1`) turns it off entirely.
+
+Giverny also rewrites its own hook paths in `settings.json` whenever you move or reinstall the binary, so switching between a source build and an installed one keeps working.
 
 Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
 
@@ -48,19 +61,6 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
 | `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
 | `Ctrl+Shift+P` | fuzzy tab palette |
-
-## Linux desktop integration
-
-```sh
-giverny install-desktop      # --remove to undo
-```
-
-Installs `giverny.desktop` and the icon set under `~/.local/share`. **On Wayland this
-is what puts the icon in the dock** — Wayland gives a client no way to hand the
-compositor its own icon, so the shell matches the window's `app_id` to an installed
-desktop entry instead. X11 and Windows use the icon compiled into the binary and need
-no setup. The entry records the binary's current path; re-run it if you move or rebuild
-elsewhere. `giverny doctor` reports whether it is in place.
 | `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
 | `Ctrl`+hover / click | underline and open a path or URL |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |
@@ -69,6 +69,14 @@ elsewhere. `giverny doctor` reports whether it is in place.
 | `Ctrl+Shift+C` | copy selection |
 | middle-click on a tab | close it |
 | right-click tab / category | full menu (move, color, account, …) |
+
+## Linux desktop integration
+
+```sh
+giverny install-desktop      # --remove to undo
+```
+
+Installs `giverny.desktop` and the icon set under `~/.local/share` (the one-line installer does this for you). **On Wayland this is what puts the icon in the dock** — Wayland gives a client no way to hand the compositor its own icon, so the shell matches the window's `app_id` to an installed desktop entry instead. X11 and Windows use the icon compiled into the binary and need no setup. The entry records the binary's current path; re-run it if you move or rebuild elsewhere. `giverny doctor` reports whether it is in place.
 
 ## Configuration
 

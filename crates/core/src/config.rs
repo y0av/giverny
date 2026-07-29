@@ -11,6 +11,21 @@ pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
     pub behavior: BehaviorConfig,
+    pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Ask GitHub once a day whether a newer release exists. This is the
+    /// only network request Giverny makes; set false to make it zero.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig { check: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +112,12 @@ scrollback_lines = 10000
 # Extra CLAUDE_CONFIG_DIRs to show as accounts (beyond ~/.claude and
 # anything in $CCTOP_CONFIG_DIRS).
 extra_profile_dirs = []
+
+[update]
+# Ask GitHub once a day whether a newer Giverny exists. This is the only
+# network request Giverny ever makes — set false and it makes none.
+# (Setting GIVERNY_NO_UPDATE in the environment also disables it.)
+check = true
 "#;
 
 pub fn config_path(base: &Path) -> PathBuf {
@@ -159,6 +180,7 @@ mod tests {
         assert_eq!(cfg.font.size, 16.5);
         assert_eq!(cfg.theme.name, "monet-dark", "unspecified sections default");
         assert!(cfg.behavior.notifications);
+        assert!(cfg.update.check);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

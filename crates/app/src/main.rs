@@ -5,6 +5,7 @@ mod desktop;
 mod icon;
 mod overlays;
 mod rail;
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,6 +53,10 @@ fn main() -> eframe::Result {
             doctor();
             return Ok(());
         }
+        Some("update") => {
+            update_cli();
+            return Ok(());
+        }
         // Wayland cannot take an icon from the client; it reads one from an
         // installed desktop entry matched on app_id. See `desktop`.
         Some("install-desktop") => {
@@ -66,6 +71,7 @@ fn main() -> eframe::Result {
                 "giverny — a native terminal built around Claude Code\n\n\
                  USAGE:\n  giverny            launch the terminal\n  \
                  giverny doctor     diagnose Claude integration\n  \
+                 giverny update     check for a newer release\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
@@ -135,6 +141,9 @@ pub enum Action {
     ResumeSpecific(TabId, String, PathBuf),
     /// Drag-and-drop: place a tab in a category at a position.
     ReorderTab(TabId, CategoryId, usize),
+    /// Run the official install command in a visible tab.
+    RunUpdate,
+    DismissUpdate,
 }
 
 pub struct TabRuntime {
@@ -167,6 +176,10 @@ pub struct App {
     /// Every live claude session started before hooks/statusline were
     /// installed, so none of them report anything (recomputed periodically).
     pub stale_sessions: bool,
+    /// A newer release, once the background check finds one.
+    pub update: Option<update::Available>,
+    update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
+    pub update_dismissed: bool,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
     last_cfg_check: Instant,
@@ -209,6 +222,25 @@ impl App {
             .map(|st| st.workspace)
             .filter(|ws| !ws.tabs.is_empty())
             .unwrap_or_default();
+
+        // Update check runs on its own thread so a slow network never
+        // delays startup; the UI picks the answer up when it lands.
+        let update_rx = if cfg.update.check {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let base = paths.base().to_path_buf();
+            let ping = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("giverny update check".into())
+                .spawn(move || {
+                    let found = update::check(&base, true);
+                    let _ = tx.send(found);
+                    ping.request_repaint();
+                })
+                .ok()
+                .map(|_| rx)
+        } else {
+            None
+        };
 
         let wake_ctx = cc.egui_ctx.clone();
         let (claude, spooled) =
@@ -254,6 +286,9 @@ impl App {
             input_seen: HashMap::new(),
             dragging: None,
             stale_sessions: false,
+            update: None,
+            update_rx,
+            update_dismissed: false,
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
@@ -480,6 +515,35 @@ impl App {
             Action::ReorderTab(tab, category, index) => {
                 self.ws.reorder_tab(tab, category, index);
             }
+            Action::RunUpdate => {
+                // Deliberately visible: a new tab runs the same command a new
+                // user would, so nothing rewrites the binary out of sight.
+                let category = self
+                    .ws
+                    .active_tab()
+                    .map(|t| t.category)
+                    .or_else(|| self.ws.categories.first().map(|c| c.id));
+                if let Some(category) = category {
+                    self.apply(
+                        ctx,
+                        Action::NewTab {
+                            category,
+                            cwd: None,
+                        },
+                    );
+                    if let Some(id) = self.ws.active {
+                        let mut cmd = update::install_command().into_bytes();
+                        cmd.push(b'\r');
+                        self.pending_inject.push((
+                            Instant::now() + Duration::from_millis(1100),
+                            id,
+                            Inject::Raw(cmd),
+                        ));
+                    }
+                }
+                self.update_dismissed = true;
+            }
+            Action::DismissUpdate => self.update_dismissed = true,
         }
     }
 
@@ -645,6 +709,12 @@ impl App {
             return;
         }
         self.last_info_refresh = Instant::now();
+        if let Some(rx) = &self.update_rx
+            && let Ok(found) = rx.try_recv()
+        {
+            self.update = found;
+            self.update_rx = None;
+        }
         self.stale_sessions = self.claude.sessions_predate_settings();
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
@@ -1090,6 +1160,25 @@ fn doctor() {
          · notifications fire when claude needs YOU (permission prompts, questions),\n    \
          not when it merely finishes"
     );
+}
+
+/// `giverny update` — headless check, for scripts and impatient users.
+fn update_cli() {
+    let paths = Paths::default_dirs();
+    println!("giverny {CURRENT}", CURRENT = update::CURRENT);
+    match update::fetch_latest() {
+        Ok(latest) => match update::is_newer(&latest, update::CURRENT) {
+            Some(true) => {
+                println!(
+                    "update available: {latest}\n\nrun:\n  {}",
+                    update::install_command()
+                );
+            }
+            _ => println!("up to date (latest release is {latest})"),
+        },
+        Err(err) => println!("could not reach github: {err}"),
+    }
+    let _ = paths;
 }
 
 fn config_mtime(paths: &Paths) -> Option<std::time::SystemTime> {

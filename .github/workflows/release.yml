@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # A tag push does not create a Release object, and the upload action waits
-  # for one — so make it first.
+  # for one — so make it first, and attach the installers to it.
   create-release:
     runs-on: ubuntu-latest
     steps:
@@ -18,22 +18,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && exit 0
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Giverny $GITHUB_REF_NAME" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what's in this release.
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Giverny $GITHUB_REF_NAME" \
+              --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md).
 
-          Binaries below are unsigned; on macOS you may need \`xattr -d com.apple.quarantine\`. Building from source (\`cargo build --release\`) is equally supported."
+          ## Install
+
+          Linux / macOS:
+          \`\`\`sh
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | sh
+          \`\`\`
+
+          Windows:
+          \`\`\`powershell
+          irm https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.ps1 | iex
+          \`\`\`
+
+          Binaries are unsigned; on macOS you may need \`xattr -d com.apple.quarantine\`."
+          fi
+          # The installers must live on the release itself — that is the URL
+          # the one-line install command fetches.
+          gh release upload "$GITHUB_REF_NAME" \
+            scripts/install.sh scripts/install.ps1 --clobber
 
   upload-binaries:
     needs: create-release
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

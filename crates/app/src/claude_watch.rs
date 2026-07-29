@@ -304,14 +304,14 @@ impl ClaudeWatch {
                 // hooks-installed check would freeze such tabs; per-tab
                 // evidence keeps the registry driving exactly those.
                 let hooks_own = entry.last_hook.is_some();
-                if !hooks_own {
+                // "busy" is unambiguous evidence Claude is running again, so
+                // it always clears a stale attention flag — even under hook
+                // authority (a declined prompt emits no hook to clear it).
+                if entry.state == ClaudeState::NeedsYou && live.entry.busy() {
+                    entry.state = ClaudeState::Busy;
+                } else if !hooks_own {
                     match entry.state {
-                        ClaudeState::NeedsYou => {
-                            if live.entry.busy() {
-                                entry.state = ClaudeState::Busy;
-                            }
-                        }
-                        ClaudeState::DoneUnseen => {}
+                        ClaudeState::NeedsYou | ClaudeState::DoneUnseen => {}
                         _ => {
                             entry.state = if live.entry.busy() {
                                 ClaudeState::Busy
@@ -468,6 +468,17 @@ impl ClaudeWatch {
         }
     }
 
+    /// The user typed in the tab: attention has been given, whatever the
+    /// outcome. Declining a permission prompt (Escape) produces no hook at
+    /// all, so without this the flag would blink forever.
+    pub fn mark_attended(&mut self, tab: TabId) {
+        if let Some(entry) = self.tabs.get_mut(&tab)
+            && matches!(entry.state, ClaudeState::NeedsYou | ClaudeState::DoneUnseen)
+        {
+            entry.state = ClaudeState::Idle;
+        }
+    }
+
     pub fn state_of(&self, tab: TabId) -> ClaudeState {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
@@ -568,6 +579,28 @@ mod tests {
         let fx = feed(&mut w, &m, Some(TabId(1)));
         assert!(fx.notify.is_empty(), "completions must not notify");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+    }
+
+    #[test]
+    fn typing_clears_a_stale_attention_flag() {
+        // Declining a permission prompt (Escape) emits no hook at all — only
+        // the user's keystroke tells us the flag is stale.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let m = hook(
+            "Notification",
+            r#","notification_type":"permission_prompt""#,
+        );
+        feed(&mut w, &m, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::NeedsYou);
+
+        w.mark_attended(TAB);
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle, "typing clears the flag");
+
+        // Working tabs keep their spinner when the user types.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        w.mark_attended(TAB);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
     }
 
     #[test]

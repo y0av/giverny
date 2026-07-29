@@ -1,0 +1,30 @@
+name: Pad
+desc: lily pad, seam + bloom
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #3f5c31      :
+  m = #5d8043      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....PPPPPP.....
+  ...PPPPPPPPpp...
+  ..PPPPPPPPpppp..
+  .PPPPPPPPppppkk.
+  .PPPPPrPppppppk.
+  PPPPPrcrpppppppk
+  PPPPrcGcrppppppk
+  PPPPPrcrppppppmk
+  PPPPpprpkkpppmmk
+  PPPppppppkkpmmmk
+  PPpppppppppkkmmk
+  .pppppppppmmk...
+  .ppppppppmmmm...
+  ..pkppppmmmmkk..
+  ...kkppmmmmkk...
+  .....kkkkkk.....

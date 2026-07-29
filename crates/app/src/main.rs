@@ -142,6 +142,8 @@ pub struct App {
     pending_inject: Vec<(Instant, TabId, Inject)>,
     pub palette: Option<overlays::PaletteState>,
     pub session_picker: Option<overlays::SessionPicker>,
+    /// Last seen user-interaction counter per tab (detects "typed just now").
+    input_seen: HashMap<TabId, u64>,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -212,6 +214,7 @@ impl App {
             pending_inject: Vec::new(),
             palette: None,
             session_picker: None,
+            input_seen: HashMap::new(),
         };
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
@@ -736,6 +739,20 @@ impl eframe::App for App {
             .iter()
             .map(|t| (t.id, t.title().to_string()))
             .collect();
+        // Typing in a tab counts as attending to it: declining a permission
+        // prompt (Escape) emits no hook, so nothing else would clear the flag.
+        for (&id, rt) in &self.rt {
+            let Some(session) = &rt.session else { continue };
+            let seq = session.input_seq();
+            if self
+                .input_seen
+                .insert(id, seq)
+                .is_some_and(|prev| prev != seq)
+            {
+                self.claude.mark_attended(id);
+            }
+        }
+
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
@@ -751,6 +768,11 @@ impl eframe::App for App {
         }
         if effects.animating {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else {
+            // Heartbeat: egui only repaints on demand, so without this the
+            // registry scan (and therefore state transitions for tabs whose
+            // output isn't waking the UI) would stall while the window idles.
+            ctx.request_repaint_after(Duration::from_millis(700));
         }
 
         let mut actions = self.shortcuts(&ctx);

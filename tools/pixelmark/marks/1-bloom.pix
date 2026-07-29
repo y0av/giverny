@@ -1,0 +1,27 @@
+name: Bloom
+desc: bare 8-petal water lily
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  ......dddd......
+  ..ddd.dddd.ddd..
+  ..dddddrrddddd..
+  ..ddrrrrrrrrdd..
+  ...drrrccrrrd...
+  .dddrrccccrrddd.
+  dddrrccGGccrrddd
+  dddrrccGGccrrddd
+  .dddrrccccrrddd.
+  ...drrrccrrrd...
+  ..ddrrrrrrrrdd..
+  ..dddddrrddddd..
+  ..ddd.dddd.ddd..
+  ......dddd......
+  .......dd.......

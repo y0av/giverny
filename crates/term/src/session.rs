@@ -27,6 +27,8 @@ pub struct TermSession {
     /// Set once the user has interacted with this session (typing, clicks) —
     /// automated injections must stand down after that.
     user_input: Arc<AtomicBool>,
+    /// Counts user interactions so the app can detect "typed since last frame".
+    input_seq: Arc<std::sync::atomic::AtomicU64>,
     sender: LoopSender,
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
@@ -103,6 +105,7 @@ impl TermSession {
             shared,
             child_pid,
             user_input: Arc::new(AtomicBool::new(false)),
+            input_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sender,
             notifier,
             dirty,
@@ -116,10 +119,17 @@ impl TermSession {
     /// injections (cwd fix, auto-resume) must stand down.
     pub fn note_user_input(&self) {
         self.user_input.store(true, Ordering::Release);
+        self.input_seq.fetch_add(1, Ordering::Release);
     }
 
     pub fn had_user_input(&self) -> bool {
         self.user_input.load(Ordering::Acquire)
+    }
+
+    /// Monotonic count of user interactions; a change since the last frame
+    /// means the user just typed here (used to clear attention markers).
+    pub fn input_seq(&self) -> u64 {
+        self.input_seq.load(Ordering::Acquire)
     }
 
     /// Shell's live working directory via `/proc` (linux).

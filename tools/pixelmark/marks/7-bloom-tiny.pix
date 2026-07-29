@@ -1,0 +1,18 @@
+name: Bloom tiny
+desc: 8x8 rail companion
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  G = #f0d178      @
+
+grid:
+  ...dd...
+  .ddrrdd.
+  .drrrrd.
+  drrGGrrd
+  drrGGrrd
+  .drrrrd.
+  .ddrrdd.
+  ...dd...

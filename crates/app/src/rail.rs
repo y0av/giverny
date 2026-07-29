@@ -543,7 +543,7 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
                 .color(AMBER),
         );
         if ui.small_button("install").on_hover_text(format!(
-            "adds `giverny relay` to {} event(s) in each profile's settings.json\n(existing hooks preserved; a .giverny-bak backup is written)",
+            "adds `giverny relay` to {} event(s) plus a compact statusline for live usage,\nin each profile's settings.json (existing hooks and any statusline of your own\nare preserved; a .giverny-bak backup is written)",
             giverny_claude::hooks::RELAY_EVENTS.len()
         )).clicked() {
             actions.push(Action::InstallHooks);
@@ -577,16 +577,17 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         } else {
             "install hooks below, or run `giverny doctor` in a tab"
         });
-        let sl = app.claude.statusline_on();
-        if ui
-            .small_button(if sl { "live usage ✓" } else { "live usage" })
-            .on_hover_text(
-                "adds a tiny statusline to claude that pushes usage to Giverny\n\
-                 (official rate_limits field — no API calls). Click to toggle.",
-            )
-            .clicked()
+        // Only surfaced when off — it is on by default wherever hooks are.
+        if !app.claude.statusline_on()
+            && ui
+                .small_button("enable live usage")
+                .on_hover_text(
+                    "adds a compact statusline to claude that pushes usage to Giverny\n\
+                     (official rate_limits field — no API calls)",
+                )
+                .clicked()
         {
-            actions.push(Action::ToggleStatusline(!sl));
+            actions.push(Action::ToggleStatusline(true));
         }
     });
     if app.claude.accounts.is_empty() {

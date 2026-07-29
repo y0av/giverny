@@ -108,6 +108,7 @@ impl ClaudeWatch {
             (None, Vec::new())
         };
 
+        Self::adopt_statusline_where_hooked(&profiles);
         let mut watch = ClaudeWatch {
             hooks_installed: Self::check_installed(&profiles),
             profiles,
@@ -132,16 +133,39 @@ impl ClaudeWatch {
         let mut ok = 0;
         let mut errs = Vec::new();
         for p in &self.profiles {
-            match hooks::install_into(&p.config_dir.join("settings.json")) {
+            let settings = p.config_dir.join("settings.json");
+            match hooks::install_into(&settings) {
                 Ok(_) => ok += 1,
                 Err(e) => errs.push(format!("{}: {e}", p.name)),
             }
+            // Live usage comes with it — the on-disk cache goes stale for
+            // accounts that aren't actively running Claude. Profiles with a
+            // statusline of their own are left alone (set_statusline errs).
+            if let Err(e) = hooks::set_statusline(&settings, true) {
+                tracing::info!("statusline skipped for {}: {e}", p.name);
+            }
         }
         self.hooks_installed = Self::check_installed(&self.profiles);
+        self.refresh_usage();
         if errs.is_empty() {
             Ok(ok)
         } else {
             Err(errs.join("; "))
+        }
+    }
+
+    /// Profiles that already have our hooks get the live-usage statusline
+    /// too: installing hooks is the consent boundary, and without this the
+    /// usage panel silently shows day-old numbers.
+    fn adopt_statusline_where_hooked(profiles: &[Profile]) {
+        for p in profiles {
+            let settings = p.config_dir.join("settings.json");
+            if hooks::installed_in(&settings) && !hooks::statusline_installed_in(&settings) {
+                match hooks::set_statusline(&settings, true) {
+                    Ok(()) => tracing::info!("live-usage statusline enabled for {}", p.name),
+                    Err(e) => tracing::info!("statusline skipped for {}: {e}", p.name),
+                }
+            }
         }
     }
 

@@ -1,3 +1,5 @@
+<img src="assets/icon/giverny-128.png" width="96" height="96" alt="Giverny">
+
 # Giverny
 
 **A native GPU terminal built around Claude Code.** Categorized, persistent tabs on a left rail; live Claude activity on every tab; usage meters for all your Claude accounts. *Where your Claudes live.*
@@ -26,9 +28,14 @@ Giverny **never calls any network API and never reads credential files**. Usage 
 
 ```sh
 git clone https://github.com/y0av/giverny && cd giverny
-cargo build --release          # Rust 1.90+
-./target/release/giverny
+cargo install --path crates/app   # Rust 1.90+; puts `giverny` on your PATH
+giverny install-desktop           # launcher entry + icons (Linux)
+giverny
 ```
+
+Or grab a binary from [the latest release](https://github.com/y0av/giverny/releases/latest). To run from the source tree without installing: `cargo run --release`.
+
+Giverny rewrites its own hook paths in `settings.json` whenever you move or reinstall the binary, so switching between a source build and an installed one keeps working.
 
 Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
 
@@ -41,6 +48,19 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
 | `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
 | `Ctrl+Shift+P` | fuzzy tab palette |
+
+## Linux desktop integration
+
+```sh
+giverny install-desktop      # --remove to undo
+```
+
+Installs `giverny.desktop` and the icon set under `~/.local/share`. **On Wayland this
+is what puts the icon in the dock** — Wayland gives a client no way to hand the
+compositor its own icon, so the shell matches the window's `app_id` to an installed
+desktop entry instead. X11 and Windows use the icon compiled into the binary and need
+no setup. The entry records the binary's current path; re-run it if you move or rebuild
+elsewhere. `giverny doctor` reports whether it is in place.
 | `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
 | `Ctrl`+hover / click | underline and open a path or URL |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |

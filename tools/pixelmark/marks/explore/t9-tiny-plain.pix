@@ -1,0 +1,18 @@
+name: t9-tiny-plain
+desc: 8x8 companion
+
+palette:
+  . = none          
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  G = #f0d178      @
+
+grid:
+  ...vv...
+  .vvVVvv.
+  .vVVVVv.
+  vVVGGVVv
+  vVVGGVVv
+  .vVVVVv.
+  .vvVVvv.
+  ...vv...

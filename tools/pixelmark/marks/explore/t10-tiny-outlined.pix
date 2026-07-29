@@ -1,0 +1,19 @@
+name: t10-tiny-outlined
+desc: 8x8 companion
+
+palette:
+  . = none          
+  u = #55476b      ,
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  G = #f0d178      @
+
+grid:
+  ...uu...
+  .uuvvuu.
+  .uVVVVu.
+  uvVGGVvu
+  uvVGGVvu
+  .uVVVVu.
+  .uuvvuu.
+  ...uu...

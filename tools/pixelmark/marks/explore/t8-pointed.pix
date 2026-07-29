@@ -1,0 +1,29 @@
+name: T8 pointed
+desc: sharper petal tips
+
+palette:
+  . = none          
+  u = #55476b      ,
+  U = #6d5c88      .
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......uu.......
+  .......uu.......
+  ..uu..uvvu..uu..
+  ..uUuuUvvUuuUu..
+  ...uvvvVVvvvu...
+  ...uvVVVVVVvu...
+  ..uUvVccccVvUu..
+  uuvvVVcGGcVVvvuu
+  uuvvVVcGGcVVvvuu
+  ..uUvVccccVvUu..
+  ...uvVVVVVVvu...
+  ...uvvvVVvvvu...
+  ..uUuuUvvUuuUu..
+  ..uu..uvvu..uu..
+  .......uu.......
+  .......uu.......

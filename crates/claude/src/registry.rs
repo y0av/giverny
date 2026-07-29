@@ -21,6 +21,10 @@ pub struct SessionEntry {
     pub status: String,
     #[serde(rename = "statusUpdatedAt", default)]
     pub status_updated_at: u64,
+    /// Session start, ms since epoch. Compared against `settings.json`'s
+    /// mtime to tell whether this session loaded Giverny's hooks.
+    #[serde(rename = "startedAt", default)]
+    pub started_at_ms: u64,
 }
 
 impl SessionEntry {
@@ -296,6 +300,7 @@ mod tests {
             "nameSource": "derived", "status": "busy", "updatedAt": 1, "statusUpdatedAt": 2 }"#;
         let e: SessionEntry = serde_json::from_str(json).unwrap();
         assert_eq!(e.pid, 1234);
+        assert_eq!(e.started_at_ms, 1785250651905);
         assert!(e.busy());
         assert_eq!(e.name.as_deref(), Some("dev-13"));
         assert_eq!(e.cwd, PathBuf::from("/home/u/dev"));

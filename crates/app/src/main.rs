@@ -1,6 +1,8 @@
 //! Giverny — a native terminal built around Claude Code.
 
 mod claude_watch;
+mod desktop;
+mod icon;
 mod overlays;
 mod rail;
 
@@ -50,11 +52,23 @@ fn main() -> eframe::Result {
             doctor();
             return Ok(());
         }
+        // Wayland cannot take an icon from the client; it reads one from an
+        // installed desktop entry matched on app_id. See `desktop`.
+        Some("install-desktop") => {
+            match std::env::args().nth(2).as_deref() {
+                Some("--remove") => desktop::remove(),
+                _ => desktop::install(),
+            }
+            return Ok(());
+        }
         Some("--help" | "-h") => {
             println!(
                 "giverny — a native terminal built around Claude Code\n\n\
                  USAGE:\n  giverny            launch the terminal\n  \
                  giverny doctor     diagnose Claude integration\n  \
+                 giverny install-desktop [--remove]\n                     \
+                 install the desktop entry + icons (needed for the\n                     \
+                 taskbar icon on Wayland)\n  \
                  giverny relay      (internal) Claude Code hook entrypoint\n  \
                  giverny statusline (internal) Claude Code statusline entrypoint"
             );
@@ -74,6 +88,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("giverny")
             .with_title("Giverny")
+            .with_icon(icon::icon_data(16))
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
@@ -149,6 +164,9 @@ pub struct App {
     input_seen: HashMap<TabId, u64>,
     /// Tab currently being dragged in the rail.
     pub dragging: Option<TabId>,
+    /// Every live claude session started before hooks/statusline were
+    /// installed, so none of them report anything (recomputed periodically).
+    pub stale_sessions: bool,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
     last_cfg_check: Instant,
@@ -235,6 +253,7 @@ impl App {
             session_picker: None,
             input_seen: HashMap::new(),
             dragging: None,
+            stale_sessions: false,
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
@@ -626,6 +645,7 @@ impl App {
             return;
         }
         self.last_info_refresh = Instant::now();
+        self.stale_sessions = self.claude.sessions_predate_settings();
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
         }
@@ -965,6 +985,23 @@ fn doctor() {
         );
     }
 
+    // On Wayland the taskbar icon comes from the desktop entry, not from us.
+    #[cfg(target_os = "linux")]
+    if let Some((entry, installed)) = desktop::status() {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        println!(
+            "desktop entry {}",
+            match (installed, wayland) {
+                (true, _) => format!("installed ✓  {}", entry.display()),
+                (false, true) => "MISSING — run `giverny install-desktop` \
+                                  (Wayland takes the taskbar icon from it)"
+                    .to_string(),
+                (false, false) => "not installed (X11 uses the built-in window icon)".to_string(),
+            }
+        );
+        println!();
+    }
+
     let profs = profiles::discover(&[]);
     if profs.is_empty() {
         println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
@@ -1018,13 +1055,33 @@ fn doctor() {
     let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
     let live = registry::scan(dirs);
     println!("\nlive claude sessions ({}):", live.len());
+    let mut stale = 0;
     for s in &live {
+        // Sessions that started before settings.json was last written never
+        // loaded our hooks or statusline.
+        let settings_at = std::fs::metadata(s.config_dir.join("settings.json"))
+            .and_then(|m| m.modified())
+            .ok();
+        let started = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(s.entry.started_at_ms));
+        let predates = matches!((settings_at, started), (Some(a), Some(b)) if b < a);
+        if predates {
+            stale += 1;
+        }
         println!(
-            "  pid {:<8} {:<6} {:<28} {}",
+            "  pid {:<8} {:<6} {:<26} {:<12} {}",
             s.entry.pid,
             s.entry.status,
             s.entry.name.as_deref().unwrap_or("-"),
+            if predates { "PRE-HOOKS" } else { "hooked" },
             s.entry.cwd.display()
+        );
+    }
+    if stale > 0 {
+        println!(
+            "\n  ⟳ {stale} session(s) started before hooks/statusline were installed.\n    \
+             Claude Code reads settings.json at session start — exit and re-run\n    \
+             claude in those tabs to get live states and live usage."
         );
     }
 

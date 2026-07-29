@@ -343,6 +343,45 @@ pub fn installed_in(settings_path: &Path) -> bool {
     })
 }
 
+/// Do this profile's Giverny entries point at a *different* binary than the
+/// one running now? Happens after `cargo install`, a rebuild elsewhere, or
+/// moving the binary — the hooks then silently invoke a path that may no
+/// longer exist.
+pub fn needs_path_refresh(settings_path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let want_relay = relay_command();
+    let hooks_stale = root
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .is_some_and(|hooks| {
+            hooks.values().any(|v| {
+                v.as_array().is_some_and(|arr| {
+                    arr.iter().filter(|e| is_our_entry(e)).any(|e| {
+                        e.get("hooks").and_then(|h| h.as_array()).is_some_and(|hs| {
+                            hs.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(|c| c != want_relay)
+                            })
+                        })
+                    })
+                })
+            })
+        });
+    let want_statusline = format!("{} statusline", exe_path());
+    let statusline_stale = root
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains("giverny") && c != want_statusline);
+    hooks_stale || statusline_stale
+}
+
 /// Install (or refresh) the relay hooks in one profile's `settings.json`.
 /// Non-destructive: existing hooks are preserved; our stale entries (old exe
 /// paths) are replaced. A one-time backup lands beside the file.

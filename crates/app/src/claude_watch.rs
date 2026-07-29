@@ -48,6 +48,16 @@ pub struct AccountPanel {
     pub statusline_on: bool,
 }
 
+/// Where an account's displayed numbers came from, and how old they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Pushed by the statusline this many minutes ago.
+    Live(i64),
+    /// Read from Claude Code's on-disk cache, this many minutes old.
+    Cache(i64),
+    None,
+}
+
 /// Push-based usage from Claude Code's statusline payload.
 #[derive(Debug, Clone)]
 pub struct LiveUsage {
@@ -160,7 +170,19 @@ impl ClaudeWatch {
     fn adopt_statusline_where_hooked(profiles: &[Profile]) {
         for p in profiles {
             let settings = p.config_dir.join("settings.json");
-            if hooks::installed_in(&settings) && !hooks::statusline_installed_in(&settings) {
+            if !hooks::installed_in(&settings) {
+                continue;
+            }
+            // Our entries point at whichever binary installed them. After a
+            // `cargo install` or a moved build, that path can be stale —
+            // rewrite it to the running executable so the relay keeps working.
+            if hooks::needs_path_refresh(&settings) {
+                match hooks::install_into(&settings) {
+                    Ok(_) => tracing::info!("hook paths refreshed for {}", p.name),
+                    Err(e) => tracing::warn!("hook refresh failed for {}: {e}", p.name),
+                }
+            }
+            if !hooks::statusline_installed_in(&settings) || hooks::needs_path_refresh(&settings) {
                 match hooks::set_statusline(&settings, true) {
                     Ok(()) => tracing::info!("live-usage statusline enabled for {}", p.name),
                     Err(e) => tracing::info!("statusline skipped for {}: {e}", p.name),
@@ -427,6 +449,44 @@ impl ClaudeWatch {
     /// Do all profiles have the live-usage statusline?
     pub fn statusline_on(&self) -> bool {
         !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
+    }
+
+    /// Claude Code loads `settings.json` when a session starts, so hooks and
+    /// the statusline do nothing for sessions that were already running.
+    /// True when every live session predates the settings file — i.e. the
+    /// user needs to restart claude for any of it to take effect.
+    pub fn sessions_predate_settings(&self) -> bool {
+        let live = registry::scan(self.profiles.iter().map(|p| p.config_dir.clone()));
+        if live.is_empty() {
+            return false;
+        }
+        live.iter().all(|s| {
+            let settings = s.config_dir.join("settings.json");
+            match (
+                std::fs::metadata(&settings).and_then(|m| m.modified()),
+                std::time::UNIX_EPOCH.checked_add(Duration::from_millis(s.entry.started_at_ms)),
+            ) {
+                (Ok(settings_at), Some(started)) => started < settings_at,
+                _ => false,
+            }
+        })
+    }
+
+    /// How fresh this account's numbers actually are, and from where.
+    /// Reporting only the cache age reads as "stale" even when a live push
+    /// has already overridden the bars.
+    pub fn freshness(acc: &AccountPanel, now: jiff::Timestamp) -> Freshness {
+        let cache_min = acc.usage.as_ref().map(|u| usage::age_minutes(u, now));
+        let live_min = acc
+            .live
+            .as_ref()
+            .map(|l| (l.at.elapsed().as_secs() / 60) as i64);
+        match (live_min, cache_min) {
+            (Some(l), Some(c)) if l <= c => Freshness::Live(l),
+            (Some(l), None) => Freshness::Live(l),
+            (_, Some(c)) => Freshness::Cache(c),
+            (None, None) => Freshness::None,
+        }
     }
 
     /// Percent to display for one bucket: the statusline push when it is

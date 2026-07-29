@@ -1,0 +1,18 @@
+name: Giverny tiny
+desc: 8x8 companion for the rail and statusline
+
+palette:
+  . = none          
+  U = #6d5c88      .
+  v = #9a86b8      o
+  G = #f0d178      @
+
+grid:
+  ...UU...
+  .UUvvUU.
+  .UvvvvU.
+  UvvGGvvU
+  UvvGGvvU
+  .UvvvvU.
+  .UUvvUU.
+  ...UU...

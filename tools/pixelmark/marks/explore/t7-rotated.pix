@@ -1,0 +1,29 @@
+name: T7 rotated
+desc: petals on the diagonals
+
+palette:
+  . = none          
+  u = #55476b      ,
+  U = #6d5c88      .
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  ................
+  ....uuu..uuu....
+  ....uvvuuvvu....
+  ....uvvvvvvu....
+  .uuuUvVVVVvUuuu.
+  .uvvvvVVVVvvvvu.
+  .uvvVVVccVVVvvu.
+  ..uvVVcGGcVVvu..
+  ..uvVVcGGcVVvu..
+  .uvvVVVccVVVvvu.
+  .uvvvvVVVVvvvvu.
+  .uuuUvVVVVvUuuu.
+  ....uvvvvvvu....
+  ....uvvuuvvu....
+  ....uuu..uuu....
+  ................

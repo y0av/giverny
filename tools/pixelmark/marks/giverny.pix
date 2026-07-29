@@ -1,0 +1,29 @@
+name: Giverny
+desc: the mark — wisteria water lily
+
+palette:
+  . = none          
+  u = #55476b      ,
+  U = #6d5c88      .
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......uu.......
+  ......uUUu......
+  ..uuuuUvvUuuuu..
+  ..uUvUUvvUUvUu..
+  ..uvvvvVVvvvvu..
+  ..uUvVVVVVVvUu..
+  .uUUvVccccVvUUu.
+  uUvvVVcGGcVVvvUu
+  uUvvVVcGGcVVvvUu
+  .uUUvVccccVvUUu.
+  ..uUvVVVVVVvUu..
+  ..uvvvvVVvvvvu..
+  ..uUvUUvvUUvUu..
+  ..uuuuUvvUuuuu..
+  ......uUUu......
+  .......uu.......

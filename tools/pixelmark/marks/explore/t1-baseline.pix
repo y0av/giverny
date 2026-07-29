@@ -1,0 +1,27 @@
+name: T1 baseline
+desc: a11 exactly as generated
+
+palette:
+  . = none          
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......vv.......
+  ......vvvv......
+  ..vvv.vvvv.vvv..
+  ..vvvvvVVvvvvv..
+  ..vvVVVVVVVVvv..
+  ...vVVVccVVVv...
+  .vvvVVccccVVvvv.
+  vvvVVccGGccVVvvv
+  vvvVVccGGccVVvvv
+  .vvvVVccccVVvvv.
+  ...vVVVccVVVv...
+  ..vvVVVVVVVVvv..
+  ..vvvvvVVvvvvv..
+  ..vvv.vvvv.vvv..
+  ......vvvv......
+  .......vv.......

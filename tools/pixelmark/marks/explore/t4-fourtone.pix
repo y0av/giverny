@@ -1,0 +1,28 @@
+name: T4 four-tone
+desc: extra dark outer band
+
+palette:
+  . = none          
+  U = #6d5c88      .
+  v = #9a86b8      o
+  V = #c3b6d8      *
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......UU.......
+  ......UUUU......
+  ..UUU.UvvU.UUU..
+  ..UUvvvvvvvvUU..
+  ..UvvvvVVvvvvU..
+  ...vvVVVVVVvv...
+  .UUvvVccccVvvUU.
+  UUvvVVcGGcVVvvUU
+  UUvvVVcGGcVVvvUU
+  .UUvvVccccVvvUU.
+  ...vvVVVVVVvv...
+  ..UvvvvVVvvvvU..
+  ..UUvvvvvvvvUU..
+  ..UUU.UvvU.UUU..
+  ......UUUU......
+  .......UU.......

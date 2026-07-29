@@ -5,7 +5,7 @@ use eframe::egui::{
 };
 use giverny_core::tabs::{CategoryId, TabId};
 
-use crate::claude_watch::{ClaudeState, ClaudeWatch};
+use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
 use crate::{Action, App, RenameTarget, category_color};
 
 const ROW_H: f32 = 40.0;
@@ -577,6 +577,24 @@ fn tab_row(
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    // Installed, but every running session predates it — claude reads
+    // settings at startup, so none of them will report anything.
+    if app.claude.hooks_installed && app.stale_sessions {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("⟳ restart claude for live states")
+                    .font(FontId::monospace(10.0))
+                    .color(AMBER),
+            )
+            .on_hover_text(
+                "hooks and the usage statusline load when a claude session starts.\n\
+                 every running session began before they were installed —\n\
+                 exit and re-run claude in a tab to activate them.",
+            );
+        });
+    }
     if app.claude.hooks_installed && !app.claude.relay_listening() {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -669,20 +687,46 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                     .font(FontId::monospace(10.5))
                     .color(fg),
             );
-            if let Some(u) = &acc.usage {
-                let age = giverny_claude::usage::age_minutes(u, now);
-                if age > 30 {
-                    let label = if age >= 120 {
-                        format!("{}h old", age / 60)
-                    } else {
-                        format!("{age}m old")
-                    };
+            // Say where the numbers came from and how old they are — a
+            // cache age shown next to live-pushed bars reads as stale.
+            let human = |m: i64| {
+                if m >= 1440 {
+                    format!("{}d", m / 1440)
+                } else if m >= 120 {
+                    format!("{}h", m / 60)
+                } else {
+                    format!("{m}m")
+                }
+            };
+            match ClaudeWatch::freshness(acc, now) {
+                Freshness::Live(m) => {
                     ui.label(
-                        egui::RichText::new(label)
+                        egui::RichText::new(if m < 2 {
+                            "· live".to_string()
+                        } else {
+                            format!("· live {}", human(m))
+                        })
+                        .font(FontId::monospace(9.0))
+                        .color(TEAL),
+                    )
+                    .on_hover_text("pushed by claude's statusline");
+                }
+                Freshness::Cache(m) if m > 30 => {
+                    let resp = ui.label(
+                        egui::RichText::new(format!("{} old", human(m)))
                             .font(FontId::monospace(9.0))
                             .color(dim),
                     );
+                    if acc.statusline_on {
+                        resp.on_hover_text(
+                            "from claude's on-disk cache.\nlive updates start when a claude \
+                             session is restarted\n(settings load at session start)",
+                        );
+                    } else {
+                        resp.on_hover_text("from claude's on-disk cache");
+                    }
                 }
+                _ => {}
             }
         });
         match &acc.usage {

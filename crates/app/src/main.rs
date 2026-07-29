@@ -118,6 +118,8 @@ pub enum Action {
     OpenSessions(TabId),
     /// Resume a specific past conversation in a tab.
     ResumeSpecific(TabId, String, PathBuf),
+    /// Drag-and-drop: place a tab in a category at a position.
+    ReorderTab(TabId, CategoryId, usize),
 }
 
 pub struct TabRuntime {
@@ -145,6 +147,8 @@ pub struct App {
     pub session_picker: Option<overlays::SessionPicker>,
     /// Last seen user-interaction counter per tab (detects "typed just now").
     input_seen: HashMap<TabId, u64>,
+    /// Tab currently being dragged in the rail.
+    pub dragging: Option<TabId>,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
     last_cfg_check: Instant,
@@ -230,6 +234,7 @@ impl App {
             palette: None,
             session_picker: None,
             input_seen: HashMap::new(),
+            dragging: None,
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
@@ -452,6 +457,9 @@ impl App {
             }
             Action::MoveTab(tab, category) => {
                 self.ws.move_tab_to_category(tab, category);
+            }
+            Action::ReorderTab(tab, category, index) => {
+                self.ws.reorder_tab(tab, category, index);
             }
         }
     }

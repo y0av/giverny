@@ -99,9 +99,27 @@ pub fn resolve_shell(cfg: &SpawnCfg) -> Shell {
     }
     #[cfg(windows)]
     {
-        // Tier-2: config → WSL → PowerShell fallback chain lands in M6.
+        // Prefer a WSL login shell (where Claude Code and unix tooling live),
+        // then PowerShell 7, then Windows PowerShell.
+        for (prog, args) in [
+            ("wsl.exe", vec!["~".to_string()]),
+            ("pwsh.exe", vec![]),
+            ("powershell.exe", vec![]),
+        ] {
+            if which_windows(prog) {
+                return Shell::new(prog.to_string(), args);
+            }
+        }
         Shell::new("powershell.exe".into(), vec![])
     }
+}
+
+/// Is `prog` resolvable on `%PATH%`?
+#[cfg(windows)]
+fn which_windows(prog: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(prog).is_file()))
+        .unwrap_or(false)
 }
 
 /// Spawn the PTY for a tab. `window_id` feeds `WINDOWID`/utmp bookkeeping.

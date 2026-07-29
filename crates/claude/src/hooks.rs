@@ -87,8 +87,9 @@ pub fn run_relay(spool: &Path) {
             }
         }
     }
-    // App not running: spool so session-id captures survive (drained at the
-    // app's next launch).
+    // No socket (Windows, or the app is closed): spool to disk. A running app
+    // polls this file; a closed one drains it at next launch, so session-id
+    // captures are never lost.
     if let Some(dir) = spool.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -99,6 +100,51 @@ pub fn run_relay(spool: &Path) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Drain and clear the spool file, returning whatever it held.
+fn drain_spool(spool: &Path) -> Vec<RelayMsg> {
+    let mut out = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(spool) {
+        for line in content.lines() {
+            if let Ok(msg) = serde_json::from_str::<RelayMsg>(line) {
+                out.push(msg);
+            }
+        }
+        let _ = std::fs::remove_file(spool);
+    }
+    out
+}
+
+/// Spool-file transport: the relay appends lines, the app polls and drains.
+/// This is the Windows path (no unix sockets) and the fallback anywhere the
+/// socket cannot be bound. Latency is the poll interval, not instant, but it
+/// needs no IPC primitives at all.
+pub fn spawn_spool_watcher(
+    spool: &Path,
+    wake: impl Fn() + Send + 'static,
+) -> anyhow::Result<(crossbeam_channel::Receiver<RelayMsg>, Vec<RelayMsg>)> {
+    let spooled = drain_spool(spool);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let path = spool.to_path_buf();
+    std::thread::Builder::new()
+        .name("giverny hook spool".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(400));
+                let batch = drain_spool(&path);
+                if batch.is_empty() {
+                    continue;
+                }
+                for msg in batch {
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+                wake();
+            }
+        })?;
+    Ok((rx, spooled))
 }
 
 /// Bind the app-side listener. `wake` is called after each delivered message
@@ -112,16 +158,7 @@ pub fn spawn_listener(
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
 
-    // Drain the spool first.
-    let mut spooled = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(spool) {
-        for line in content.lines() {
-            if let Ok(msg) = serde_json::from_str::<RelayMsg>(line) {
-                spooled.push(msg);
-            }
-        }
-        let _ = std::fs::remove_file(spool);
-    }
+    let spooled = drain_spool(spool);
 
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
@@ -463,6 +500,28 @@ mod tests {
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "user's entry kept");
         assert_eq!(stop[0]["hooks"][0]["command"], "echo mine");
+    }
+
+    #[test]
+    fn spool_watcher_delivers_and_clears() {
+        let dir = std::env::temp_dir().join(format!("giverny-spool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spool = dir.join("hook-spool.jsonl");
+        let line = r#"{"tab_id":"giverny-3","config_dir":null,"event":{"hook_event_name":"Stop"}}"#;
+        std::fs::write(&spool, format!("{line}\n")).unwrap();
+
+        // Messages already on disk come back immediately...
+        let (rx, spooled) = spawn_spool_watcher(&spool, || {}).unwrap();
+        assert_eq!(spooled.len(), 1);
+        assert!(!spool.exists(), "spool is consumed, not replayed forever");
+
+        // ...and later appends arrive through the channel.
+        std::fs::write(&spool, format!("{line}\n")).unwrap();
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("watcher delivers appended lines");
+        assert_eq!(msg.hook_event(), Some("Stop"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

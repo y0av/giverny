@@ -40,10 +40,21 @@ fn pid_alive(pid: u32) -> bool {
     {
         Path::new(&format!("/proc/{pid}")).exists()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // Portable fallback: kill(0).
+        // macOS/BSD: signal 0 probes existence without delivering anything.
         unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys.process(Pid::from_u32(pid)).is_some()
     }
 }
 
@@ -253,8 +264,23 @@ pub fn has_ancestor(mut pid: u32, ancestor: u32) -> bool {
     false
 }
 
+/// Same walk on non-Linux platforms, via `sysinfo`'s parent links.
 #[cfg(not(target_os = "linux"))]
-pub fn has_ancestor(_pid: u32, _ancestor: u32) -> bool {
+pub fn has_ancestor(pid: u32, ancestor: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut current = Pid::from_u32(pid);
+    let target = Pid::from_u32(ancestor);
+    for _ in 0..64 {
+        if current == target {
+            return true;
+        }
+        match sys.process(current).and_then(|p| p.parent()) {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
     false
 }
 

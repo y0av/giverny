@@ -213,6 +213,36 @@ impl Workspace {
         self.active = Some(self.tabs[next].id);
     }
 
+    /// Move `id` into `category` at `index` counted among that category's
+    /// tabs (clamped). Used by rail drag-and-drop.
+    pub fn reorder_tab(&mut self, id: TabId, category: CategoryId, index: usize) {
+        if self.category(category).is_none() {
+            return;
+        }
+        let Some(from) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let mut tab = self.tabs.remove(from);
+        tab.category = category;
+
+        // Translate the within-category index into an absolute rail index.
+        let siblings: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.category == category)
+            .map(|(i, _)| i)
+            .collect();
+        let at = match siblings.get(index) {
+            Some(&i) => i,
+            None => siblings
+                .last()
+                .map(|&i| i + 1)
+                .unwrap_or_else(|| self.tabs.len()),
+        };
+        self.tabs.insert(at, tab);
+    }
+
     pub fn move_tab_to_category(&mut self, id: TabId, category: CategoryId) {
         if self.category(category).is_none() {
             return;
@@ -312,6 +342,32 @@ mod tests {
         assert!(ws.remove_category(work));
         assert_eq!(ws.tab(t).unwrap().category, main);
         assert!(!ws.remove_category(main), "last category stays");
+    }
+
+    #[test]
+    fn reorder_within_and_across_categories() {
+        let mut ws = Workspace::default();
+        let main = ws.categories[0].id;
+        let work = ws.add_category("work");
+        let a = ws.add_tab(main);
+        let b = ws.add_tab(main);
+        let c = ws.add_tab(main);
+        let ids = |ws: &Workspace, cat| ws.tabs_in(cat).map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&ws, main), vec![a, b, c]);
+
+        // Drag the last tab to the front of its own category.
+        ws.reorder_tab(c, main, 0);
+        assert_eq!(ids(&ws, main), vec![c, a, b]);
+
+        // Drop into an empty category.
+        ws.reorder_tab(a, work, 0);
+        assert_eq!(ids(&ws, work), vec![a]);
+        assert_eq!(ids(&ws, main), vec![c, b]);
+
+        // An out-of-range index appends rather than panicking.
+        ws.reorder_tab(b, work, 99);
+        assert_eq!(ids(&ws, work), vec![a, b]);
+        assert_eq!(ids(&ws, main), vec![c]);
     }
 
     #[test]

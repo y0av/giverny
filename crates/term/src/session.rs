@@ -132,16 +132,26 @@ impl TermSession {
         self.input_seq.load(Ordering::Acquire)
     }
 
-    /// Shell's live working directory via `/proc` (linux).
+    /// The shell's live working directory: `/proc` on Linux (cheap), and
+    /// `sysinfo` elsewhere — this is what keeps tab paths and Claude resume
+    /// targets correct as the user `cd`s around.
     pub fn proc_cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child_pid?;
         #[cfg(target_os = "linux")]
         {
-            let pid = self.child_pid?;
             std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            None
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+            let mut sys = System::new();
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+                true,
+                ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+            );
+            sys.process(Pid::from_u32(pid))
+                .and_then(|p| p.cwd().map(|c| c.to_path_buf()))
         }
     }
 

@@ -94,18 +94,18 @@ fn done_kind(notification_type: &str) -> bool {
 impl ClaudeWatch {
     pub fn new(spool: &Path, wake: impl Fn() + Send + 'static) -> (Self, Vec<RelayMsg>) {
         let profiles = profiles::discover(&[]);
+        // Unix: a socket for instant delivery. Elsewhere (or if binding
+        // fails): poll the spool file the relay always falls back to.
         #[cfg(unix)]
-        let (hook_rx, spooled) = match hooks::spawn_listener(spool, wake) {
+        let listener = hooks::spawn_listener(spool, wake);
+        #[cfg(not(unix))]
+        let listener = hooks::spawn_spool_watcher(spool, wake);
+        let (hook_rx, spooled) = match listener {
             Ok((rx, spooled)) => (Some(rx), spooled),
             Err(err) => {
                 tracing::warn!("hook listener unavailable: {err:#}");
                 (None, Vec::new())
             }
-        };
-        #[cfg(not(unix))]
-        let (hook_rx, spooled) = {
-            let _ = (spool, wake);
-            (None, Vec::new())
         };
 
         Self::adopt_statusline_where_hooked(&profiles);

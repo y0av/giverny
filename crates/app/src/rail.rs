@@ -114,15 +114,39 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             usage_panel(app, ui, dim, fg, &mut actions);
         });
 
+    // Drag-and-drop bookkeeping: where would a drop land right now?
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let mut drop_target: Option<(CategoryId, usize, f32)> = None;
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(6.0);
             for cat in &cats {
-                category_header(app, ui, cat, dim, &mut actions);
+                let header = category_header(app, ui, cat, dim, &mut actions);
+                // Dropping on a header (or an empty category's band) appends
+                // to that category.
+                if let Some(p) = pointer
+                    && app.dragging.is_some()
+                    && header.contains(p)
+                {
+                    drop_target = Some((cat.id, cat.rows.len(), header.max.y));
+                }
                 if !cat.collapsed {
-                    for row in &cat.rows {
-                        tab_row(app, ui, row, fg, dim, &mut actions);
+                    for (index, row) in cat.rows.iter().enumerate() {
+                        let rect = tab_row(app, ui, row, fg, dim, &mut actions);
+                        // Above a row's midpoint drops before it, below after.
+                        if let Some(p) = pointer
+                            && app.dragging.is_some()
+                            && p.x >= rect.min.x
+                            && p.x <= rect.max.x
+                            && p.y >= rect.min.y - 2.0
+                            && p.y <= rect.max.y + 2.0
+                        {
+                            let after = p.y > rect.center().y;
+                            let y = if after { rect.max.y } else { rect.min.y };
+                            drop_target = Some((cat.id, index + usize::from(after), y));
+                        }
                     }
                 }
                 ui.add_space(6.0);
@@ -141,6 +165,26 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             ui.add_space(8.0);
         });
 
+    // Drop indicator + commit on release.
+    if let Some(dragged) = app.dragging {
+        if let Some((_, _, y)) = drop_target {
+            let x0 = ui.min_rect().min.x + 6.0;
+            let x1 = ui.min_rect().max.x - 6.0;
+            ui.painter().hline(
+                x0..=x1,
+                y,
+                egui::Stroke::new(2.0, Color32::from_rgb(0x5f, 0xa3, 0xa3)),
+            );
+        }
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some((cat, index, _)) = drop_target {
+                actions.push(Action::ReorderTab(dragged, cat, index));
+            }
+            app.dragging = None;
+        }
+    }
+
     actions
 }
 
@@ -150,7 +194,7 @@ fn category_header(
     cat: &CatData,
     dim: Color32,
     actions: &mut Vec<Action>,
-) {
+) -> Rect {
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_H), Sense::click());
     let p = ui.painter_at(rect);
@@ -182,7 +226,7 @@ fn category_header(
                 Some(value),
             ));
         }
-        return;
+        return rect;
     }
 
     // Right-click: category management.
@@ -311,6 +355,7 @@ fn category_header(
     if resp.hovered() {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
+    rect
 }
 
 fn tab_row(
@@ -320,9 +365,9 @@ fn tab_row(
     fg: Color32,
     dim: Color32,
     actions: &mut Vec<Action>,
-) {
+) -> Rect {
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     // Geometry-based hover: `resp.hovered()` flickers when the close button
     // overlays the row in the hit-test stack.
@@ -422,7 +467,7 @@ fn tab_row(
             let value = buf.clone();
             actions.push(Action::CommitRename(RenameTarget::Tab(row.id), Some(value)));
         }
-        return;
+        return rect;
     }
 
     // Title (char-budget truncation; the rail is monospace).
@@ -472,7 +517,7 @@ fn tab_row(
         );
         if close.clicked() {
             actions.push(Action::CloseTab(row.id));
-            return;
+            return rect;
         }
     }
 
@@ -507,6 +552,9 @@ fn tab_row(
         }
     });
 
+    if resp.drag_started() {
+        app.dragging = Some(row.id);
+    }
     if resp.double_clicked() {
         actions.push(Action::StartRename(RenameTarget::Tab(row.id)));
     } else if resp.clicked() {
@@ -517,6 +565,15 @@ fn tab_row(
     if hovered {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
+    // The dragged row dims in place; the drop indicator shows where it lands.
+    if app.dragging == Some(row.id) {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+        );
+    }
+    rect
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {

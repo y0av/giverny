@@ -42,25 +42,38 @@ pub fn category_color(index: usize) -> Color32 {
     CATEGORY_PALETTE[index % CATEGORY_PALETTE.len()]
 }
 
-/// Remember accounts found in the environment, so they survive the launcher.
+/// Remember accounts that only the environment knew about.
 ///
-/// `CCTOP_CONFIG_DIRS` is the convention for listing extra `CLAUDE_CONFIG_DIR`s
-/// and it usually lives in a shell rc file — which means Giverny sees it when
-/// started from a terminal and *not* when started from the dock or a desktop
-/// entry, so the same machine shows three accounts or one depending on how it
-/// was launched. Copy anything new into the config the first time we do see
-/// it; after that the account list is ours and no longer depends on how we
-/// were started.
-fn adopt_env_profiles(paths: &Paths, cfg: &mut config::Config) {
-    let Ok(list) = std::env::var("CCTOP_CONFIG_DIRS") else {
-        return;
-    };
-    let home_default = dirs::home_dir().map(|h| h.join(".claude"));
+/// An account kept somewhere unguessable is found through the environment —
+/// `CLAUDE_CONFIG_DIR`, or a list in `CCTOP_CONFIG_DIRS` for people who keep
+/// one. Both usually come from a shell rc, which means they exist when
+/// Giverny starts from a terminal and not when it starts from a launcher, so
+/// the account list changed depending on how the app was opened.
+///
+/// Writing them into the config the first time we see them makes the list
+/// ours: from then on it is the same however Giverny was started, and it is
+/// visible and editable in settings rather than hidden in a shell rc.
+fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
+    let mut from_env: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        from_env.push(PathBuf::from(dir));
+    }
+    if let Ok(list) = std::env::var("CCTOP_CONFIG_DIRS") {
+        from_env.extend(list.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
+    }
+
+    // Anything found without being told stays out of the config — no point
+    // recording ~/.claude or a dir the scan picks up anyway. This must not
+    // consult the environment: the environment is what is being decided about,
+    // so `discover()` here would find everything and record nothing.
+    let found_anyway = giverny_claude::profiles::ambient_dirs();
     let mut merged = cfg.behavior.extra_profile_dirs.clone();
     let mut added = 0;
-    for dir in list.split(':').filter(|p| !p.is_empty()).map(PathBuf::from) {
-        // `~/.claude` is found on its own; listing it again is noise.
-        if Some(&dir) == home_default.as_ref() || !dir.is_dir() || merged.contains(&dir) {
+    for dir in from_env {
+        if merged.contains(&dir)
+            || found_anyway.contains(&dir)
+            || !giverny_claude::profiles::looks_like_account(&dir)
+        {
             continue;
         }
         merged.push(dir);
@@ -77,7 +90,7 @@ fn adopt_env_profiles(paths: &Paths, cfg: &mut config::Config) {
     );
     match giverny_core::settings::write(paths.base(), def, &value) {
         Ok(()) => {
-            tracing::info!("remembered {added} account dir(s) from CCTOP_CONFIG_DIRS");
+            tracing::info!("remembered {added} account dir(s) from the environment");
             cfg.behavior.extra_profile_dirs = merged;
         }
         Err(err) => tracing::warn!("could not record account dirs: {err:#}"),
@@ -322,7 +335,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
-        adopt_env_profiles(&paths, &mut cfg);
+        remember_env_accounts(&paths, &mut cfg);
         let theme = Theme::by_name(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
         let mut shared = RenderShared::with_family(theme, cfg.font.size, family)
@@ -1439,24 +1452,28 @@ fn doctor() {
         println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
         return;
     }
-    // Name the sources honestly: which one supplied them is exactly what you
-    // need to know when an account goes missing.
+    // Name the sources consulted: when an account goes missing, "where do
+    // these come from" is the actual question.
     let mut sources = vec!["~/.claude"];
-    if !cfg.behavior.extra_profile_dirs.is_empty() {
-        sources.push("config");
+    if giverny_claude::profiles::ambient_dirs().len() > 1 {
+        sources.push("claude* in ~ and ~/.config");
+    }
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+        sources.push("$CLAUDE_CONFIG_DIR");
     }
     if std::env::var_os("CCTOP_CONFIG_DIRS").is_some() {
         sources.push("$CCTOP_CONFIG_DIRS");
-    } else {
-        println!("note: $CCTOP_CONFIG_DIRS is not set here. It comes from your shell rc,");
-        println!("      so a launcher-started Giverny never sees it. Accounts listed in");
-        println!("      config.toml (behavior.extra_profile_dirs) do not depend on it.");
+    }
+    if !cfg.behavior.extra_profile_dirs.is_empty() {
+        sources.push("config");
     }
     println!(
         "profiles ({} found via {}):",
         profs.len(),
         sources.join(" + ")
     );
+    println!("      an account kept elsewhere? add its directory in settings → claude,");
+    println!("      or as behavior.extra_profile_dirs in config.toml");
     let now = jiff::Timestamp::now();
     for p in &profs {
         let settings = p.config_dir.join("settings.json");

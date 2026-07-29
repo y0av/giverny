@@ -646,15 +646,17 @@ mod tests {
 
     #[test]
     fn account_dirs_are_remembered_not_just_inherited() {
-        // The bug this guards: CCTOP_CONFIG_DIRS lives in a shell rc, so the
-        // account list changed depending on whether Giverny was started from
-        // a terminal or from the dock.
+        // The bug this guards: CLAUDE_CONFIG_DIR and CCTOP_CONFIG_DIRS come
+        // from a shell rc, so the account list changed depending on whether
+        // Giverny was started from a terminal or from the dock.
         let dir = std::env::temp_dir().join(format!("giverny-adopt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
         let paths = giverny_core::state::Paths::at(&dir);
         let account = dir.join("envs/work/claude");
         std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        let not_an_account = dir.join("envs/empty");
+        std::fs::create_dir_all(&not_an_account).unwrap();
         std::fs::write(
             giverny_core::config::config_path(paths.base()),
             giverny_core::settings::template(),
@@ -662,15 +664,30 @@ mod tests {
         .unwrap();
 
         let mut cfg = giverny_core::config::Config::default();
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("CCTOP_CONFIG_DIRS", account.display().to_string()) };
-        crate::adopt_env_profiles(&paths, &mut cfg);
-        unsafe { std::env::remove_var("CCTOP_CONFIG_DIRS") };
+        // SAFETY: single-threaded test. The real environment is set aside so
+        // this asserts about the fixture rather than the developer's machine.
+        let real = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::set_var(
+                "CCTOP_CONFIG_DIRS",
+                format!("{}:{}", account.display(), not_an_account.display()),
+            );
+        }
+        crate::remember_env_accounts(&paths, &mut cfg);
+        unsafe {
+            std::env::remove_var("CCTOP_CONFIG_DIRS");
+            if let Some(v) = real {
+                std::env::set_var("CLAUDE_CONFIG_DIR", v);
+            }
+        }
 
-        assert_eq!(cfg.behavior.extra_profile_dirs, vec![account.clone()]);
+        // The real one is kept; the empty directory is not silently adopted.
+        assert!(cfg.behavior.extra_profile_dirs.contains(&account));
+        assert!(!cfg.behavior.extra_profile_dirs.contains(&not_an_account));
         // And it is on disk, so the next launch finds it with no environment.
         let reloaded = giverny_core::config::load(paths.base());
-        assert_eq!(reloaded.behavior.extra_profile_dirs, vec![account]);
+        assert!(reloaded.behavior.extra_profile_dirs.contains(&account));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -78,14 +78,85 @@ fn profile_for(config_dir: PathBuf) -> Profile {
     }
 }
 
-/// Discover profiles: the default `~/.claude`, plus any dirs in the
-/// `CCTOP_CONFIG_DIRS` (colon-separated) convention, plus `extra` from
-/// config. Deduped by canonical path, order preserved.
+/// Does this directory look like a Claude account, rather than something
+/// that merely sits at a plausible path?
+///
+/// Claude Code writes an identity file and a session registry; requiring one
+/// of them keeps an empty `~/.claude-old` out of the account list.
+pub fn looks_like_account(dir: &Path) -> bool {
+    dir.is_dir() && (identity_path(dir).is_file() || dir.join("sessions").is_dir())
+}
+
+/// Directories that could plausibly hold an account, without walking $HOME.
+///
+/// Deliberately shallow: `~/.claude`, anything named like it beside it, and
+/// the XDG config location. Anywhere else, an account has to be named — by
+/// `CLAUDE_CONFIG_DIR`, or in `behavior.extra_profile_dirs`.
+fn scan_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(home) = dirs::home_dir() else {
+        return out;
+    };
+    let mut roots = vec![home.clone()];
+    if let Some(config) = dirs::config_dir() {
+        roots.push(config);
+    }
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // `.claude`, `.claude-work`, `claude`, `claude-personal`…
+            if name.trim_start_matches('.').starts_with("claude") {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// Directories Giverny finds without being told: the default account and
+/// anything the shallow scan turns up.
+///
+/// Separate from `discover` because "would this be found anyway?" has to be
+/// answerable *without* the environment — the environment is exactly what is
+/// being decided about.
+pub fn ambient_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let default = home.join(".claude");
+        if default.is_dir() {
+            out.push(default);
+        }
+    }
+    out.extend(
+        scan_candidates()
+            .into_iter()
+            .filter(|d| looks_like_account(d)),
+    );
+    out
+}
+
+/// Discover accounts, in priority order:
+///
+/// 1. `~/.claude` — Claude Code's default.
+/// 2. `$CLAUDE_CONFIG_DIR` — Claude Code's own way of naming a config dir.
+/// 3. A shallow scan of `~` and `~/.config` for `claude*` directories.
+/// 4. `$CCTOP_CONFIG_DIRS` — a colon-separated list, supported for people
+///    who already keep one; nothing here depends on it.
+/// 5. `extra`, from `behavior.extra_profile_dirs` — the general answer for
+///    accounts kept anywhere else.
+///
+/// Deduped by canonical path, order preserved. Candidates that do not look
+/// like accounts are dropped, except ones named explicitly (2 and 5): if you
+/// named it, you get told about it rather than silently ignored.
 pub fn discover(extra: &[PathBuf]) -> Vec<Profile> {
     let mut out = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut push = |dir: PathBuf| {
-        if !dir.is_dir() {
+    let mut push = |dir: PathBuf, require_evidence: bool| {
+        if !dir.is_dir() || (require_evidence && !looks_like_account(&dir)) {
             return;
         }
         let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -95,15 +166,21 @@ pub fn discover(extra: &[PathBuf]) -> Vec<Profile> {
     };
 
     if let Some(home) = dirs::home_dir() {
-        push(home.join(".claude"));
+        push(home.join(".claude"), false);
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        push(PathBuf::from(dir), false);
+    }
+    for dir in ambient_dirs() {
+        push(dir, true);
     }
     if let Ok(list) = std::env::var("CCTOP_CONFIG_DIRS") {
         for part in list.split(':').filter(|p| !p.is_empty()) {
-            push(PathBuf::from(part));
+            push(PathBuf::from(part), true);
         }
     }
     for dir in extra {
-        push(dir.clone());
+        push(dir.clone(), false);
     }
     out
 }
@@ -116,6 +193,69 @@ pub fn find<'a>(profiles: &'a [Profile], config_dir: &Path) -> Option<&'a Profil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("giverny-prof-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A directory that looks like a logged-in account.
+    fn account(dir: &Path, email: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"u"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_account_needs_evidence_not_just_a_plausible_name() {
+        let root = scratch("evidence");
+        let empty = root.join(".claude-old");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            !looks_like_account(&empty),
+            "an empty dir is not an account"
+        );
+
+        let real = root.join(".claude-work");
+        account(&real, "a@b.c");
+        assert!(looks_like_account(&real));
+
+        // A session registry counts too: a config dir used but never logged in.
+        let fresh = root.join(".claude-fresh");
+        std::fs::create_dir_all(fresh.join("sessions")).unwrap();
+        assert!(looks_like_account(&fresh));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicitly_named_dirs_are_kept_even_without_evidence() {
+        // If you listed it, an empty or not-yet-used dir should still appear,
+        // so it can be seen to be empty rather than silently dropped.
+        let root = scratch("named");
+        let named = root.join("somewhere/odd");
+        std::fs::create_dir_all(&named).unwrap();
+        let found = discover(std::slice::from_ref(&named));
+        assert!(
+            found.iter().any(|p| p.config_dir == named),
+            "a named dir was dropped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_profile_is_named_after_its_account_not_its_directory() {
+        let root = scratch("naming");
+        let dir = root.join("work-claude");
+        account(&dir, "sam@example.com");
+        let p = profile_for(dir);
+        assert_eq!(p.name, "sam");
+        assert_eq!(p.email.as_deref(), Some("sam@example.com"));
+    }
 
     #[test]
     fn identity_path_default_is_sibling() {

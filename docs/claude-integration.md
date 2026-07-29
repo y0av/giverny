@@ -33,6 +33,12 @@ cd "<transcript cwd>" && CLAUDE_CONFIG_DIR="<dir>" command claude --resume <id>
 
 `claude --resume` only finds a conversation from the directory it ran in — using the tab's current directory fails once you've `cd`'d. `command` bypasses shell wrapper functions named `claude`. If the session is already live elsewhere, resume is skipped: two writers interleave into one transcript.
 
+## Accounts
+
+An account is a `CLAUDE_CONFIG_DIR`. Giverny finds them, in order: `~/.claude`; `$CLAUDE_CONFIG_DIR`; a shallow scan of `~` and `~/.config` for `claude*` directories that contain an identity file or a session registry; `$CCTOP_CONFIG_DIRS` if you happen to keep one; and `behavior.extra_profile_dirs` from the config.
+
+The last is the general answer for accounts kept anywhere else, and it is what the others feed into: a directory named only by the environment is copied into the config the first time Giverny sees it. Environment variables usually come from a shell rc, so without that step the account list changes depending on whether the app was started from a terminal or from a launcher. `giverny doctor` prints which source each account came from.
+
 ## Usage meters
 
 Claude Code caches its own usage payload per account in `.claude.json → cachedUsageUtilization`, including the `limits[]` array with the 5-hour window, the weekly window, and model-scoped buckets. Giverny renders `limits[]` only — the legacy scalar keys beside it are placeholder-ridden. A window whose `resets_at` has passed renders 0%: the server keeps the lapsed window's percentage rather than zeroing it.

@@ -7,7 +7,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 
 | Key | Default | What it does |
 |---|---|---|
-| `font.family` | `""` | Preferred monospace family; empty auto-detects. |
+| `font.family` | `""` | Preferred monospace family; empty auto-detects. Takes effect on restart. |
 | `font.size` | `13.0` | Point size of the terminal grid. |
 | `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin. |
 | `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
@@ -16,6 +16,6 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `behavior.notifications` | `true` | Notify when Claude needs you in a background tab. |
 | `behavior.restore_claude` | `"auto"` | Re-run `claude --resume` in restored tabs. One of: auto, prompt, off. |
 | `behavior.restore_apps` | 26 programs | Full-screen programs a restored tab may start again by itself. |
-| `behavior.extra_profile_dirs` | `[]` | More CLAUDE_CONFIG_DIRs to show as accounts. |
+| `behavior.extra_profile_dirs` | `[]` | More CLAUDE_CONFIG_DIRs to show as accounts. Takes effect on restart. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
 | `update.check` | `true` | Ask GitHub once a day whether a newer Giverny exists. |

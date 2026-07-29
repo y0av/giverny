@@ -271,6 +271,14 @@ fn row(
                         .font(FontId::monospace(10.0))
                         .color(c.dim),
                 );
+                if def.needs_restart && modified {
+                    ui.label(
+                        RichText::new("restart to apply")
+                            .font(FontId::monospace(9.5))
+                            .color(c.amber),
+                    )
+                    .on_hover_text("the change is saved; it loads at startup");
+                }
                 if modified {
                     ui.label(
                         RichText::new("●")

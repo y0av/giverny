@@ -102,6 +102,9 @@ pub struct SettingDef {
     /// Extra lines for the template only, where the *why* is worth having in
     /// the file but too long for a settings row.
     pub note: &'static [&'static str],
+    /// Changing this does nothing until Giverny restarts. The screen says so
+    /// once you have changed it, rather than looking broken.
+    pub needs_restart: bool,
     pub kind: Kind,
 }
 
@@ -193,7 +196,8 @@ pub const SETTINGS: &[SettingDef] = &[
         label: "font family",
         section: Section::Appearance,
         doc: "Preferred monospace family; empty auto-detects.",
-        note: &[],
+        note: &["Applied at startup: the glyph atlas is built once."],
+        needs_restart: true,
         kind: Kind::Text {
             default: "",
             placeholder: "auto-detect",
@@ -205,6 +209,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Appearance,
         doc: "Point size of the terminal grid.",
         note: &["Ctrl +/-/0 changes this live and writes it back here."],
+        needs_restart: false,
         kind: Kind::Float {
             default: 13.0,
             min: 6.0,
@@ -217,6 +222,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Appearance,
         doc: "Colour theme for the grid and the chrome around it.",
         note: &[],
+        needs_restart: false,
         // Kept in step with `Theme::NAMES` by a test in the app crate —
         // core cannot see the themes, so the check lives where both are.
         kind: Kind::Choice {
@@ -238,6 +244,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Titles,
         doc: "Drop the `user@host:` your shell puts in front of every title.",
         note: &["The rail is narrow and that prefix is the same on every tab."],
+        needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
@@ -246,6 +253,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Titles,
         doc: "Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo.",
         note: &[],
+        needs_restart: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -254,6 +262,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Terminal,
         doc: "Lines kept above the screen, per tab.",
         note: &[],
+        needs_restart: false,
         kind: Kind::Int {
             default: 10_000,
             min: 0,
@@ -266,6 +275,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Terminal,
         doc: "Notify when Claude needs you in a background tab.",
         note: &[],
+        needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
@@ -274,6 +284,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Restore,
         doc: "Re-run `claude --resume` in restored tabs.",
         note: &[],
+        needs_restart: false,
         kind: Kind::Choice {
             default: "auto",
             options: &["auto", "prompt", "off"],
@@ -288,6 +299,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "Anything not listed is remembered but never re-run: replaying an",
             "arbitrary last command could deploy, delete or push something.",
         ],
+        needs_restart: false,
         kind: Kind::StringList {
             default: Some(default_restore_apps),
         },
@@ -298,6 +310,7 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Claude,
         doc: "More CLAUDE_CONFIG_DIRs to show as accounts.",
         note: &["Beyond ~/.claude and anything in $CCTOP_CONFIG_DIRS."],
+        needs_restart: true,
         kind: Kind::StringList { default: None },
     },
     SettingDef {
@@ -310,6 +323,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "The caches themselves are re-read every 60s regardless, plus",
             "immediately after a refresh; statusline pushes land as they arrive.",
         ],
+        needs_restart: false,
         kind: Kind::Int {
             default: 10,
             min: 0,
@@ -325,6 +339,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "The only network request Giverny ever makes - set false and it",
             "makes none. GIVERNY_NO_UPDATE in the environment also disables it.",
         ],
+        needs_restart: false,
         kind: Kind::Bool { default: true },
     },
 ];
@@ -473,6 +488,9 @@ pub fn template() -> String {
         for line in def.note {
             out.push_str(&format!("# {line}\n"));
         }
+        if def.needs_restart {
+            out.push_str("# Takes effect when Giverny restarts.\n");
+        }
         if let Kind::Choice { options, .. } = &def.kind {
             out.push_str(&format!("# One of: {}\n", options.join(" | ")));
         }
@@ -516,6 +534,9 @@ pub fn markdown() -> String {
         let mut doc = def.doc.replace('|', "\\|");
         if let Kind::Choice { options, .. } = &def.kind {
             doc.push_str(&format!(" One of: {}.", options.join(", ")));
+        }
+        if def.needs_restart {
+            doc.push_str(" Takes effect on restart.");
         }
         out.push_str(&format!("| `{}` | {} | {} |\n", def.key, default, doc));
     }

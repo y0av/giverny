@@ -120,8 +120,12 @@ fn done_kind(notification_type: &str) -> bool {
 }
 
 impl ClaudeWatch {
-    pub fn new(spool: &Path, wake: impl Fn() + Send + 'static) -> (Self, Vec<RelayMsg>) {
-        let profiles = profiles::discover(&[]);
+    pub fn new(
+        spool: &Path,
+        extra_dirs: &[PathBuf],
+        wake: impl Fn() + Send + 'static,
+    ) -> (Self, Vec<RelayMsg>) {
+        let profiles = profiles::discover(extra_dirs);
         // Unix: a socket for instant delivery. Elsewhere (or if binding
         // fails): poll the spool file the relay always falls back to.
         #[cfg(unix)]

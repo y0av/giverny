@@ -645,6 +645,36 @@ mod tests {
     }
 
     #[test]
+    fn account_dirs_are_remembered_not_just_inherited() {
+        // The bug this guards: CCTOP_CONFIG_DIRS lives in a shell rc, so the
+        // account list changed depending on whether Giverny was started from
+        // a terminal or from the dock.
+        let dir = std::env::temp_dir().join(format!("giverny-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = giverny_core::state::Paths::at(&dir);
+        let account = dir.join("envs/work/claude");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(
+            giverny_core::config::config_path(paths.base()),
+            giverny_core::settings::template(),
+        )
+        .unwrap();
+
+        let mut cfg = giverny_core::config::Config::default();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("CCTOP_CONFIG_DIRS", account.display().to_string()) };
+        crate::adopt_env_profiles(&paths, &mut cfg);
+        unsafe { std::env::remove_var("CCTOP_CONFIG_DIRS") };
+
+        assert_eq!(cfg.behavior.extra_profile_dirs, vec![account.clone()]);
+        // And it is on disk, so the next launch finds it with no environment.
+        let reloaded = giverny_core::config::load(paths.base());
+        assert_eq!(reloaded.behavior.extra_profile_dirs, vec![account]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_finds_options_from_any_section() {
         let mut state = SettingsState {
             section: Section::Appearance,

@@ -309,7 +309,11 @@ pub const SETTINGS: &[SettingDef] = &[
         label: "extra account directories",
         section: Section::Claude,
         doc: "More CLAUDE_CONFIG_DIRs to show as accounts.",
-        note: &["Beyond ~/.claude and anything in $CCTOP_CONFIG_DIRS."],
+        note: &[
+            "Beyond ~/.claude. Anything in $CCTOP_CONFIG_DIRS is copied here",
+            "the first time Giverny sees it, because that variable comes from",
+            "your shell rc and is absent when the app starts from a launcher.",
+        ],
         needs_restart: true,
         kind: Kind::StringList { default: None },
     },

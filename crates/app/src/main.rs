@@ -42,6 +42,48 @@ pub fn category_color(index: usize) -> Color32 {
     CATEGORY_PALETTE[index % CATEGORY_PALETTE.len()]
 }
 
+/// Remember accounts found in the environment, so they survive the launcher.
+///
+/// `CCTOP_CONFIG_DIRS` is the convention for listing extra `CLAUDE_CONFIG_DIR`s
+/// and it usually lives in a shell rc file — which means Giverny sees it when
+/// started from a terminal and *not* when started from the dock or a desktop
+/// entry, so the same machine shows three accounts or one depending on how it
+/// was launched. Copy anything new into the config the first time we do see
+/// it; after that the account list is ours and no longer depends on how we
+/// were started.
+fn adopt_env_profiles(paths: &Paths, cfg: &mut config::Config) {
+    let Ok(list) = std::env::var("CCTOP_CONFIG_DIRS") else {
+        return;
+    };
+    let home_default = dirs::home_dir().map(|h| h.join(".claude"));
+    let mut merged = cfg.behavior.extra_profile_dirs.clone();
+    let mut added = 0;
+    for dir in list.split(':').filter(|p| !p.is_empty()).map(PathBuf::from) {
+        // `~/.claude` is found on its own; listing it again is noise.
+        if Some(&dir) == home_default.as_ref() || !dir.is_dir() || merged.contains(&dir) {
+            continue;
+        }
+        merged.push(dir);
+        added += 1;
+    }
+    if added == 0 {
+        return;
+    }
+    let Some(def) = giverny_core::settings::by_key("behavior.extra_profile_dirs") else {
+        return;
+    };
+    let value = giverny_core::settings::Value::List(
+        merged.iter().map(|p| p.display().to_string()).collect(),
+    );
+    match giverny_core::settings::write(paths.base(), def, &value) {
+        Ok(()) => {
+            tracing::info!("remembered {added} account dir(s) from CCTOP_CONFIG_DIRS");
+            cfg.behavior.extra_profile_dirs = merged;
+        }
+        Err(err) => tracing::warn!("could not record account dirs: {err:#}"),
+    }
+}
+
 /// Claude Code marks its own subprocesses with session-identity variables.
 /// Launch Giverny *from* a Claude session — a tab, or `claude` in any
 /// terminal — and those markers are inherited, then handed to every shell we
@@ -280,6 +322,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
+        adopt_env_profiles(&paths, &mut cfg);
         let theme = Theme::by_name(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
         let mut shared = RenderShared::with_family(theme, cfg.font.size, family)
@@ -336,8 +379,11 @@ impl App {
         };
 
         let wake_ctx = cc.egui_ctx.clone();
-        let (claude, spooled) =
-            claude_watch::ClaudeWatch::new(&paths.hook_spool(), move || wake_ctx.request_repaint());
+        let (claude, spooled) = claude_watch::ClaudeWatch::new(
+            &paths.hook_spool(),
+            &cfg.behavior.extra_profile_dirs,
+            move || wake_ctx.request_repaint(),
+        );
         // Events spooled while the app was closed: keep session captures.
         for msg in &spooled {
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else {
@@ -1387,14 +1433,29 @@ fn doctor() {
         println!();
     }
 
-    let profs = profiles::discover(&[]);
+    let cfg = config::load(Paths::default_dirs().base());
+    let profs = profiles::discover(&cfg.behavior.extra_profile_dirs);
     if profs.is_empty() {
         println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
         return;
     }
+    // Name the sources honestly: which one supplied them is exactly what you
+    // need to know when an account goes missing.
+    let mut sources = vec!["~/.claude"];
+    if !cfg.behavior.extra_profile_dirs.is_empty() {
+        sources.push("config");
+    }
+    if std::env::var_os("CCTOP_CONFIG_DIRS").is_some() {
+        sources.push("$CCTOP_CONFIG_DIRS");
+    } else {
+        println!("note: $CCTOP_CONFIG_DIRS is not set here. It comes from your shell rc,");
+        println!("      so a launcher-started Giverny never sees it. Accounts listed in");
+        println!("      config.toml (behavior.extra_profile_dirs) do not depend on it.");
+    }
     println!(
-        "profiles ({} found via ~/.claude + CCTOP_CONFIG_DIRS):",
-        profs.len()
+        "profiles ({} found via {}):",
+        profs.len(),
+        sources.join(" + ")
     );
     let now = jiff::Timestamp::now();
     for p in &profs {

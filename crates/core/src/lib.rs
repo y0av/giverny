@@ -4,6 +4,7 @@
 //! versioned `state/tabs.json` store + scrollback snapshots (atomic writes,
 //! crash-safe), single-instance locking, and restore orchestration.
 
+pub mod config;
 pub mod git;
 pub mod state;
 pub mod tabs;

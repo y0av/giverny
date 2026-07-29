@@ -43,14 +43,25 @@ pub struct RenderShared {
 
 impl RenderShared {
     pub fn new(theme: Theme, font_size: f32) -> anyhow::Result<Self> {
+        Self::with_family(theme, font_size, None)
+    }
+
+    /// `family`: preferred font family from config (`None` = auto-detect).
+    pub fn with_family(theme: Theme, font_size: f32, family: Option<&str>) -> anyhow::Result<Self> {
         Ok(Self {
-            fonts: FontSet::load(None)?,
+            fonts: FontSet::load(family)?,
             atlas: Atlas::default(),
             theme,
             font_size,
             metrics: None,
             generation: 0,
         })
+    }
+
+    /// Swap the theme; invalidates cached meshes so colors take effect.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn metrics_for(&mut self, px: f32) -> CellMetrics {

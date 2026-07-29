@@ -49,6 +49,83 @@ impl Theme {
         }
     }
 
+    /// Daylight version of the garden palette.
+    pub fn monet_light() -> Self {
+        let hex =
+            |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8);
+        Theme {
+            bg: hex(0xf7f4ec),
+            fg: hex(0x2f3438),
+            cursor: hex(0x9a6b1f),
+            cursor_text: hex(0xf7f4ec),
+            selection_bg: Color32::from_rgba_unmultiplied(0x5b, 0x7f, 0xa6, 70),
+            ansi: [
+                hex(0x2f3438),
+                hex(0xa8412f),
+                hex(0x4d7a34),
+                hex(0x9a7418),
+                hex(0x2f5f8c),
+                hex(0x74589c),
+                hex(0x2c7d7d),
+                hex(0x6d7379),
+                hex(0x5b6167),
+                hex(0xc35b4e),
+                hex(0x7ba25a),
+                hex(0xc09a3a),
+                hex(0x5b7fa6),
+                hex(0x9a86b8),
+                hex(0x5fa3a3),
+                hex(0x2f3438),
+            ],
+        }
+    }
+
+    /// High-contrast near-monochrome.
+    pub fn ink() -> Self {
+        let hex =
+            |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8);
+        Theme {
+            bg: hex(0x0b0b0c),
+            fg: hex(0xe6e6e6),
+            cursor: hex(0xffffff),
+            cursor_text: hex(0x0b0b0c),
+            selection_bg: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 60),
+            ansi: [
+                hex(0x1c1c1e),
+                hex(0xd06b5c),
+                hex(0x8fb573),
+                hex(0xd8c07a),
+                hex(0x7f9ec4),
+                hex(0xa694c4),
+                hex(0x76b8b8),
+                hex(0xc8c8c8),
+                hex(0x5a5a5e),
+                hex(0xe8897a),
+                hex(0xa9d18d),
+                hex(0xf0dc9a),
+                hex(0x9db9dc),
+                hex(0xc0b0dc),
+                hex(0x96d2d2),
+                hex(0xf5f5f5),
+            ],
+        }
+    }
+
+    /// Look up a built-in theme by config name.
+    pub fn by_name(name: &str) -> Theme {
+        match name {
+            "monet-light" | "light" => Theme::monet_light(),
+            "ink" => Theme::ink(),
+            _ => Theme::monet_dark(),
+        }
+    }
+
+    /// True when the background is light (UI chrome follows).
+    pub fn is_light(&self) -> bool {
+        let c = self.bg;
+        (c.r() as u32 + c.g() as u32 + c.b() as u32) / 3 > 127
+    }
+
     /// Resolve a VT color against runtime overrides and this theme.
     pub fn resolve(&self, color: AnsiColor, overrides: &Colors) -> Color32 {
         match color {
@@ -138,6 +215,17 @@ mod tests {
         assert_eq!(t.indexed(232), Color32::from_rgb(8, 8, 8));
         assert_eq!(t.indexed(255), Color32::from_rgb(238, 238, 238));
         assert_eq!(t.indexed(1), t.ansi[1]);
+    }
+
+    #[test]
+    fn named_themes_resolve_and_report_lightness() {
+        assert!(!Theme::by_name("monet-dark").is_light());
+        assert!(Theme::by_name("monet-light").is_light());
+        assert!(!Theme::by_name("ink").is_light());
+        assert!(
+            !Theme::by_name("nonsense").is_light(),
+            "unknown names fall back to the default dark theme"
+        );
     }
 
     #[test]

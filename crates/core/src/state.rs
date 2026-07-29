@@ -50,6 +50,11 @@ impl Paths {
         Paths { base: base.into() }
     }
 
+    /// Root of Giverny's config/state directory.
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.base.join("state").join("tabs.json")
     }

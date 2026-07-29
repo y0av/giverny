@@ -41,6 +41,8 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
 | `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
 | `Ctrl+Shift+P` | fuzzy tab palette |
+| `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
+| `Ctrl`+hover / click | underline and open a path or URL |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |
 | `F2` or double-click | rename tab |
 | `Ctrl` `+` / `−` / `0` | font size (persists) |
@@ -48,9 +50,13 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | middle-click on a tab | close it |
 | right-click tab / category | full menu (move, color, account, …) |
 
+## Configuration
+
+`~/.config/giverny/config.toml` is written with comments on first run and hot-reloads on save: font family and size, theme (`monet-dark`, `monet-light`, `ink`), whether restored tabs re-run `claude --resume`, notifications, scrollback depth, and extra account directories. A broken file is reported and ignored rather than blocking startup.
+
 ## Status
 
-Early but daily-drivable. Built and verified against Claude Code 2.1.220 on Linux. Not yet done: drag-to-reorder tabs, scrollback search UI, clickable paths, config file/themes, macOS/Windows platform passes. The full design plan (7 milestones, research notes) lives in `docs/`.
+Early but daily-drivable. Built and verified against Claude Code 2.1.220 on Linux. Not yet done: drag-to-reorder tabs, split panes, SSH/remote tabs, macOS/Windows platform passes. The full design plan (7 milestones, research notes) lives in `docs/`.
 
 ## License
 

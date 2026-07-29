@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
+use giverny_core::config;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
@@ -144,6 +145,9 @@ pub struct App {
     pub session_picker: Option<overlays::SessionPicker>,
     /// Last seen user-interaction counter per tab (detects "typed just now").
     input_seen: HashMap<TabId, u64>,
+    pub cfg: config::Config,
+    cfg_mtime: Option<std::time::SystemTime>,
+    last_cfg_check: Instant,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -159,13 +163,24 @@ enum Inject {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let theme = Theme::monet_dark();
-        let mut shared = RenderShared::new(theme, DEFAULT_FONT_SIZE).expect("font discovery");
-        shared.install_ui_fonts(&cc.egui_ctx);
         let paths = Paths::default_dirs();
+        let cfg = config::load(paths.base());
+        let theme = Theme::by_name(&cfg.theme.name);
+        let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
+        let mut shared = RenderShared::with_family(theme, cfg.font.size, family)
+            .or_else(|err| {
+                tracing::warn!("configured font unusable ({err}); auto-detecting");
+                RenderShared::new(Theme::by_name(&cfg.theme.name), cfg.font.size)
+            })
+            .expect("font discovery");
+        shared.install_ui_fonts(&cc.egui_ctx);
 
+        let cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
-        if let Some(st) = &restored {
+        // A font size chosen live with Ctrl+± wins over the config default.
+        if let Some(st) = &restored
+            && st.font_size != DEFAULT_FONT_SIZE
+        {
             shared.set_font_size(st.font_size);
         }
         let mut ws = restored
@@ -215,6 +230,9 @@ impl App {
             palette: None,
             session_picker: None,
             input_seen: HashMap::new(),
+            cfg_mtime,
+            cfg,
+            last_cfg_check: Instant::now(),
         };
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
@@ -560,7 +578,39 @@ impl App {
         tab.git_branch = tab.cwd.as_deref().and_then(giverny_core::git::branch_of);
     }
 
+    /// Hot-reload `config.toml` when it changes on disk.
+    fn reload_config_if_changed(&mut self) {
+        if self.last_cfg_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_cfg_check = Instant::now();
+        let mtime = config_mtime(&self.paths);
+        if mtime == self.cfg_mtime {
+            return;
+        }
+        self.cfg_mtime = mtime;
+        let cfg = config::load(self.paths.base());
+        if cfg.theme.name != self.cfg.theme.name {
+            self.shared.set_theme(Theme::by_name(&cfg.theme.name));
+            for rt in self.rt.values() {
+                if let Some(session) = &rt.session {
+                    *session.shared.theme.write() = Theme::by_name(&cfg.theme.name);
+                    session.mark_dirty();
+                }
+            }
+        }
+        if cfg.font.size != self.cfg.font.size {
+            self.shared.set_font_size(cfg.font.size);
+        }
+        if cfg.font.family != self.cfg.font.family {
+            tracing::info!("font family changed — restart Giverny to apply");
+        }
+        self.cfg = cfg;
+        tracing::info!("config reloaded");
+    }
+
     fn periodic_refresh(&mut self) {
+        self.reload_config_if_changed();
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_state(false);
         }
@@ -963,6 +1013,12 @@ fn doctor() {
          · notifications fire when claude needs YOU (permission prompts, questions),\n    \
          not when it merely finishes"
     );
+}
+
+fn config_mtime(paths: &Paths) -> Option<std::time::SystemTime> {
+    std::fs::metadata(config::config_path(paths.base()))
+        .ok()
+        .and_then(|m| m.modified().ok())
 }
 
 fn desktop_notify(summary: String, body: String) {

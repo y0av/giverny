@@ -520,6 +520,17 @@ fn tab_row(
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    if app.claude.hooks_installed && !app.claude.relay_listening() {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("⚠ hook relay socket failed — states degraded")
+                    .font(FontId::monospace(10.0))
+                    .color(POPPY),
+            );
+        });
+    }
     if app.claude.hooks_installed || app.hooks_banner_dismissed {
         return;
     }
@@ -552,6 +563,13 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32) {
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
+        if app.claude.hooks_installed && app.claude.relay_listening() {
+            ui.label(
+                egui::RichText::new("· hooks ✓")
+                    .font(FontId::monospace(9.0))
+                    .color(dim),
+            );
+        }
     });
     if app.claude.accounts.is_empty() {
         ui.horizontal(|ui| {

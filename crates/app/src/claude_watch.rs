@@ -235,7 +235,6 @@ impl ClaudeWatch {
         // Registry scan: baseline busy/idle + identity, ~1 Hz.
         if self.last_scan.elapsed() >= Duration::from_secs(1) {
             self.last_scan = Instant::now();
-            let hooks_live = self.hooks_installed;
             for tab in self.tabs.values_mut() {
                 tab.seen_in_scan = false;
             }
@@ -256,13 +255,14 @@ impl ClaudeWatch {
                 if account.is_some() {
                     entry.account = account;
                 }
-                // State authority: once hooks have spoken for a tab, they own
-                // its state. Claude's registry file can lag — a stale "busy"
-                // after a turn ends would stomp the crisp Stop transition and
-                // leave the spinner running. The registry drives states only
-                // as the no-hooks fallback, or for sessions hooks never saw
-                // (e.g. Claude was already running when Giverny launched).
-                let hooks_own = hooks_live && entry.state != ClaudeState::None;
+                // State authority is PER TAB: only once this tab's session has
+                // actually emitted hook events do hooks own its state (the
+                // registry file can lag with a stale "busy" and must not stomp
+                // a crisp Stop). Hooks load at claude startup — a session
+                // started before install never fires them, and a global
+                // hooks-installed check would freeze such tabs; per-tab
+                // evidence keeps the registry driving exactly those.
+                let hooks_own = entry.last_hook.is_some();
                 if !hooks_own {
                     match entry.state {
                         ClaudeState::NeedsYou => {
@@ -289,6 +289,9 @@ impl ClaudeWatch {
                 if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
                     tab.state = ClaudeState::None;
                     tab.session_name = None;
+                    // The session is gone — its hook evidence goes with it, so
+                    // a future claude (with or without hooks) starts fresh.
+                    tab.last_hook = None;
                 }
             }
         }
@@ -327,5 +330,10 @@ impl ClaudeWatch {
 
     pub fn state_of(&self, tab: TabId) -> ClaudeState {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
+    }
+
+    /// Is the hook relay socket actually listening?
+    pub fn relay_listening(&self) -> bool {
+        self.hook_rx.is_some()
     }
 }

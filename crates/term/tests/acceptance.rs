@@ -237,6 +237,27 @@ fn scrollback_survives_restart_via_preseed() {
     b.shutdown();
 }
 
+/// Tab identity must reach hook subprocesses: the env chain is
+/// giverny → shell → claude → hook, so the shell must see it.
+#[test]
+fn tab_env_reaches_child() {
+    let h = headless_session(
+        Some((
+            "/bin/sh".into(),
+            vec!["-c".into(), "printf 'TAB=[%s]' \"$GIVERNY_TAB_ID\"".into()],
+        )),
+        std::env::temp_dir(),
+        None,
+    );
+    drain_until_done(&h);
+    let screen = h.screen_text();
+    assert!(
+        screen.contains("TAB=[test-tab]"),
+        "GIVERNY_TAB_ID missing:\n{screen}"
+    );
+    h.shutdown();
+}
+
 fn find_claude() -> Option<String> {
     let out = std::process::Command::new("sh")
         .args(["-c", "command -v claude"])

@@ -61,9 +61,15 @@ pub fn socket_path() -> PathBuf {
 pub fn run_relay(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
+    // Sessions outside Giverny tabs have no tab identity — nothing to relay
+    // (and nothing worth spooling; the stdin read above keeps claude's
+    // pipe-write happy before we bail).
+    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+        return;
+    };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let msg = RelayMsg {
-        tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
+        tab_id: Some(tab_id),
         config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
         event,
     };

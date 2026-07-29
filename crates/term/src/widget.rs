@@ -5,15 +5,16 @@
 //! scroll accumulator, focus). A `generation` counter on the shared state
 //! invalidates every tab's cache when fonts/theme change.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::epaint::Mesh;
 use egui::{
-    CursorIcon, Event as EguiEvent, EventFilter, Key, Modifiers, PointerButton, Pos2, Rect,
-    Response, Sense, Shape, Ui, Vec2,
+    Color32, CursorIcon, Event as EguiEvent, EventFilter, Key, Modifiers, PointerButton, Pos2,
+    Rect, Response, Sense, Shape, Ui, Vec2,
 };
 
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 
@@ -23,6 +24,7 @@ use crate::render::atlas::Atlas;
 use crate::render::mesh::{self, BuildParams, Snapshot};
 use crate::render::metrics::{CellMetrics, FontSet};
 use crate::render::theme::Theme;
+use crate::search::{ClickTarget, Search};
 use crate::session::TermSession;
 
 /// Default font size in logical points (`Ctrl+0` resets to this).
@@ -117,6 +119,10 @@ pub struct TabView {
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
     last_blink: bool,
+    /// Open scrollback search (`Ctrl+Shift+F`).
+    pub search: Option<Search>,
+    /// Click target under the pointer while Ctrl is held.
+    hover_target: Option<(ClickTarget, u16, u16, u16)>,
 }
 
 impl Default for TabView {
@@ -127,6 +133,8 @@ impl Default for TabView {
             had_focus: false,
             last_motion_cell: None,
             last_blink: true,
+            search: None,
+            hover_target: None,
         }
     }
 }
@@ -170,6 +178,8 @@ impl TabView {
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mouse_reporting = mode.intersects(TermMode::MOUSE_MODE) && !shift_held;
 
+        self.handle_search(ui, session, rect, ppp, metrics);
+        self.handle_click_targets(ui, session, &response, rect, ppp, metrics);
         self.handle_keyboard(ui, shared, session, &response, mode);
         if mouse_reporting {
             self.handle_mouse_reporting(ui, session, rect, ppp, metrics, mode);
@@ -243,6 +253,35 @@ impl TabView {
                     painter.add(Shape::Mesh(mesh.clone()));
                 }
             }
+        }
+
+        // Search match highlight + hovered link underline, over the grid.
+        if let Some(search) = &self.search
+            && let Some(rows) = {
+                let term = session.term.lock();
+                search.highlight_rows(&term)
+            }
+        {
+            for row in rows {
+                if row < 0 || row >= rows_now(rect, ppp, metrics) {
+                    continue;
+                }
+                let y = rect.min.y + (row as f32 * metrics.cell_h as f32) / ppp;
+                let band = Rect::from_min_size(
+                    Pos2::new(rect.min.x, y),
+                    Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
+                );
+                painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(217, 181, 95, 40));
+            }
+        }
+        if let Some((_, line, col, len)) = &self.hover_target {
+            let x = rect.min.x + (*col as f32 * metrics.cell_w as f32) / ppp;
+            let y = rect.min.y + ((*line + 1) as f32 * metrics.cell_h as f32 - 2.0) / ppp;
+            let underline = Rect::from_min_size(
+                Pos2::new(x, y),
+                Vec2::new((*len as f32 * metrics.cell_w as f32) / ppp, 1.0),
+            );
+            painter.rect_filled(underline, 0.0, shared.theme.ansi[12]);
         }
 
         // Let the platform position IME candidate windows near the pane.
@@ -569,6 +608,164 @@ impl TabView {
             self.had_focus = has;
         }
     }
+}
+
+impl TabView {
+    /// Search overlay: query box, next/prev, Esc to close.
+    fn handle_search(
+        &mut self,
+        ui: &mut Ui,
+        session: &TermSession,
+        rect: Rect,
+        _ppp: f32,
+        _m: CellMetrics,
+    ) {
+        // Open/close chords are consumed before the terminal sees them.
+        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F));
+        if toggle {
+            self.search = match self.search.take() {
+                Some(s) => {
+                    let mut term = session.term.lock();
+                    s.clear(&mut term);
+                    term.selection = None;
+                    session.mark_dirty();
+                    None
+                }
+                None => Some(Search::default()),
+            };
+        }
+        let Some(mut search) = self.search.take() else {
+            return;
+        };
+
+        let mut close = false;
+        let mut step: Option<Direction> = None;
+        ui.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::Escape) {
+                close = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Enter) {
+                step = Some(Direction::Left);
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::Enter) {
+                step = Some(Direction::Right);
+            }
+        });
+
+        let bar = Rect::from_min_size(
+            Pos2::new(rect.max.x - 330.0, rect.min.y + 6.0),
+            Vec2::new(320.0, 28.0),
+        );
+        let mut query = search.query.clone();
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("search scrollback")
+                            .desired_width(180.0)
+                            .font(egui::FontId::monospace(12.0)),
+                    );
+                    if search.needs_focus {
+                        te.request_focus();
+                        search.needs_focus = false;
+                    }
+                    if ui.small_button("↑").clicked() {
+                        step = Some(Direction::Left);
+                    }
+                    if ui.small_button("↓").clicked() {
+                        step = Some(Direction::Right);
+                    }
+                    if search.no_match {
+                        ui.colored_label(Color32::from_rgb(0xd9, 0x7f, 0x70), "none");
+                    }
+                });
+            });
+        });
+
+        if query != search.query {
+            search.set_query(query);
+            step = Some(Direction::Left);
+        }
+        if let Some(direction) = step
+            && !search.query.is_empty()
+        {
+            let mut term = session.term.lock();
+            search.find(&mut term, direction);
+            if let Some(m) = &search.current {
+                let mut sel = alacritty_terminal::selection::Selection::new(
+                    SelectionType::Simple,
+                    *m.start(),
+                    Side::Left,
+                );
+                sel.update(*m.end(), Side::Right);
+                term.selection = Some(sel);
+            }
+            drop(term);
+            session.mark_dirty();
+        }
+
+        if close {
+            let mut term = session.term.lock();
+            search.clear(&mut term);
+            term.selection = None;
+            drop(term);
+            session.mark_dirty();
+        } else {
+            self.search = Some(search);
+        }
+    }
+
+    /// Ctrl+hover underlines paths/URLs; Ctrl+click opens them.
+    fn handle_click_targets(
+        &mut self,
+        ui: &mut Ui,
+        session: &TermSession,
+        response: &Response,
+        rect: Rect,
+        ppp: f32,
+        m: CellMetrics,
+    ) {
+        self.hover_target = None;
+        let (ctrl, pos) = ui.input(|i| {
+            (
+                i.modifiers.ctrl || i.modifiers.command,
+                i.pointer.hover_pos(),
+            )
+        });
+        let Some(pos) = pos.filter(|p| ctrl && rect.contains(*p)) else {
+            return;
+        };
+        let (col, line, _) = cell_at(rect, ppp, m, pos);
+        let text = session.row_text(line);
+        let cwd = session.proc_cwd().unwrap_or_else(|| PathBuf::from("/"));
+        let Some(target) = crate::search::target_at(&text, col as usize, &cwd) else {
+            return;
+        };
+
+        // Underline the whole token: walk out from the cursor over non-space.
+        let chars: Vec<char> = text.chars().collect();
+        let start = (0..=col as usize)
+            .rev()
+            .take_while(|&i| !chars[i].is_whitespace())
+            .last()
+            .unwrap_or(col as usize);
+        let end = (col as usize..chars.len())
+            .take_while(|&i| !chars[i].is_whitespace())
+            .last()
+            .unwrap_or(col as usize);
+        self.hover_target = Some((target.clone(), line, start as u16, (end - start + 1) as u16));
+
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+        if response.clicked() {
+            target.open();
+        }
+    }
+}
+
+/// Visible row count for the current geometry.
+fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
+    (rect.height() * ppp / m.cell_h as f32).floor() as i32
 }
 
 fn button_code(button: PointerButton) -> Option<MouseCode> {

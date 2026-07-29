@@ -10,6 +10,7 @@ pub mod io_loop;
 pub mod proxy;
 pub mod pty;
 pub mod render;
+pub mod search;
 pub mod session;
 pub mod tee;
 pub mod widget;

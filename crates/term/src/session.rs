@@ -260,6 +260,20 @@ impl TermSession {
         Some(out)
     }
 
+    /// One visible row as text (0 = top of the viewport).
+    pub fn row_text(&self, row: u16) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = self.term.lock();
+        let grid = term.grid();
+        if row as usize >= grid.screen_lines() {
+            return String::new();
+        }
+        (0..grid.columns())
+            .map(|c| grid[Point::new(Line(row as i32), Column(c))].c)
+            .collect()
+    }
+
     /// Visible screen contents as text (row-major, newline-separated).
     /// Diagnostics/tests; trims trailing spaces per row.
     pub fn screen_text(&self) -> String {

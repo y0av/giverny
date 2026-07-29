@@ -1,0 +1,28 @@
+name: Bloom
+desc: top-down water lily
+
+palette:
+  . = none
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f2e7db      O
+  g = #d9b55f      *
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  ......drrd......
+  ......drrd......
+  .d....drrd....d.
+  .dd..drccrd..dd.
+  ..dd.drccrd.dd..
+  ..ddrrcGGcrrdd..
+  ddrrccgGGgccrrdd
+  ddrrccgGGgccrrdd
+  ..ddrrcGGcrrdd..
+  ..dd.drccrd.dd..
+  .dd..drccrd..dd.
+  .d....drrd....d.
+  ......drrd......
+  ......drrd......
+  .......dd.......

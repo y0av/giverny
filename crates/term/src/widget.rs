@@ -68,6 +68,37 @@ impl RenderShared {
         m
     }
 
+    /// Install the terminal's fonts into egui so rail/UI text can render the
+    /// same symbol set as the grid (spinners, flags, box drawing).
+    pub fn install_ui_fonts(&self, ctx: &egui::Context) {
+        use egui::FontFamily;
+        use egui::epaint::text::{FontData, FontInsert, FontPriority, InsertFontFamily};
+        for (i, (name, bytes)) in self.fonts.face_bytes().into_iter().enumerate() {
+            // Primary face leads the monospace chain; the rest (symbol/emoji
+            // fallbacks) go behind everything, in order, so they only fill
+            // gaps. Inserting them all as Highest would reverse that.
+            let mono_priority = if i == 0 {
+                FontPriority::Highest
+            } else {
+                FontPriority::Lowest
+            };
+            ctx.add_font(FontInsert {
+                name,
+                data: FontData::from_owned(bytes),
+                families: vec![
+                    InsertFontFamily {
+                        family: FontFamily::Monospace,
+                        priority: mono_priority,
+                    },
+                    InsertFontFamily {
+                        family: FontFamily::Proportional,
+                        priority: FontPriority::Lowest,
+                    },
+                ],
+            });
+        }
+    }
+
     /// Change the font size; invalidates every tab's cached meshes.
     pub fn set_font_size(&mut self, size: f32) {
         let size = size.clamp(7.0, 32.0);

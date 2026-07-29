@@ -139,6 +139,23 @@ impl FontSet {
         &self.fonts[0]
     }
 
+    /// Raw bytes of every loaded face, primary first — so the UI layer can
+    /// install the same fonts egui uses for chrome. Without this the rail
+    /// cannot draw braille spinners, ⚑, ✓ or other symbols: egui's built-in
+    /// fonts don't cover them and they render as tofu boxes.
+    pub fn face_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.fonts
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                (
+                    format!("giverny-face-{i}-{}", f.family),
+                    f.data.as_ref().clone(),
+                )
+            })
+            .collect()
+    }
+
     fn glyph_in(&self, slot: u16, ch: char) -> u16 {
         if let Some(&g) = self.charmap_cache.borrow().get(&(slot, ch)) {
             return g;

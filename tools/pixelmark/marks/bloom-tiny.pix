@@ -1,0 +1,19 @@
+name: Bloom (tiny)
+desc: 8x8 rail / statusline size
+
+palette:
+  . = none
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f2e7db      O
+  G = #f0d178      @
+
+grid:
+  ...dd...
+  ..drrd..
+  .drccrd.
+  drcGGcrd
+  drcGGcrd
+  .drccrd.
+  ..drrd..
+  ...dd...

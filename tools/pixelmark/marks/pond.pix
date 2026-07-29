@@ -1,0 +1,29 @@
+name: Pond
+desc: three pads, one in bloom
+
+palette:
+  . = none          
+  w = #2c4a5a      .
+  W = #35566a      ,
+  g = #6b9250      o
+  r = #d08aa2      *
+  c = #f4e9de      @
+  Y = #d9b55f      #
+
+grid:
+  ..wwwwwwwwwwww..
+  .wwwwwwwwwwwwww.
+  wwwwwwwwwwwwwwww
+  WWWggWWWWWWWWWWW
+  WWggggWWWWWWWWWW
+  WWWggWWWWWrWWWWW
+  wwwwwwwwwwrcrwww
+  wwwwwwwwwggYggww
+  wwwwwwwwwwgggwww
+  WWWWWWWWWWWWWWWW
+  WWWWWWWWWWWWWWWW
+  WWWWWWggWWWWWWWW
+  wwwwwggggwwwwwww
+  wwwwwwggwwwwwwww
+  .wwwwwwwwwwwwww.
+  ..WWWWWWWWWWWW..

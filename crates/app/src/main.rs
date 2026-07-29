@@ -159,6 +159,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let theme = Theme::monet_dark();
         let mut shared = RenderShared::new(theme, DEFAULT_FONT_SIZE).expect("font discovery");
+        shared.install_ui_fonts(&cc.egui_ctx);
         let paths = Paths::default_dirs();
 
         let restored = state::load(&paths);

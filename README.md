@@ -38,6 +38,8 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 | Chord | Action |
 |---|---|
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
+| `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
+| `Ctrl+Shift+P` | fuzzy tab palette |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |
 | `F2` or double-click | rename tab |
 | `Ctrl` `+` / `−` / `0` | font size (persists) |
@@ -47,7 +49,7 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 
 ## Status
 
-Early but daily-drivable. Built and verified against Claude Code 2.1.220 on Linux. Not yet done: drag-to-reorder tabs, fuzzy tab palette, scrollback search UI, clickable paths, config file/themes, past-session picker, macOS/Windows platform passes. The full design plan (7 milestones, research notes) lives in `docs/`.
+Early but daily-drivable. Built and verified against Claude Code 2.1.220 on Linux. Not yet done: drag-to-reorder tabs, scrollback search UI, clickable paths, config file/themes, macOS/Windows platform passes. The full design plan (7 milestones, research notes) lives in `docs/`.
 
 ## License
 

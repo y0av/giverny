@@ -138,12 +138,16 @@ fn main() -> eframe::Result {
         )
         .init();
 
+    // Reopen at the size the user left it. Read before the window exists, so
+    // it can't be applied as a resize the user sees happen.
+    let layout = state::load_layout(&Paths::default_dirs());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("giverny")
             .with_title("Giverny")
             .with_icon(icon::icon_data(16))
-            .with_inner_size([1280.0, 820.0])
+            .with_inner_size(layout.window_size().unwrap_or([1280.0, 820.0]))
+            .with_maximized(layout.maximized)
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
@@ -200,6 +204,11 @@ pub struct TabRuntime {
     pub view: TabView,
 }
 
+/// Rail width limits: narrow enough to be a strip, wide enough for long
+/// tab titles, and the clamp a restored width is held to.
+const RAIL_MIN: f32 = 180.0;
+const RAIL_MAX: f32 = 420.0;
+
 pub struct App {
     pub shared: RenderShared,
     pub ws: Workspace,
@@ -230,6 +239,8 @@ pub struct App {
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
     capture: Option<capture::Capture>,
+    /// Window size and rail width as last seen, persisted with the workspace.
+    layout: state::Layout,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
     last_cfg_check: Instant,
@@ -268,6 +279,7 @@ impl App {
         {
             shared.set_font_size(st.font_size);
         }
+        let layout = restored.as_ref().map(|st| st.layout).unwrap_or_default();
         let mut ws = restored
             .map(|st| st.workspace)
             .filter(|ws| !ws.tabs.is_empty())
@@ -340,6 +352,7 @@ impl App {
             update_rx,
             update_dismissed: false,
             capture: capture::Capture::from_env(),
+            layout,
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
@@ -367,6 +380,7 @@ impl App {
             clean_shutdown,
             workspace: self.ws.clone(),
             font_size: self.shared.font_size,
+            layout: self.layout,
         };
         if let Err(err) = state::save(&self.paths, &st) {
             tracing::error!("state save failed: {err:#}");
@@ -752,6 +766,55 @@ impl App {
         tracing::info!("config reloaded");
     }
 
+    /// Notice window and rail resizes so they persist with everything else.
+    ///
+    /// Read back from the window rather than tracked at the drag, because the
+    /// window manager has the last word: a tiled or snapped window ends up a
+    /// size nobody asked for, and that is still the size to reopen at.
+    fn track_layout(&mut self, ctx: &egui::Context) {
+        let before = self.layout;
+        let (maximized, viewport_rect) = ctx.input(|i| {
+            let vp = i.viewport();
+            (
+                vp.maximized.unwrap_or(false) || vp.fullscreen.unwrap_or(false),
+                i.viewport_rect(),
+            )
+        });
+        // Deliberately not `viewport().inner_rect`: it is derived from the
+        // window's *position*, which Wayland never reports, so it is None on
+        // the primary platform. The egui surface is the window's inner area
+        // everywhere; scaled by the zoom factor it is the logical size
+        // `with_inner_size` wants back.
+        let size = viewport_rect.size() * ctx.zoom_factor();
+        self.layout.maximized = maximized;
+        // A maximized window's size is the screen's, not the user's choice —
+        // storing it would reopen unmaximized at monitor size.
+        if !maximized && size.x > 0.0 && size.y > 0.0 {
+            self.layout.window = Some([size.x, size.y]);
+        }
+        if let Some(rail) = egui::PanelState::load(ctx, egui::Id::new("rail")) {
+            self.layout.rail_width = Some(rail.size().x);
+        }
+
+        let moved = |a: Option<f32>, b: Option<f32>| match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() >= 1.0,
+            (a, b) => a.is_some() != b.is_some(),
+        };
+        let changed = self.layout.maximized != before.maximized
+            || moved(self.layout.rail_width, before.rail_width)
+            || moved(
+                self.layout.window.map(|w| w[0]),
+                before.window.map(|w| w[0]),
+            )
+            || moved(
+                self.layout.window.map(|w| w[1]),
+                before.window.map(|w| w[1]),
+            );
+        if changed {
+            self.state_dirty = true;
+        }
+    }
+
     /// Remember what each tab is running, so a restart can bring it back.
     fn track_foreground(&mut self) {
         let seen: Vec<(TabId, Option<String>)> = self
@@ -1034,11 +1097,16 @@ impl eframe::App for App {
 
         egui::Panel::left("rail")
             .resizable(true)
-            .default_size(240.0)
-            .size_range(180.0..=420.0)
+            .default_size(
+                self.layout
+                    .rail_width_in(RAIL_MIN..=RAIL_MAX)
+                    .unwrap_or(240.0),
+            )
+            .size_range(RAIL_MIN..=RAIL_MAX)
             .show(ui, |ui| {
                 actions.extend(rail::show(self, ui));
             });
+        self.track_layout(&ctx);
 
         for action in actions.drain(..) {
             self.apply(&ctx, action);

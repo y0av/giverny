@@ -693,6 +693,18 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
         }
+        // The way in that does not require knowing a chord.
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new("⚙")
+                    .font(FontId::monospace(11.0))
+                    .color(dim),
+            ))
+            .on_hover_text("settings  (Ctrl+,)")
+            .clicked()
+        {
+            actions.push(Action::ToggleSettings);
+        }
     });
     ui.horizontal(|ui| {
         ui.add_space(6.0);

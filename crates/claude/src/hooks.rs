@@ -160,11 +160,20 @@ pub fn spawn_listener(
     wake: impl Fn() + Send + 'static,
 ) -> anyhow::Result<(crossbeam_channel::Receiver<RelayMsg>, Vec<RelayMsg>)> {
     use std::io::BufRead;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     let spooled = drain_spool(spool);
 
     let path = socket_path();
+    // A socket that still accepts connections belongs to a live instance —
+    // unlinking and rebinding would silently steal its hook stream. Only a
+    // stale socket (owner gone) may be replaced.
+    if UnixStream::connect(&path).is_ok() {
+        anyhow::bail!(
+            "another Giverny is listening on {} — this window will not receive hook events",
+            path.display()
+        );
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -536,6 +545,31 @@ mod tests {
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "user's entry kept");
         assert_eq!(stop[0]["hooks"][0]["command"], "echo mine");
+    }
+
+    #[test]
+    fn detects_stale_binary_paths() {
+        let path = scratch("stale-path");
+        install_into(&path).unwrap();
+        set_statusline(&path, true).unwrap();
+        assert!(
+            !needs_path_refresh(&path),
+            "freshly installed entries match the running binary"
+        );
+
+        // Simulate the entries having been written by a binary living
+        // somewhere else (what `cargo install` or a moved build produces).
+        let text = std::fs::read_to_string(&path).unwrap();
+        let stale = text.replace(&relay_command(), "/old/path/giverny relay");
+        std::fs::write(&path, stale).unwrap();
+        assert!(
+            needs_path_refresh(&path),
+            "a different exe path is detected"
+        );
+
+        install_into(&path).unwrap();
+        assert!(!needs_path_refresh(&path), "reinstalling repairs the path");
+        assert!(installed_in(&path));
     }
 
     #[test]

@@ -31,6 +31,8 @@ struct CatData {
     color: Color32,
     collapsed: bool,
     count: usize,
+    busy: usize,
+    needs: usize,
     rows: Vec<RowData>,
 }
 
@@ -79,12 +81,22 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                     }
                 })
                 .collect::<Vec<_>>();
+            let busy = rows
+                .iter()
+                .filter(|r| r.claude == ClaudeState::Busy)
+                .count();
+            let needs = rows
+                .iter()
+                .filter(|r| r.claude == ClaudeState::NeedsYou)
+                .count();
             CatData {
                 id: c.id,
                 name: c.name.clone(),
                 color,
                 collapsed: c.collapsed,
                 count: rows.len(),
+                busy,
+                needs,
                 rows,
             }
         })
@@ -239,13 +251,37 @@ fn category_header(
         FontId::monospace(11.5),
         cat.color,
     );
+    // Right-aligned summary: attention flags, working count, tab count.
+    let mut badge_x = rect.max.x - 26.0;
     p.text(
-        Pos2::new(rect.max.x - 26.0, rect.center().y),
+        Pos2::new(badge_x, rect.center().y),
         Align2::RIGHT_CENTER,
         format!("{}", cat.count),
         FontId::monospace(10.0),
         dim,
     );
+    badge_x -= 20.0;
+    if cat.busy > 0 {
+        let time = ui.input(|i| i.time);
+        let glyph = SPINNER[(time * 10.0) as usize % SPINNER.len()];
+        p.text(
+            Pos2::new(badge_x, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{}{glyph}", cat.busy),
+            FontId::monospace(10.0),
+            cat.color,
+        );
+        badge_x -= 26.0;
+    }
+    if cat.needs > 0 {
+        p.text(
+            Pos2::new(badge_x, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{}⚑", cat.needs),
+            FontId::monospace(10.0),
+            AMBER,
+        );
+    }
 
     // "+" new-tab zone at the right edge.
     let plus_rect = Rect::from_min_size(
@@ -444,6 +480,10 @@ fn tab_row(
     resp.context_menu(|ui| {
         if ui.button("rename").clicked() {
             actions.push(Action::StartRename(RenameTarget::Tab(row.id)));
+            ui.close();
+        }
+        if ui.button("sessions…").clicked() {
+            actions.push(Action::OpenSessions(row.id));
             ui.close();
         }
         ui.menu_button("move to", |ui| {

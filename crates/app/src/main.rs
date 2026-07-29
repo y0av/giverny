@@ -1,6 +1,7 @@
 //! Giverny — a native terminal built around Claude Code.
 
 mod claude_watch;
+mod overlays;
 mod rail;
 
 use std::collections::HashMap;
@@ -88,6 +89,12 @@ pub enum Action {
     InstallHooks,
     DismissHooksBanner,
     SetCategoryProfile(CategoryId, Option<PathBuf>),
+    /// Jump to the next tab where Claude needs attention (then done-unseen).
+    JumpAttention,
+    TogglePalette,
+    OpenSessions(TabId),
+    /// Resume a specific past conversation in a tab.
+    ResumeSpecific(TabId, String, PathBuf),
 }
 
 pub struct TabRuntime {
@@ -111,6 +118,8 @@ pub struct App {
     pub hooks_banner_dismissed: bool,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
+    pub palette: Option<overlays::PaletteState>,
+    pub session_picker: Option<overlays::SessionPicker>,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -178,6 +187,8 @@ impl App {
             claude,
             hooks_banner_dismissed: false,
             pending_inject: Vec::new(),
+            palette: None,
+            session_picker: None,
         };
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
@@ -308,6 +319,77 @@ impl App {
                 if let Some(cat) = self.ws.category_mut(id) {
                     cat.profile_dir = dir;
                 }
+            }
+            Action::JumpAttention => {
+                use claude_watch::ClaudeState;
+                let order: Vec<TabId> = self.ws.tabs.iter().map(|t| t.id).collect();
+                if order.is_empty() {
+                    return;
+                }
+                let start = self
+                    .ws
+                    .active
+                    .and_then(|a| order.iter().position(|&x| x == a))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let ring = |k: usize| order[(start + k) % order.len()];
+                let pick = (0..order.len())
+                    .map(ring)
+                    .find(|&t| self.claude.state_of(t) == ClaudeState::NeedsYou)
+                    .or_else(|| {
+                        (0..order.len())
+                            .map(ring)
+                            .find(|&t| self.claude.state_of(t) == ClaudeState::DoneUnseen)
+                    });
+                if let Some(id) = pick {
+                    self.apply(ctx, Action::Select(id));
+                }
+            }
+            Action::TogglePalette => {
+                self.palette = if self.palette.is_some() {
+                    None
+                } else {
+                    Some(Default::default())
+                };
+            }
+            Action::OpenSessions(id) => {
+                let cwd = self
+                    .rt
+                    .get(&id)
+                    .and_then(|rt| rt.session.as_ref())
+                    .and_then(|s| s.proc_cwd())
+                    .or_else(|| self.ws.tab(id).and_then(|t| t.cwd.clone()));
+                let Some(cwd) = cwd else { return };
+                let dirs: Vec<PathBuf> = self
+                    .claude
+                    .profiles
+                    .iter()
+                    .map(|p| p.config_dir.clone())
+                    .collect();
+                let sessions = giverny_claude::registry::list_sessions(&dirs, &cwd);
+                self.session_picker = Some(overlays::SessionPicker { tab: id, sessions });
+            }
+            Action::ResumeSpecific(id, sid, config_dir) => {
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    tab.claude_session = Some(sid.clone());
+                    tab.claude_config_dir = Some(config_dir);
+                }
+                let has_live_shell = self.rt.get(&id).is_some_and(|rt| rt.session.is_some())
+                    && !self.ws.tab(id).is_some_and(|t| t.exited);
+                if has_live_shell {
+                    if let Some(cmd) = self.resume_command(&sid, id) {
+                        // Ctrl+U clears any half-typed line first.
+                        let mut bytes = vec![0x15];
+                        bytes.extend(cmd);
+                        if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) {
+                            session.write(bytes);
+                        }
+                    }
+                } else {
+                    // Respawn queues the auto-resume for the new shell.
+                    self.apply(ctx, Action::Respawn(id));
+                }
+                self.apply(ctx, Action::Select(id));
             }
             Action::DeleteCategory(id) => {
                 self.ws.remove_category(id);
@@ -458,17 +540,30 @@ impl App {
         }
     }
 
-    /// Queue the auto-resume command for a freshly restored tab, guarded
-    /// against a second live resume of the same session.
+    /// Queue the auto-resume command for a freshly restored tab.
     fn queue_resume(&mut self, id: TabId) {
-        use giverny_claude::registry;
-        let Some(tab) = self.ws.tab(id) else { return };
-        let Some(sid) = tab.claude_session.clone() else {
+        let Some(sid) = self.ws.tab(id).and_then(|t| t.claude_session.clone()) else {
             return;
         };
+        if let Some(cmd) = self.resume_command(&sid, id) {
+            self.pending_inject.push((
+                Instant::now() + Duration::from_millis(1300),
+                id,
+                Inject::Raw(cmd),
+            ));
+        }
+    }
+
+    /// Build the shell command that resumes `sid` in tab `id`, with every
+    /// guard: id validation, double-resume protection, transcript lookup
+    /// across profiles (self-heals a lost account association), and the
+    /// conversation's own recorded cwd (`claude --resume` only finds a
+    /// session from the directory it ran in).
+    fn resume_command(&self, sid: &str, id: TabId) -> Option<Vec<u8>> {
+        use giverny_claude::registry;
         if sid.len() != 36 || !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             tracing::warn!("tab {id:?}: malformed session id {sid:?} — not resuming");
-            return;
+            return None;
         }
         let all_dirs: Vec<PathBuf> = self
             .claude
@@ -476,14 +571,12 @@ impl App {
             .iter()
             .map(|p| p.config_dir.clone())
             .collect();
-        if registry::session_is_live(all_dirs.clone(), &sid) {
+        if registry::session_is_live(all_dirs.clone(), sid) {
             tracing::info!("claude session {sid} already live elsewhere — not resuming");
-            return;
+            return None;
         }
 
-        // Locate the transcript on disk — preferred profile first, then all
-        // (self-heals a lost account association). No transcript ⇒ nothing to
-        // resume; skip silently instead of letting claude error in the tab.
+        let tab = self.ws.tab(id)?;
         let preferred = tab.claude_config_dir.clone();
         let mut search: Vec<PathBuf> = preferred.iter().cloned().collect();
         search.extend(
@@ -493,15 +586,12 @@ impl App {
         );
         let Some((config_dir, transcript)) = search
             .iter()
-            .find_map(|d| registry::find_transcript(d, &sid).map(|t| (d.clone(), t)))
+            .find_map(|d| registry::find_transcript(d, sid).map(|t| (d.clone(), t)))
         else {
             tracing::info!("tab {id:?}: no transcript for session {sid} — skipping resume");
-            return;
+            return None;
         };
 
-        // `claude --resume` only finds a conversation from the directory it
-        // ran in — use the transcript's own recorded cwd, not the tab's
-        // (which drifts with every `cd`).
         let resume_dir = registry::transcript_cwd(&transcript).or_else(|| tab.cwd.clone());
 
         let mut cmd = String::new();
@@ -514,11 +604,7 @@ impl App {
         }
         // `command` bypasses shell wrapper functions named `claude`.
         cmd.push_str(&format!("command claude --resume {sid}\r"));
-        self.pending_inject.push((
-            Instant::now() + Duration::from_millis(1300),
-            id,
-            Inject::Raw(cmd.into_bytes()),
-        ));
+        Some(cmd.into_bytes())
     }
 
     fn process_pending(&mut self, ctx: &egui::Context) {
@@ -572,6 +658,12 @@ impl App {
                 && let Some(id) = self.ws.active
             {
                 actions.push(Action::CloseTab(id));
+            }
+            if i.consume_key(cs, Key::A) {
+                actions.push(Action::JumpAttention);
+            }
+            if i.consume_key(cs, Key::P) {
+                actions.push(Action::TogglePalette);
             }
             if i.consume_key(Modifiers::CTRL, Key::PageDown) {
                 actions.push(Action::Cycle(1));
@@ -702,6 +794,9 @@ impl eframe::App for App {
                 }
             }
         });
+
+        actions.extend(overlays::palette_ui(self, &ctx));
+        actions.extend(overlays::sessions_ui(self, &ctx));
 
         for action in actions {
             self.apply(&ctx, action);

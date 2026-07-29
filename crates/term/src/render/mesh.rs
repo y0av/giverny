@@ -149,6 +149,8 @@ pub struct BuildParams<'a> {
     /// Widget origin in physical pixels (already rounded to the pixel grid).
     pub origin_px: Vec2,
     pub pixels_per_point: f32,
+    /// Blink phase: `false` hides the cursor for this frame.
+    pub cursor_visible: bool,
 }
 
 pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
@@ -173,7 +175,12 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
     };
 
     // Cursor block backdrop paints first so glyphs draw over it.
-    let cursor_block = snapshot.cursor.filter(|(.., s)| *s == CursorShape::Block);
+    let shown_cursor = if p.cursor_visible {
+        snapshot.cursor
+    } else {
+        None
+    };
+    let cursor_block = shown_cursor.filter(|(.., s)| *s == CursorShape::Block);
     if let Some((line, col, _)) = cursor_block {
         push_solid(&mut bg, to_points(cell_rect_px(line, col)), p.theme.cursor);
     }
@@ -248,7 +255,7 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
     }
 
     // Non-block cursors.
-    if let Some((line, col, shape)) = snapshot.cursor {
+    if let Some((line, col, shape)) = shown_cursor {
         let rect_px = cell_rect_px(line, col);
         let thick = (m.cell_w as f32 / 6.0).max(1.0).round();
         match shape {
@@ -413,6 +420,7 @@ mod tests {
             theme: &theme,
             origin_px: Vec2::ZERO,
             pixels_per_point: 1.0,
+            cursor_visible: true,
         };
         let meshes = build(&snap, &mut params);
 

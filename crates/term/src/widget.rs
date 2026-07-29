@@ -80,12 +80,24 @@ impl RenderShared {
 }
 
 /// Per-tab view state.
-#[derive(Default)]
 pub struct TabView {
     scroll_accum: f32,
     cached: Option<CachedFrame>,
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
+    last_blink: bool,
+}
+
+impl Default for TabView {
+    fn default() -> Self {
+        Self {
+            scroll_accum: 0.0,
+            cached: None,
+            had_focus: false,
+            last_motion_cell: None,
+            last_blink: true,
+        }
+    }
 }
 
 struct CachedFrame {
@@ -146,14 +158,24 @@ impl TabView {
         );
         self.handle_focus_reporting(session, &response, mode);
 
+        // Cursor blink: focused tabs pulse gently; unfocused show steady.
+        let focused = response.has_focus();
+        let cursor_visible = !focused || ((ui.input(|i| i.time) * 1.4) % 1.0) < 0.65;
+        if focused {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(180));
+        }
+
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
         let dirty = session.take_dirty();
         let needs_rebuild = dirty
+            || self.last_blink != cursor_visible
             || self
                 .cached
                 .as_ref()
                 .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
+        self.last_blink = cursor_visible;
         if needs_rebuild {
             let snapshot = {
                 let term = session.term.lock();
@@ -168,6 +190,7 @@ impl TabView {
                 theme: &shared.theme,
                 origin_px,
                 pixels_per_point: ppp,
+                cursor_visible,
             };
             let built = mesh::build(&snapshot, &mut params);
             let mut meshes = Vec::with_capacity(built.glyphs.len() + 2);

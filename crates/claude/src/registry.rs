@@ -120,6 +120,110 @@ pub fn transcript_cwd(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Claude's project-dir name for a cwd: every non-alphanumeric byte becomes
+/// `-`, case preserved (verified against 2.1.220 layouts).
+pub fn munge_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// A past conversation in some project dir, for the resume picker.
+#[derive(Debug, Clone)]
+pub struct PastSession {
+    pub id: String,
+    /// AI title / last prompt (best-effort from the transcript tail).
+    pub title: String,
+    pub path: PathBuf,
+    pub config_dir: PathBuf,
+    pub modified: Option<std::time::SystemTime>,
+    /// Currently open in some terminal — resuming would corrupt it.
+    pub live: bool,
+}
+
+/// List past sessions for `cwd` across config dirs, newest first (capped).
+pub fn list_sessions(config_dirs: &[PathBuf], cwd: &Path) -> Vec<PastSession> {
+    use std::collections::HashSet;
+    let live_ids: HashSet<String> = scan(config_dirs.iter().cloned())
+        .into_iter()
+        .map(|s| s.entry.session_id)
+        .collect();
+    let munged = munge_cwd(cwd);
+    let mut out: Vec<PastSession> = Vec::new();
+    for dir in config_dirs {
+        let proj = dir.join("projects").join(&munged);
+        let Ok(entries) = std::fs::read_dir(&proj) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if id.len() != 36 {
+                continue;
+            }
+            let modified = e.metadata().ok().and_then(|m| m.modified().ok());
+            out.push(PastSession {
+                live: live_ids.contains(&id),
+                id,
+                title: String::new(),
+                path,
+                config_dir: dir.clone(),
+                modified,
+            });
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    out.truncate(15);
+    for s in &mut out {
+        s.title = tail_title(&s.path).unwrap_or_else(|| s.id[..8].to_string());
+    }
+    out
+}
+
+/// Best-effort session title from the transcript's tail: the last `aiTitle`
+/// line, else the last `lastPrompt` (truncated).
+fn tail_title(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 128 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut buf = String::new();
+    file.take(TAIL).read_to_string(&mut buf).ok()?;
+
+    let mut title: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    for line in buf.lines() {
+        if !line.contains("\"aiTitle\"") && !line.contains("\"lastPrompt\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
+            title = Some(t.to_string());
+        } else if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+            prompt = Some(p.to_string());
+        }
+    }
+    let mut best = title.or(prompt)?;
+    best = best.replace(['\n', '\r'], " ");
+    if best.chars().count() > 60 {
+        best = best.chars().take(59).collect::<String>() + "…";
+    }
+    (!best.is_empty()).then_some(best)
+}
+
 /// Walk `/proc/<pid>/stat` parent links; true when `ancestor` is in the chain.
 /// Maps a claude process to the Giverny tab whose shell spawned it.
 #[cfg(target_os = "linux")]
@@ -193,6 +297,49 @@ mod tests {
         assert_eq!(live[0].entry.session_id, "alive");
         assert!(session_is_live([dir.clone()], "alive"));
         assert!(!session_is_live([dir.clone()], "dead"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn munge_matches_claude_layout() {
+        assert_eq!(
+            munge_cwd(Path::new("/home/yoz/Dev/claude_test")),
+            "-home-yoz-Dev-claude-test",
+            "underscores and slashes become dashes, case preserved"
+        );
+        assert_eq!(
+            munge_cwd(Path::new("/home/yoz/Dev/yoav.xyz.next")),
+            "-home-yoz-Dev-yoav-xyz-next"
+        );
+    }
+
+    #[test]
+    fn lists_sessions_with_tail_titles() {
+        let dir = std::env::temp_dir().join(format!("giverny-list-{}", std::process::id()));
+        let cwd = Path::new("/home/u/proj_x");
+        let proj = dir.join("projects").join(munge_cwd(cwd));
+        std::fs::create_dir_all(&proj).unwrap();
+        let sid_a = "aaaaaaaa-1111-2222-3333-444444444444";
+        let sid_b = "bbbbbbbb-1111-2222-3333-444444444444";
+        std::fs::write(
+            proj.join(format!("{sid_a}.jsonl")),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"fix auth bug\",\"sessionId\":\"a\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(format!("{sid_b}.jsonl")),
+            "{\"type\":\"last-prompt\",\"lastPrompt\":\"run the tests\",\"sessionId\":\"b\"}\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("not-a-session.jsonl"), "junk").unwrap();
+
+        let sessions = list_sessions(std::slice::from_ref(&dir), cwd);
+        assert_eq!(sessions.len(), 2, "{sessions:?}");
+        let a = sessions.iter().find(|s| s.id == sid_a).unwrap();
+        assert_eq!(a.title, "fix auth bug");
+        let b = sessions.iter().find(|s| s.id == sid_b).unwrap();
+        assert_eq!(b.title, "run the tests");
+        assert!(!a.live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

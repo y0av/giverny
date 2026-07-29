@@ -111,11 +111,97 @@ impl Theme {
         }
     }
 
+    /// Tokyo Night — the widely used dark blue-purple palette.
+    pub fn tokyo_night() -> Self {
+        Theme::from_hex(
+            0x1a1b26,
+            0xc0caf5,
+            0xc0caf5,
+            0x1a1b26,
+            [
+                0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
+                0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
+            ],
+        )
+    }
+
+    /// Gruvbox dark.
+    pub fn gruvbox() -> Self {
+        Theme::from_hex(
+            0x282828,
+            0xebdbb2,
+            0xebdbb2,
+            0x282828,
+            [
+                0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
+                0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+            ],
+        )
+    }
+
+    /// Nord.
+    pub fn nord() -> Self {
+        Theme::from_hex(
+            0x2e3440,
+            0xd8dee9,
+            0xd8dee9,
+            0x2e3440,
+            [
+                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+                0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+            ],
+        )
+    }
+
+    /// Catppuccin Mocha.
+    pub fn catppuccin() -> Self {
+        Theme::from_hex(
+            0x1e1e2e,
+            0xcdd6f4,
+            0xf5e0dc,
+            0x1e1e2e,
+            [
+                0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de,
+                0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+            ],
+        )
+    }
+
+    fn from_hex(bg: u32, fg: u32, cursor: u32, cursor_text: u32, ansi: [u32; 16]) -> Theme {
+        let hex =
+            |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8);
+        let sel = hex(ansi[4]);
+        Theme {
+            bg: hex(bg),
+            fg: hex(fg),
+            cursor: hex(cursor),
+            cursor_text: hex(cursor_text),
+            selection_bg: Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 80),
+            ansi: ansi.map(hex),
+        }
+    }
+
+    /// Every built-in, in picker order. The names are the values of
+    /// `theme.name`, and the settings schema is checked against this list.
+    pub const NAMES: &'static [&'static str] = &[
+        "monet-dark",
+        "monet-light",
+        "ink",
+        "tokyo-night",
+        "gruvbox",
+        "nord",
+        "catppuccin",
+    ];
+
     /// Look up a built-in theme by config name.
     pub fn by_name(name: &str) -> Theme {
         match name {
             "monet-light" | "light" => Theme::monet_light(),
             "ink" => Theme::ink(),
+            "tokyo-night" => Theme::tokyo_night(),
+            "gruvbox" => Theme::gruvbox(),
+            "nord" => Theme::nord(),
+            "catppuccin" => Theme::catppuccin(),
             _ => Theme::monet_dark(),
         }
     }

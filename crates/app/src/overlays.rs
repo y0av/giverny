@@ -91,7 +91,7 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 .as_deref()
                 .map(|p| giverny_core::short_path(p, 28))
                 .unwrap_or_default();
-            let label = format!("{cat} › {}   {cwd}", t.title());
+            let label = format!("{cat} › {}   {cwd}", t.display_title(&app.cfg.titles));
             fuzzy_score(&st.query, &label).map(|s| (t.id, label, s))
         })
         .collect();

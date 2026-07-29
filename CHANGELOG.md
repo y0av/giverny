@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Settings
+- A settings screen (`Ctrl+,`), drawn over the terminal with the rail still
+  visible. Search across every option, per-row reset, and each row labelled
+  with its TOML key.
+- Options are declared once and generate the screen, the commented
+  `config.toml` written on first run, and [docs/options.md](docs/options.md).
+  Tests fail if the three disagree.
+- Edits are written back with `toml_edit`: your comments and layout survive.
+- `F1` lists every key binding, from the same table the settings screen uses.
+- Titles: `titles.strip_host_prefix` (on by default) drops the `user@host:`
+  your shell puts in front of every title; `titles.shorten_paths` abbreviates
+  all but the last directory. Both apply at display time, so toggling either
+  updates existing tabs at once.
+- Four more themes: Tokyo Night, Gruvbox, Nord, Catppuccin.
+- Font size now lives only in `config.toml`. `Ctrl` `+`/`−`/`0` writes it
+  there; a size saved by an older build is migrated on first run.
+
 ## v0.2.0 — 2026-07-29
 
 Everything since the first release: installers, an update check, and the fixes

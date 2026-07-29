@@ -578,3 +578,54 @@ fn footer(ui: &mut egui::Ui, actions: &mut Vec<Action>, close: &mut bool) {
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use giverny_term::render::theme::Theme;
+
+    #[test]
+    fn every_theme_the_screen_offers_is_real_and_distinct() {
+        // The choice list lives in giverny-core, which cannot see the themes;
+        // this crate sees both, so this is where they are checked against
+        // each other. A name that falls through `by_name` silently becomes
+        // monet-dark, which looks like the picker doing nothing.
+        let offered = match settings::by_key("theme.name").map(|d| &d.kind) {
+            Some(Kind::Choice { options, .. }) => *options,
+            _ => panic!("theme.name is not a choice"),
+        };
+        assert_eq!(
+            offered,
+            Theme::NAMES,
+            "offered themes differ from the built-ins"
+        );
+        for name in offered.iter().filter(|n| **n != "monet-dark") {
+            assert_ne!(
+                Theme::by_name(name).bg,
+                Theme::monet_dark().bg,
+                "{name} is offered but not implemented"
+            );
+        }
+    }
+
+    #[test]
+    fn search_finds_options_from_any_section() {
+        let mut state = SettingsState {
+            section: Section::Appearance,
+            ..Default::default()
+        };
+        // A restore option, found from the appearance section.
+        state.search = "btop".into();
+        assert!(
+            visible(&state).is_empty(),
+            "search is over labels, not values"
+        );
+        state.search = "restart".into();
+        let hits = visible(&state);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "behavior.restore_apps");
+        // Searching by TOML key works too — that is half the point of showing it.
+        state.search = "titles.strip".into();
+        assert_eq!(visible(&state).len(), 1);
+    }
+}

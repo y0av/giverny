@@ -10,9 +10,97 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
+    pub titles: TitlesConfig,
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
     pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TitlesConfig {
+    /// Drop a leading `user@host:` from titles the shell sets.
+    pub strip_host_prefix: bool,
+    /// Abbreviate every directory but the last: `~/Dev/bobo` → `~/D/bobo`.
+    pub shorten_paths: bool,
+}
+
+impl Default for TitlesConfig {
+    fn default() -> Self {
+        TitlesConfig {
+            strip_host_prefix: true,
+            shorten_paths: false,
+        }
+    }
+}
+
+/// Tidy a title the shell set, for a rail that is 240px wide.
+///
+/// Applied at *display* time, never to the stored title: toggling either
+/// option then takes effect on every existing tab at once, instead of only on
+/// titles set afterwards.
+pub fn display_title(raw: &str, cfg: &TitlesConfig) -> String {
+    let mut out = raw;
+    if cfg.strip_host_prefix {
+        out = strip_host_prefix(out);
+    }
+    if cfg.shorten_paths {
+        return shorten_paths(out);
+    }
+    out.to_string()
+}
+
+/// `yoz@yoz-framework:~/Dev/bobo` → `~/Dev/bobo`.
+///
+/// Narrow on purpose: only `name@host:` at the very start, where both parts
+/// look like a name. `ssh: user@host` and titles that merely contain an `@`
+/// are left alone.
+fn strip_host_prefix(title: &str) -> &str {
+    let Some(colon) = title.find(':') else {
+        return title;
+    };
+    let (prefix, rest) = title.split_at(colon);
+    let Some((user, host)) = prefix.split_once('@') else {
+        return title;
+    };
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    if plain(user) && plain(host) {
+        rest[1..].trim_start()
+    } else {
+        title
+    }
+}
+
+/// `~/Dev/claude_test/giverny` → `~/D/c/giverny`. Only the last segment keeps
+/// its name — the one you are actually in.
+fn shorten_paths(title: &str) -> String {
+    title
+        .split(' ')
+        .map(|word| {
+            if !word.contains('/') || word.len() < 12 {
+                return word.to_string();
+            }
+            let parts: Vec<&str> = word.split('/').collect();
+            let last = parts.len() - 1;
+            parts
+                .iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == last || part.is_empty() || *part == "~" {
+                        (*part).to_string()
+                    } else {
+                        part.chars().next().map(String::from).unwrap_or_default()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +271,48 @@ mod tests {
         assert!(cfg.update.check);
         assert_eq!(cfg.usage.refresh_minutes, 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_prefix_is_stripped_only_when_it_really_is_one() {
+        let cfg = TitlesConfig::default();
+        // The actual shape oh-my-zsh sets, and the reason for the option.
+        assert_eq!(
+            display_title("yoz@yoz-framework:~/Dev/bobo", &cfg),
+            "~/Dev/bobo"
+        );
+        assert_eq!(display_title("a@b: spaced", &cfg), "spaced");
+        // Left alone: no colon, an @ that is not a prefix, and titles whose
+        // prefix is not a plain name@host.
+        for keep in [
+            "✳ Claude Code",
+            "btop",
+            "ssh: user@host",
+            "npm run build: watching",
+            "git log --author=me@example.com",
+            "~/Dev/bobo",
+        ] {
+            assert_eq!(
+                display_title(keep, &cfg),
+                keep,
+                "{keep} should be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn shortening_keeps_the_directory_you_are_in() {
+        let cfg = TitlesConfig {
+            strip_host_prefix: true,
+            shorten_paths: true,
+        };
+        assert_eq!(
+            display_title("yoz@host:~/Dev/claude_test/giverny", &cfg),
+            "~/D/c/giverny"
+        );
+        // Short paths and non-paths are not worth mangling.
+        assert_eq!(display_title("~/Dev", &cfg), "~/Dev");
+        assert_eq!(display_title("btop", &cfg), "btop");
     }
 
     #[test]

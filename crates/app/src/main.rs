@@ -276,7 +276,7 @@ enum Inject {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let paths = Paths::default_dirs();
-        let cfg = config::load(paths.base());
+        let mut cfg = config::load(paths.base());
         let theme = Theme::by_name(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
         let mut shared = RenderShared::with_family(theme, cfg.font.size, family)
@@ -287,13 +287,23 @@ impl App {
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
 
-        let cfg_mtime = config_mtime(&paths);
+        let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
-        // A font size chosen live with Ctrl+± wins over the config default.
+        // Font size now lives in config.toml alone. One-time migration for
+        // state files written when it lived here instead, so nobody's zoom
+        // level is lost the first time they run this build.
         if let Some(st) = &restored
             && st.font_size != DEFAULT_FONT_SIZE
+            && cfg.font.size == DEFAULT_FONT_SIZE
         {
             shared.set_font_size(st.font_size);
+            if let Some(def) = giverny_core::settings::by_key("font.size") {
+                let value = giverny_core::settings::Value::Float(st.font_size as f64);
+                if giverny_core::settings::write(paths.base(), def, &value).is_ok() {
+                    cfg.font.size = st.font_size;
+                    cfg_mtime = config_mtime(&paths);
+                }
+            }
         }
         let layout = restored.as_ref().map(|st| st.layout).unwrap_or_default();
         let mut ws = restored
@@ -461,7 +471,8 @@ impl App {
                     RenameTarget::Tab(id) => self
                         .ws
                         .tab(*id)
-                        .map(|t| t.title().to_string())
+                        // What they see, not the raw title behind it.
+                        .map(|t| t.display_title(&self.cfg.titles))
                         .unwrap_or_default(),
                     RenameTarget::Category(id) => self
                         .ws
@@ -892,6 +903,28 @@ impl App {
         }
     }
 
+    /// Ctrl+±/0 changes the font size live. Write it back to `config.toml`,
+    /// which is the single place the size lives — it used to be persisted
+    /// separately in the state file too, where it silently outranked the
+    /// config and the settings screen.
+    fn persist_font_size(&mut self) {
+        let live = self.shared.font_size;
+        if (live - self.cfg.font.size).abs() < 0.01 {
+            return;
+        }
+        let Some(def) = giverny_core::settings::by_key("font.size") else {
+            return;
+        };
+        let value = giverny_core::settings::Value::Float(live as f64);
+        match giverny_core::settings::write(self.paths.base(), def, &value) {
+            Ok(()) => {
+                self.cfg.font.size = live;
+                self.cfg_mtime = config_mtime(&self.paths);
+            }
+            Err(err) => tracing::warn!("could not persist font size: {err:#}"),
+        }
+    }
+
     /// Remember what each tab is running, so a restart can bring it back.
     fn track_foreground(&mut self) {
         let seen: Vec<(TabId, Option<String>)> = self
@@ -927,6 +960,7 @@ impl App {
             self.update = found;
             self.update_rx = None;
         }
+        self.persist_font_size();
         self.track_foreground();
         self.stale_sessions = self.claude.sessions_predate_settings();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -1139,7 +1173,7 @@ impl eframe::App for App {
             .ws
             .tabs
             .iter()
-            .map(|t| (t.id, t.title().to_string()))
+            .map(|t| (t.id, t.display_title(&self.cfg.titles)))
             .collect();
         // Typing in a tab counts as attending to it: declining a permission
         // prompt (Escape) emits no hook, so nothing else would clear the flag.

@@ -217,10 +217,36 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Appearance,
         doc: "Colour theme for the grid and the chrome around it.",
         note: &[],
+        // Kept in step with `Theme::NAMES` by a test in the app crate —
+        // core cannot see the themes, so the check lives where both are.
         kind: Kind::Choice {
             default: "monet-dark",
-            options: &["monet-dark", "monet-light", "ink"],
+            options: &[
+                "monet-dark",
+                "monet-light",
+                "ink",
+                "tokyo-night",
+                "gruvbox",
+                "nord",
+                "catppuccin",
+            ],
         },
+    },
+    SettingDef {
+        key: "titles.strip_host_prefix",
+        label: "strip user@host:",
+        section: Section::Titles,
+        doc: "Drop the `user@host:` your shell puts in front of every title.",
+        note: &["The rail is narrow and that prefix is the same on every tab."],
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "titles.shorten_paths",
+        label: "shorten paths",
+        section: Section::Titles,
+        doc: "Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo.",
+        note: &[],
+        kind: Kind::Bool { default: false },
     },
     SettingDef {
         key: "behavior.scrollback_lines",
@@ -470,6 +496,32 @@ pub fn template() -> String {
     out
 }
 
+/// The options table for the docs — the third thing generated from the
+/// schema, so `docs/options.md` cannot describe a different app than the one
+/// that ships. A test compares it against the checked-in file.
+pub fn markdown() -> String {
+    let mut out = String::from(
+        "# Options\n\n\
+         <!-- Generated from crates/core/src/settings.rs.\n     \
+         Regenerate: cargo run -p giverny-core --example options -->\n\n\
+         Everything in `~/.config/giverny/config.toml`, and everything in the \
+         settings screen (`Ctrl+,`) — they are the same list.\n\n\
+         | Key | Default | What it does |\n|---|---|---|\n",
+    );
+    for def in SETTINGS {
+        let default = match def.default_value() {
+            Value::List(items) if items.len() > 6 => format!("{} programs", items.len()),
+            other => format!("`{}`", render_value(&other)),
+        };
+        let mut doc = def.doc.replace('|', "\\|");
+        if let Kind::Choice { options, .. } = &def.kind {
+            doc.push_str(&format!(" One of: {}.", options.join(", ")));
+        }
+        out.push_str(&format!("| `{}` | {} | {} |\n", def.key, default, doc));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +573,20 @@ mod tests {
             );
             assert!(is_default(&cfg, def), "{} not seen as default", def.key);
         }
+    }
+
+    #[test]
+    fn the_docs_table_is_in_step_with_the_schema() {
+        // The generated docs are checked in so they are browsable on GitHub;
+        // this is what stops them describing an older set of options.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/options.md");
+        let checked_in = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            checked_in,
+            markdown(),
+            "docs/options.md is stale — regenerate with \
+             `cargo run -p giverny-core --example options`"
+        );
     }
 
     #[test]

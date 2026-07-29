@@ -72,7 +72,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                     }
                     RowData {
                         id: t.id,
-                        title: t.title().to_string(),
+                        title: t.display_title(&app.cfg.titles),
                         sub,
                         active: app.ws.active == Some(t.id),
                         exited: t.exited,

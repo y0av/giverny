@@ -22,6 +22,7 @@ Running many concurrent Claude Code sessions across projects — and across mult
 - **Live Claude states.** Braille spinner while Claude works, a pulsing amber flag when it *needs you* (permission prompts, questions, agent input) with a desktop notification, a quiet ✓ when it finished in a background tab. Driven by Claude Code hooks (one-click install, non-destructive, reversible) with a zero-config fallback that reads Claude's own live session registry.
 - **Conversations resume.** Each tab remembers its Claude session; on restore, Giverny re-runs `claude --resume <id>` in the right directory *and* the right account, guarded against double-resuming a session that's already live elsewhere.
 - **Multi-account, at a glance.** Profiles are `CLAUDE_CONFIG_DIR`s (auto-discovered, including the `CCTOP_CONFIG_DIRS` convention). Assign an account per category; every tab shows its account. The rail's bottom panel shows each account's limit bars — 5-hour window, weekly, and per-model buckets (e.g. *Fable*) — with reset countdowns and severity colors. Installing hooks also adds a compact Claude statusline that pushes live usage back to Giverny (official `rate_limits` data, no API calls); values it refreshes are marked with a dot, since Claude's own on-disk cache can be days stale for idle accounts.
+- **Settings that are still a config file.** `Ctrl+,` opens a settings screen over the terminal, with the rail still visible; every row shows its TOML key, so you can make the next change by hand or over SSH. Edits are written back to `~/.config/giverny/config.toml` with your comments intact, and the file stays the source of truth — see [all options](docs/options.md).
 - **`giverny doctor`** prints exactly what the app sees: profiles, per-profile hook and statusline status, usage freshness, and every live Claude session — the first thing to run if states look wrong.
 
 ### Privacy & security
@@ -61,6 +62,7 @@ Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI 
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
 | `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
 | `Ctrl+Shift+P` | fuzzy tab palette |
+| `Ctrl+,` / `F1` | settings / this list of keys |
 | `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
 | `Ctrl`+hover / click | underline and open a path or URL |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |

@@ -66,6 +66,15 @@ impl Tab {
         }
         "shell"
     }
+
+    /// The title as shown in the rail: tidied per `[titles]`, but only when
+    /// the shell chose it. A name you typed yourself is never rewritten.
+    pub fn display_title(&self, titles: &crate::config::TitlesConfig) -> String {
+        match &self.custom_title {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => crate::config::display_title(self.title(), titles),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +345,24 @@ mod tests {
         assert_eq!(ws.tab(id).unwrap().title(), "zsh: ~/dev");
         ws.tab_mut(id).unwrap().custom_title = Some("api server".into());
         assert_eq!(ws.tab(id).unwrap().title(), "api server");
+    }
+
+    #[test]
+    fn a_title_you_typed_is_never_tidied() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let id = ws.add_tab(cat);
+        let titles = crate::config::TitlesConfig::default();
+
+        ws.tab_mut(id).unwrap().auto_title = "yoz@box:~/Dev/bobo".into();
+        assert_eq!(ws.tab(id).unwrap().display_title(&titles), "~/Dev/bobo");
+
+        // Same shape, but chosen by the user: left exactly as typed.
+        ws.tab_mut(id).unwrap().custom_title = Some("yoz@box:~/Dev/bobo".into());
+        assert_eq!(
+            ws.tab(id).unwrap().display_title(&titles),
+            "yoz@box:~/Dev/bobo"
+        );
     }
 
     #[test]

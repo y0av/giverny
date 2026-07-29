@@ -39,7 +39,54 @@ pub fn category_color(index: usize) -> Color32 {
     CATEGORY_PALETTE[index % CATEGORY_PALETTE.len()]
 }
 
+/// Claude Code marks its own subprocesses with session-identity variables.
+/// Launch Giverny *from* a Claude session — a tab, or `claude` in any
+/// terminal — and those markers are inherited, then handed to every shell we
+/// spawn: the `claude` inside each tab decides it is a child session and
+/// turns off transcript saving, which silently disables resume.
+///
+/// Scrub them before any thread exists (the only safe window to mutate the
+/// environment). `CLAUDE_CONFIG_DIR` is deliberately kept — that is account
+/// selection, not session identity — as are `ANTHROPIC_*` credentials-ish
+/// and provider settings we have no business touching.
+fn scrub_inherited_claude_markers() {
+    const MARKERS: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_NAME",
+        "CLAUDE_CODE_SESSION_KIND",
+        "CLAUDE_CODE_JSONL_TRANSCRIPT",
+        "CLAUDE_CODE_SESSION_LOG",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE",
+        "CLAUDE_PROJECT_DIR",
+        "CLAUDE_PLUGIN_ROOT",
+        "CLAUDE_PLUGIN_DATA",
+        "CLAUDE_EFFORT",
+    ];
+    let inherited: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| MARKERS.contains(&k.as_str()) || k.starts_with("CLAUDE_BG_"))
+        .collect();
+    if inherited.is_empty() {
+        return;
+    }
+    for key in &inherited {
+        // SAFETY: single-threaded here — called first thing in main.
+        unsafe { std::env::remove_var(key) };
+    }
+    eprintln!(
+        "giverny: cleared {} inherited Claude session marker(s) so tabs start clean",
+        inherited.len()
+    );
+}
+
 fn main() -> eframe::Result {
+    scrub_inherited_claude_markers();
+
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
@@ -137,6 +184,7 @@ pub enum Action {
     JumpAttention,
     TogglePalette,
     ToggleStatusline(bool),
+    RefreshUsage,
     OpenSessions(TabId),
     /// Resume a specific past conversation in a tab.
     ResumeSpecific(TabId, String, PathBuf),
@@ -458,6 +506,7 @@ impl App {
                 ),
                 Err(e) => tracing::error!("statusline: {e}"),
             },
+            Action::RefreshUsage => self.claude.refresh_stale_usage(0, true),
             Action::TogglePalette => {
                 self.palette = if self.palette.is_some() {
                     None
@@ -719,6 +768,9 @@ impl App {
             self.update_rx = None;
         }
         self.stale_sessions = self.claude.sessions_predate_settings();
+        // Ask Claude Code to refresh accounts whose numbers have aged out.
+        self.claude
+            .refresh_stale_usage(self.cfg.usage.refresh_minutes, false);
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
         }

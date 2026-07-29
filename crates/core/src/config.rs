@@ -11,7 +11,25 @@ pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
     pub behavior: BehaviorConfig,
+    pub usage: UsageConfig,
     pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageConfig {
+    /// Ask Claude Code to refresh its usage cache (`claude -p /usage`) when
+    /// an account's numbers are older than this. 0 disables it, leaving the
+    /// panel dependent on whatever Claude last wrote.
+    pub refresh_minutes: u64,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        UsageConfig {
+            refresh_minutes: 10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +131,12 @@ scrollback_lines = 10000
 # anything in $CCTOP_CONFIG_DIRS).
 extra_profile_dirs = []
 
+[usage]
+# Refresh account usage by asking Claude Code to update its own cache
+# (runs `claude -p /usage` for accounts whose numbers are older than this).
+# Set 0 to never refresh.
+refresh_minutes = 10
+
 [update]
 # Ask GitHub once a day whether a newer Giverny exists. This is the only
 # network request Giverny ever makes — set false and it makes none.
@@ -181,6 +205,7 @@ mod tests {
         assert_eq!(cfg.theme.name, "monet-dark", "unspecified sections default");
         assert!(cfg.behavior.notifications);
         assert!(cfg.update.check);
+        assert_eq!(cfg.usage.refresh_minutes, 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

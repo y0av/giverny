@@ -2,8 +2,9 @@
 //! `sessions/<pid>.json` registry into per-tab states, and refreshes the
 //! per-account usage meters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -79,6 +80,8 @@ pub struct WatchEffects {
 
 pub struct ClaudeWatch {
     pub profiles: Vec<Profile>,
+    /// Accounts with a refresh currently running, so we never stack them.
+    refreshing: Arc<Mutex<HashSet<PathBuf>>>,
     pub tabs: HashMap<TabId, ClaudeTab>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
@@ -120,6 +123,7 @@ impl ClaudeWatch {
 
         Self::adopt_statusline_where_hooked(&profiles);
         let mut watch = ClaudeWatch {
+            refreshing: Arc::new(Mutex::new(HashSet::new())),
             hooks_installed: Self::check_installed(&profiles),
             profiles,
             tabs: HashMap::new(),
@@ -430,6 +434,50 @@ impl ClaudeWatch {
             .collect();
     }
 
+    /// Ask Claude Code to refresh accounts whose numbers have aged out.
+    /// `max_age_minutes == 0` disables the sweep; `force` ignores the age.
+    pub fn refresh_stale_usage(&self, max_age_minutes: u64, force: bool) {
+        if max_age_minutes == 0 && !force {
+            return;
+        }
+        let now = jiff::Timestamp::now();
+        for acc in &self.accounts {
+            let age = acc
+                .usage
+                .as_ref()
+                .map(|u| usage::age_minutes(u, now))
+                .unwrap_or(i64::MAX);
+            if !force && age < max_age_minutes as i64 {
+                continue;
+            }
+            self.spawn_refresh(acc.profile.config_dir.clone());
+        }
+    }
+
+    fn spawn_refresh(&self, config_dir: PathBuf) {
+        {
+            let mut busy = self.refreshing.lock().unwrap();
+            if !busy.insert(config_dir.clone()) {
+                return; // already refreshing this account
+            }
+        }
+        let busy = Arc::clone(&self.refreshing);
+        let _ = std::thread::Builder::new()
+            .name("giverny usage refresh".into())
+            .spawn(move || {
+                match usage::refresh_via_cli(&config_dir) {
+                    Ok(()) => tracing::info!("usage refreshed for {}", config_dir.display()),
+                    Err(err) => tracing::info!("usage refresh skipped: {err}"),
+                }
+                busy.lock().unwrap().remove(&config_dir);
+            });
+    }
+
+    /// Is any account mid-refresh (for the spinner in the rail)?
+    pub fn refresh_in_flight(&self) -> bool {
+        !self.refreshing.lock().unwrap().is_empty()
+    }
+
     /// Turn the live-usage statusline on/off for every profile.
     pub fn set_statusline(&mut self, enable: bool) -> Result<(), String> {
         let mut errs = Vec::new();
@@ -554,6 +602,7 @@ impl ClaudeWatch {
             hook_rx: None,
             last_scan: Instant::now(),
             last_usage: Instant::now(),
+            refreshing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

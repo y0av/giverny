@@ -136,6 +136,43 @@ pub fn read(config_dir: &Path) -> Option<AccountUsage> {
     })
 }
 
+/// Ask Claude Code to refresh its own usage cache for one account.
+///
+/// `claude -p /usage` performs the fetch Claude would do interactively and
+/// rewrites `cachedUsageUtilization`, which we then read as usual. This is
+/// why Giverny needs no credentials and makes no Anthropic request of its
+/// own: the first-party client does it, we just ask.
+///
+/// Blocking (seconds); call from a background thread. Failure is normal —
+/// a logged-out account, no `claude` on PATH — and is not worth surfacing.
+pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("claude")
+        .arg("-p")
+        .arg("/usage")
+        .env("CLAUDE_CONFIG_DIR", config_dir)
+        // Never let it inherit a tab's identity: this is not a tab session.
+        .env_remove("GIVERNY_TAB_ID")
+        .env_remove("GIVERNY_NONCE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // Bounded wait: a hung refresh must not leak a process forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait()? {
+            Some(_) => return Ok(()),
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                anyhow::bail!("usage refresh timed out");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
+}
+
 /// Cache age in minutes given the current wall clock.
 pub fn age_minutes(usage: &AccountUsage, now: jiff::Timestamp) -> i64 {
     let now_ms = now.as_millisecond();

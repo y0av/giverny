@@ -669,6 +669,30 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
+        let spinning = app.claude.refresh_in_flight();
+        let label = if spinning {
+            let t = ui.input(|i| i.time);
+            SPINNER[(t * 10.0) as usize % SPINNER.len()].to_string()
+        } else {
+            "⟳".to_string()
+        };
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new(label)
+                    .font(FontId::monospace(10.0))
+                    .color(if spinning { TEAL } else { dim }),
+            ))
+            .on_hover_text(
+                "refresh usage now\n(asks Claude Code to update its own cache;\nGiverny makes no API call)",
+            )
+            .clicked()
+        {
+            actions.push(Action::RefreshUsage);
+        }
+        if spinning {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        }
     });
     ui.horizontal(|ui| {
         ui.add_space(6.0);

@@ -6,8 +6,9 @@ Everything since the first release: installers, an update check, and the fixes
 found by actually living in it.
 
 ### Install & update
-- One-line installers for Linux, macOS and Windows, with signed-by-checksum
-  release archives built for x86_64/aarch64 Linux, both Macs, and Windows.
+- One-line installers for Linux, macOS and Windows. Prebuilt binaries for
+  x86_64 Linux, both Macs, and Windows; arm64 Linux builds from source until
+  the next release adds it.
 - Giverny checks GitHub once a day for a newer version and offers a one-click
   update; `giverny update` does it from the shell. Opt out with
   `[update] check = false` or `GIVERNY_NO_UPDATE=1`.

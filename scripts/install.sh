@@ -44,9 +44,11 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "downloading ${asset}"
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$url" -o "$tmp/$asset" || die "download failed — is there a release for ${target}?"
+  curl -fsSL "$url" -o "$tmp/$asset" || die "no ${target} build in this release. Build from source instead:
+  git clone https://github.com/${REPO} && cd giverny && cargo install --path crates/app"
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$tmp/$asset" "$url" || die "download failed — is there a release for ${target}?"
+  wget -qO "$tmp/$asset" "$url" || die "no ${target} build in this release. Build from source instead:
+  git clone https://github.com/${REPO} && cd giverny && cargo install --path crates/app"
 else
   die "this installer needs curl or wget"
 fi

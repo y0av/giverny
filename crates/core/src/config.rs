@@ -145,8 +145,10 @@ extra_profile_dirs = []
 
 [usage]
 # Refresh account usage by asking Claude Code to update its own cache
-# (runs `claude -p /usage` for accounts whose numbers are older than this).
-# Set 0 to never refresh.
+# (runs `claude -p /usage` for accounts whose numbers are older than this,
+# and no more often than that per account). Set 0 to never refresh.
+# The caches themselves are re-read every 60s regardless, plus immediately
+# after a refresh; live statusline pushes land the moment they arrive.
 refresh_minutes = 10
 
 [update]

@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,14 @@ pub struct ClaudeWatch {
     pub profiles: Vec<Profile>,
     /// Accounts with a refresh currently running, so we never stack them.
     refreshing: Arc<Mutex<HashSet<PathBuf>>>,
+    /// When we last *asked* for a refresh, successful or not. Age alone can't
+    /// gate the sweep: an account whose cache never appears (logged out, no
+    /// `claude` on PATH) reads as infinitely old and would be retried on every
+    /// tick forever.
+    attempted: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    /// Set by a refresh thread when it finishes, so the panel picks up the new
+    /// numbers on the next frame instead of waiting out the read interval.
+    cache_dirty: Arc<AtomicBool>,
     pub tabs: HashMap<TabId, ClaudeTab>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
@@ -89,6 +98,12 @@ pub struct ClaudeWatch {
     last_scan: Instant,
     last_usage: Instant,
 }
+
+/// How often the on-disk usage caches are re-read. The numbers inside them
+/// only move when Claude Code fetches (minutes apart), and anything faster —
+/// a statusline push, a finished refresh — updates the panel directly, so
+/// polling harder buys nothing.
+const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
 
 fn needs_you(notification_type: &str) -> bool {
     matches!(
@@ -124,13 +139,15 @@ impl ClaudeWatch {
         Self::adopt_statusline_where_hooked(&profiles);
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
+            attempted: Arc::new(Mutex::new(HashMap::new())),
+            cache_dirty: Arc::new(AtomicBool::new(false)),
             hooks_installed: Self::check_installed(&profiles),
             profiles,
             tabs: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
-            last_usage: Instant::now() - Duration::from_secs(60),
+            last_usage: Instant::now() - USAGE_READ_INTERVAL,
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -363,7 +380,11 @@ impl ClaudeWatch {
             }
         }
 
-        if self.last_usage.elapsed() >= Duration::from_secs(10) {
+        // Re-read the caches on a slow timer, or straight away when a refresh
+        // we asked for has just rewritten one.
+        if self.cache_dirty.swap(false, Ordering::Relaxed)
+            || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
+        {
             self.refresh_usage();
         }
 
@@ -434,21 +455,47 @@ impl ClaudeWatch {
             .collect();
     }
 
+    /// Is a refresh due for an account? Split out from the sweep so the two
+    /// ways it can be spared — young numbers, and a recent attempt — are
+    /// testable without spawning anything.
+    fn refresh_due(
+        age_minutes: i64,
+        since_attempt: Option<Duration>,
+        max_age_minutes: u64,
+    ) -> bool {
+        let window = Duration::from_secs(max_age_minutes * 60);
+        if age_minutes < max_age_minutes as i64 {
+            return false;
+        }
+        // An account with no readable cache is infinitely "old", so the age
+        // test never spares it; the attempt clock is what stops the retry loop.
+        since_attempt.is_none_or(|since| since >= window)
+    }
+
     /// Ask Claude Code to refresh accounts whose numbers have aged out.
-    /// `max_age_minutes == 0` disables the sweep; `force` ignores the age.
+    /// `max_age_minutes == 0` disables the sweep; `force` refreshes everything
+    /// now (the user asked), subject only to the in-flight guard.
     pub fn refresh_stale_usage(&self, max_age_minutes: u64, force: bool) {
         if max_age_minutes == 0 && !force {
             return;
         }
         let now = jiff::Timestamp::now();
         for acc in &self.accounts {
-            let age = acc
-                .usage
-                .as_ref()
-                .map(|u| usage::age_minutes(u, now))
-                .unwrap_or(i64::MAX);
-            if !force && age < max_age_minutes as i64 {
-                continue;
+            if !force {
+                let age = acc
+                    .usage
+                    .as_ref()
+                    .map(|u| usage::age_minutes(u, now))
+                    .unwrap_or(i64::MAX);
+                let since = self
+                    .attempted
+                    .lock()
+                    .unwrap()
+                    .get(&acc.profile.config_dir)
+                    .map(|t| t.elapsed());
+                if !Self::refresh_due(age, since, max_age_minutes) {
+                    continue;
+                }
             }
             self.spawn_refresh(acc.profile.config_dir.clone());
         }
@@ -461,12 +508,21 @@ impl ClaudeWatch {
                 return; // already refreshing this account
             }
         }
+        self.attempted
+            .lock()
+            .unwrap()
+            .insert(config_dir.clone(), Instant::now());
         let busy = Arc::clone(&self.refreshing);
+        let dirty = Arc::clone(&self.cache_dirty);
         let _ = std::thread::Builder::new()
             .name("giverny usage refresh".into())
             .spawn(move || {
                 match usage::refresh_via_cli(&config_dir) {
-                    Ok(()) => tracing::info!("usage refreshed for {}", config_dir.display()),
+                    Ok(()) => {
+                        tracing::info!("usage refreshed for {}", config_dir.display());
+                        // Show the new numbers without waiting for the timer.
+                        dirty.store(true, Ordering::Relaxed);
+                    }
                     Err(err) => tracing::info!("usage refresh skipped: {err}"),
                 }
                 busy.lock().unwrap().remove(&config_dir);
@@ -603,6 +659,8 @@ impl ClaudeWatch {
             last_scan: Instant::now(),
             last_usage: Instant::now(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
+            attempted: Arc::new(Mutex::new(HashMap::new())),
+            cache_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -790,5 +848,34 @@ mod tests {
         // No push ⇒ cache value, not flagged.
         let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, None), &limit, now);
         assert_eq!((pct, is_live), (5.0, false));
+    }
+
+    #[test]
+    fn refresh_waits_for_the_numbers_to_age() {
+        let mins = |m: u64| Some(Duration::from_secs(m * 60));
+        // Young numbers are left alone however long ago we last asked.
+        assert!(!ClaudeWatch::refresh_due(3, None, 10));
+        assert!(!ClaudeWatch::refresh_due(9, mins(60), 10));
+        // Aged out and never asked, or asked long enough ago.
+        assert!(ClaudeWatch::refresh_due(10, None, 10));
+        assert!(ClaudeWatch::refresh_due(45, mins(11), 10));
+    }
+
+    #[test]
+    fn an_account_that_never_caches_is_not_retried_in_a_loop() {
+        // No readable cache reads as infinitely old, so only the attempt clock
+        // stands between us and spawning `claude -p /usage` every tick.
+        assert!(ClaudeWatch::refresh_due(i64::MAX, None, 10));
+        for secs in [1, 30, 120, 599] {
+            assert!(
+                !ClaudeWatch::refresh_due(i64::MAX, Some(Duration::from_secs(secs)), 10),
+                "retried {secs}s after the last attempt"
+            );
+        }
+        assert!(ClaudeWatch::refresh_due(
+            i64::MAX,
+            Some(Duration::from_secs(600)),
+            10
+        ));
     }
 }

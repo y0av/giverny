@@ -39,4 +39,14 @@ Claude Code caches its own usage payload per account in `.claude.json → cached
 
 That cache only refreshes when Claude Code fetches usage, which for idle accounts can be days. The optional statusline (installed with the hooks) pushes the official `rate_limits` fields after every assistant message; those values override the cache when fresher and are marked with a leading `·`.
 
+Three cadences, deliberately different, because the numbers behind them move at different speeds:
+
+| What | How often | Why |
+|---|---|---|
+| Statusline push | as it happens | Already an event; nothing to poll. |
+| Re-read the on-disk caches | 60 s, plus immediately after a refresh completes | The file only changes when Claude fetches. |
+| `claude -p /usage` per account | when that account's numbers pass `usage.refresh_minutes` (default 10), and never more than once per window | It spawns a real Claude process. |
+
+The per-account attempt clock is what makes the last row safe: an account with no readable cache is infinitely old, so age alone would spawn a refresh on every tick forever.
+
 Deliberately **not** implemented: polling `api.anthropic.com/api/oauth/usage` (undocumented, unsupported, and inside 2026 ToS language about using subscription OAuth outside Claude Code) and refreshing OAuth tokens (they are single-use and rotating — a third-party refresh logs Claude Code out).

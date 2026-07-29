@@ -25,7 +25,7 @@ Giverny **never calls any network API and never reads credential files**. Usage 
 ## Install
 
 ```sh
-git clone https://github.com/YOURNAME/giverny && cd giverny
+git clone https://github.com/y0av/giverny && cd giverny
 cargo build --release          # Rust 1.90+
 ./target/release/giverny
 ```

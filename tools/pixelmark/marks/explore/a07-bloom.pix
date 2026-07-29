@@ -1,0 +1,27 @@
+name: Bloom 7
+desc: sharp points
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  .......dd.......
+  ..dd..dddd..dd..
+  ..dddddrrddddd..
+  ...drrrrrrrrd...
+  ...drrrccrrrd...
+  ..ddrrccccrrdd..
+  dddrrccGGccrrddd
+  dddrrccGGccrrddd
+  ..ddrrccccrrdd..
+  ...drrrccrrrd...
+  ...drrrrrrrrd...
+  ..dddddrrddddd..
+  ..dd..dddd..dd..
+  .......dd.......
+  .......dd.......

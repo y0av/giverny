@@ -1,0 +1,29 @@
+name: Comp 7
+desc: bloom on rippled water
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  R = #e3aebc      *
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  s = #3f7286      s
+
+grid:
+  wwwwwwwwwwwwwwww
+  wwwwwwwwwwwwwwww
+  wswswswswswswsws
+  wwwwwwwrrwwwwwww
+  wwwwrrrRRrrrwwww
+  wwwwrRRRRRRrwwww
+  swswrRccccRrswsw
+  wwwrRRcGGcRRrwww
+  wwwrRRcGGcRRrwww
+  wwwwrRccccRrwwww
+  wswsrRRRRRRrwsws
+  wwwwrrrRRrrrwwww
+  wwwwwwwrrwwwwwww
+  wwwwwwwwwwwwwwww
+  swswswswswswswsw
+  wwwwwwwwwwwwwwww

@@ -1,0 +1,31 @@
+name: Term 6
+desc: chevron + pad
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  t = #5fa3a3      >
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  ................
+  ................
+  ................
+  .........PPPP...
+  ..tt...PPPPPppp.
+  ...tt..PPPPpppk.
+  ....ttPPPrcrpppk
+  .....t.kkcGcpppk
+  .......kkrcrppmk
+  ......Pppppppmmk
+  .....ttpppppmmk.
+  ....tt.pkppmmkk.
+  ...tt....kkkk...
+  ..tt............
+  ................
+  ................

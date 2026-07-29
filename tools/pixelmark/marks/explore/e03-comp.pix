@@ -1,0 +1,28 @@
+name: Comp 3
+desc: the bridge arch
+
+palette:
+  . = none          
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ................
+  ................
+  ................
+  ................
+  ......mmmm......
+  ....mmppppmm....
+  ..mmppkkkkppmm..
+  .mppkk....kkppm.
+  .pkk........kkp.
+  mkwwwwwwwwwwwwkm
+  pWWWWWWWWWWWWWWp
+  kWWWWWWWWWWWWWWk
+  wwwwwwwwwwwwwwww
+  WWWWWWWWWWWWWWWW
+  WWWWWWWWWWWWWWWW
+  wwwwwwwwwwwwwwww

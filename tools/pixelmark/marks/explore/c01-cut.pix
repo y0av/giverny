@@ -1,0 +1,24 @@
+name: Cut 1
+desc: bloom knocked out of water
+
+palette:
+  . = none          
+  w = #152935      -
+
+grid:
+  .....wwwwww.....
+  ...wwwwwwwwww...
+  ..wwwww..wwwww..
+  .ww..........ww.
+  .ww..........ww.
+  www..........www
+  www..........www
+  ww............ww
+  ww............ww
+  www..........www
+  www..........www
+  .ww..........ww.
+  .ww..........ww.
+  ..wwwww..wwwww..
+  ...wwwwwwwwww...
+  .....wwwwww.....

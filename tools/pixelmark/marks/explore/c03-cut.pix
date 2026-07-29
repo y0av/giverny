@@ -1,0 +1,24 @@
+name: Cut 3
+desc: cut bloom, solid core
+
+palette:
+  . = none          
+  t = #5fa3a3      >
+
+grid:
+  .....tttttt.....
+  ...tttttttttt...
+  ..ttttt..ttttt..
+  .tt..........tt.
+  .tt..........tt.
+  ttt..........ttt
+  ttt....tt....ttt
+  tt....tttt....tt
+  tt....tttt....tt
+  ttt....tt....ttt
+  ttt..........ttt
+  .tt..........tt.
+  .tt..........tt.
+  ..ttttt..ttttt..
+  ...tttttttttt...
+  .....tttttt.....

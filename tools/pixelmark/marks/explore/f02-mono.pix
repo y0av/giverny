@@ -1,0 +1,27 @@
+name: Mono 2
+desc: G with a bloom counter
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  p = #7ba25a      %
+
+grid:
+  .....pppppp.....
+  ...pppppppppp...
+  ..pppp....pppp..
+  .ppp........ppp.
+  ppp..........ppp
+  ppp.............
+  ppp...rcr.......
+  ppp...cGcppppppp
+  ppp...rcrppppppp
+  ppp..........ppp
+  ppp..........ppp
+  .ppp........ppp.
+  ..pppp....pppp..
+  ...pppppppppp...
+  .....pppppp.....
+  ................

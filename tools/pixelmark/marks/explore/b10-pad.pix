@@ -1,0 +1,27 @@
+name: Pad 10
+desc: two pads, overlapping
+
+palette:
+  . = none          
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  ..........PP....
+  ........PPPPPp..
+  .......PPPPPppk.
+  ........PPPpppk.
+  ...PPP.Pkkkppppk
+  .PPPPPPPPpppppmk
+  .PPPPPPPpppppmk.
+  PPPPPPppppppmmk.
+  PPPPPpppkkpmkk..
+  PPPPppppppkk....
+  PPPpppkkkpmk....
+  PPpppppppkk.....
+  Ppppppppmmm.....
+  .ppppppmmmk.....
+  .pkpppmmmkk.....
+  ...kkkkkk.......

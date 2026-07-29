@@ -1,0 +1,29 @@
+name: Bloom 18
+desc: on a water tile
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ...WWWWWWWWWW...
+  .WWWWWWddWWWWWW.
+  .WWddWddddWddWW.
+  wwdddddrrdddddww
+  wwddrrdrrdrrddww
+  wwwdrrrccrrrdwww
+  WWdddrccccrdddWW
+  WddrrccGGccrrddW
+  WddrrccGGccrrddW
+  wwdddrccccrdddww
+  wwwdrrrccrrrdwww
+  wwddrrdrrdrrddww
+  WWdddddrrdddddWW
+  .WWddWddddWddWW.
+  .WWWWWWddWWWWWW.
+  ...wwwwwwwwww...

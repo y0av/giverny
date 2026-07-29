@@ -1,0 +1,30 @@
+name: Pad 4
+desc: seam west
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....PPPPPP.....
+  ...PPPPPPPPpp...
+  ..PPPPPPPPpppp..
+  .PPPPPPPPppppkk.
+  .PPPPPPPpprpppk.
+  PPPPPPPpprcrpppk
+  PPPPPPpprcGcrppk
+  PPPPPpppprcrppmk
+  PPPPppkkpprppmmk
+  PPPppkkpppppmmmk
+  PPpkkppppppmmmmk
+  ...kppppppmmmmk.
+  ...ppppppmmmmkk.
+  ..pkppppmmmmkk..
+  ...kkppmmmmkk...
+  .....kkkkkk.....

@@ -1,0 +1,24 @@
+name: Mono 1
+desc: plain G
+
+palette:
+  . = none          
+  t = #5fa3a3      >
+
+grid:
+  .....tttttt.....
+  ...tttttttttt...
+  ..tttt....tttt..
+  .ttt........ttt.
+  ttt..........ttt
+  ttt.............
+  ttt.............
+  ttt.....tttttttt
+  ttt.....tttttttt
+  ttt..........ttt
+  ttt..........ttt
+  .ttt........ttt.
+  ..tttt....tttt..
+  ...tttttttttt...
+  .....tttttt.....
+  ................

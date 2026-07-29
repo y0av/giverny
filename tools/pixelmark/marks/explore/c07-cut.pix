@@ -1,0 +1,29 @@
+name: Cut 7
+desc: bloom in a punched window
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ...WWWWWWWWWW...
+  .WWWWWWWWWWWWWW.
+  .WWWW......WWWW.
+  wwww...dd...wwww
+  www.dddrrddd.www
+  ww..drrrrrrd..ww
+  WW..drccccrd..WW
+  WW.drrcGGcrrd.WW
+  WW.drrcGGcrrd.WW
+  ww..drccccrd..ww
+  ww..drrrrrrd..ww
+  www.dddrrddd.www
+  WWWW...dd...WWWW
+  .WWWW......WWWW.
+  .WWWWWWWWWWWWWW.
+  ...wwwwwwwwww...

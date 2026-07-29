@@ -1,0 +1,31 @@
+name: Comp 5
+desc: two pads on a disc
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+  w = #152935      -
+
+grid:
+  .....wwwwww.....
+  ...wwwwwwwwww...
+  ..wwPPwwwwwwww..
+  .wPPPPppwwwwwww.
+  .wPPPppkwrcrwww.
+  wPPPppppkcGcwwww
+  wPPppkkmkrcrwwww
+  wwppppk.wPPPpwww
+  wwpkpmk..PPppkww
+  wwwwkkww.kkppkww
+  wwwwwwwwPppppkww
+  .wwwwwwwppppmkw.
+  .wwwwwwwwkkkkww.
+  ..wwwwwwwwwwww..
+  ...wwwwwwwwww...
+  .....wwwwww.....

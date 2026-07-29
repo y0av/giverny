@@ -1,0 +1,27 @@
+name: Bloom 1
+desc: 5 petals
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  ......dddd......
+  ......dddd......
+  .....ddrrdd.....
+  .....drrrrd.....
+  .dddddrrrrddddd.
+  dddrrrrccrrrrddd
+  dddrrccGGccrrddd
+  .ddrrcGGGGcrrdd.
+  .ddrrrcGGcrrrdd.
+  ...drrcGGcrrd...
+  ...drrccccrrd...
+  ..ddrrrrrrrrdd..
+  ..dddrrddrrddd..
+  ..dddddddddddd..
+  ...dddd..dddd...
+  ................

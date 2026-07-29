@@ -1,0 +1,30 @@
+name: Pad 3
+desc: seam NE
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....PPPPPP.....
+  ...PPPPPPPPpp...
+  ..PPPPPPPPppp...
+  .PPPPPPPPppp....
+  .PPPPPPPpppkkpk.
+  PPPPPPPpppkkpppk
+  PPPPPPpppkkppppk
+  PPPPPprpkpppppmk
+  PPPPprcrpppppmmk
+  PPPprcGcrpppmmmk
+  PPppprcrpppmmmmk
+  .ppppprpppmmmmk.
+  .ppppppppmmmmkk.
+  ..pkppppmmmmkk..
+  ...kkppmmmmkk...
+  .....kkkkkk.....

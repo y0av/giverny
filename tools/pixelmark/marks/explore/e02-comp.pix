@@ -1,0 +1,32 @@
+name: Comp 2
+desc: full-bleed, off-centre
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  WWWWWWWWWWWWWWWW
+  WWWWWWWWWWWWWWWW
+  WWWWWWWWWWWWWWWW
+  wwwwwwwwwwwrwwww
+  wwwPPPPwwwrcrwww
+  wPPPPPPpprcGcrww
+  PPPPPPpppkrcrWWW
+  PPPPPppppkWrWWWW
+  PPPPppppppkWWWWW
+  PPPpppppppkwwwww
+  PPpppkkppmkwwwww
+  Pppppppkk..wwwww
+  pppppppmm.WWWWWW
+  ppppppmmmkWWWWWW
+  WkkppmmkkWWWWWWW
+  wwwkkkkwwwwwwwww

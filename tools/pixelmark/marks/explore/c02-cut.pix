@@ -1,0 +1,25 @@
+name: Cut 2
+desc: bloom knocked out of tile
+
+palette:
+  . = none          
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ...WWWWWWWWWW...
+  .WWWWWW..WWWWWW.
+  .WWWWW....WWWWW.
+  www..........www
+  www..........www
+  www..........www
+  WW............WW
+  W..............W
+  W..............W
+  ww............ww
+  www..........www
+  www..........www
+  WWW..........WWW
+  .WWWWW....WWWWW.
+  .WWWWWW..WWWWWW.
+  ...wwwwwwwwww...

@@ -1,0 +1,27 @@
+name: Bloom 11
+desc: wisteria colourway
+
+palette:
+  . = none          
+  c = #f7ece4      O
+  G = #f0d178      @
+  v = #9a86b8      v
+  V = #c3b6d8      V
+
+grid:
+  .......vv.......
+  ......vvvv......
+  ..vvv.vvvv.vvv..
+  ..vvvvvVVvvvvv..
+  ..vvVVVVVVVVvv..
+  ...vVVVccVVVv...
+  .vvvVVccccVVvvv.
+  vvvVVccGGccVVvvv
+  vvvVVccGGccVVvvv
+  .vvvVVccccVVvvv.
+  ...vVVVccVVVv...
+  ..vvVVVVVVVVvv..
+  ..vvvvvVVvvvvv..
+  ..vvv.vvvv.vvv..
+  ......vvvv......
+  .......vv.......

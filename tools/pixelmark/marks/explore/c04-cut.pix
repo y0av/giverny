@@ -1,0 +1,25 @@
+name: Cut 4
+desc: pad as a hole in the tile
+
+palette:
+  . = none          
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  ...PPPPPPPPPP...
+  .PPPP......PPPP.
+  .PPP........PPP.
+  ppp..........ppp
+  pp............pp
+  p..............p
+  P..............P
+  P..............P
+  P..............P
+  p..............p
+  p..............p
+  pp............pp
+  PPP..........PPP
+  .PPP........PPP.
+  .PPPP......PPPP.
+  ...pppppppppp...

@@ -1,0 +1,27 @@
+name: Pad 7
+desc: bare pad, no bloom
+
+palette:
+  . = none          
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....PPPPPP.....
+  ...PPPPPPPPpp...
+  ..PPPPPPPPpppp..
+  .PPPPPPPPppppkk.
+  .PPPPPPPppppppk.
+  PPPPPPPppppppppk
+  PPPPPPpppppppppk
+  PPPPPpppppppppmk
+  PPPPppppkkpppmmk
+  PPPppppppkkpmmmk
+  PPpppppppppkkmmk
+  .pppppppppmmk...
+  .ppppppppmmmm...
+  ..pkppppmmmmkk..
+  ...kkppmmmmkk...
+  .....kkkkkk.....

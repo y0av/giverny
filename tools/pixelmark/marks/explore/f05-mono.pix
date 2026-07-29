@@ -1,0 +1,28 @@
+name: Mono 5
+desc: G cut from a tile
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ...WW......WW...
+  .WW..........WW.
+  .W....WWWW....W.
+  w...wwwwwwww...w
+  ...wwwwwwwwww...
+  ...wwwwddwwwwwww
+  ...WWWrrrrWWWWWW
+  ...WWdrGGrd.....
+  ...WWdrGGrd.....
+  ...wwwrrrrwww...
+  ...wwwwddwwww...
+  w...wwwwwwww...w
+  WW....WWWW....WW
+  .WW..........WW.
+  .WWWW......WWWW.
+  ...wwwwwwwwww...

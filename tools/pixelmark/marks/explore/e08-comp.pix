@@ -1,0 +1,30 @@
+name: Comp 8
+desc: two blooms, unequal
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  R = #e3aebc      *
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  .....WWWWWW.....
+  ...WWWWWWWWWW...
+  ..WWWrWWWWWWWW..
+  .wrrrRrrrwwwwww.
+  .wwRRcRRwwwwwww.
+  wrrRcGcRrrwwwwww
+  WrrRcGcRrrWWWWWW
+  WWWRRcRRWWdWWWWW
+  WWrrrRrrddrddWWW
+  wwwwwrwwdcccdwww
+  wwwwwwwdrcGcrdww
+  .wwwwwwwdcccdww.
+  .WWWWWWWddrddWW.
+  ..WWWWWWWWdWWW..
+  ...WWWWWWWWWW...
+  .....wwwwww.....

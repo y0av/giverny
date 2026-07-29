@@ -1,0 +1,26 @@
+name: Cut 6
+desc: inverted — water inside the bloom
+
+palette:
+  . = none          
+  d = #a85f78      .
+  G = #f0d178      @
+  w = #152935      -
+
+grid:
+  .....dddddd.....
+  ...dddddddddd...
+  ..dddddwwddddd..
+  .ddwwwwwwwwwwdd.
+  .ddwwwwwwwwwwdd.
+  dddwwwwwwwwwwddd
+  dddwwwwGGwwwwddd
+  ddwwwwGGGGwwwwdd
+  ddwwwwGGGGwwwwdd
+  dddwwwwGGwwwwddd
+  dddwwwwwwwwwwddd
+  .ddwwwwwwwwwwdd.
+  .ddwwwwwwwwwwdd.
+  ..dddddwwddddd..
+  ...dddddddddd...
+  .....dddddd.....

@@ -1,0 +1,26 @@
+name: Term 2
+desc: chevron + block cursor
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  G = #f0d178      @
+  t = #5fa3a3      >
+
+grid:
+  ................
+  ................
+  ................
+  ttt.............
+  .ttt.....rrGrrr.
+  ..ttt....GGGGGr.
+  ...ttt...GGGGGr.
+  ....ttt.GGGGGGG.
+  ....ttt..GGGGGr.
+  ...ttt...GGGGGr.
+  ..ttt....rrGrrr.
+  .ttt.....rrrrrr.
+  ttt.............
+  ................
+  ................
+  ................

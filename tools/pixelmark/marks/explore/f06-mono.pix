@@ -1,0 +1,27 @@
+name: Mono 6
+desc: G holding a pad
+
+palette:
+  . = none          
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....pppppp.....
+  ...pppppppppp...
+  ..pppp....pppp..
+  .ppp........ppp.
+  ppp...PPPP...ppp
+  ppp..PPPPpp.....
+  ppp.PPPPpppk....
+  ppp.PPPppppkpppp
+  ppp.PPppkkmkpppp
+  ppp.Pppppk...ppp
+  ppp..pppmm...ppp
+  .ppp..kkkk..ppp.
+  ..pppp....pppp..
+  ...pppppppppp...
+  .....pppppp.....
+  ................

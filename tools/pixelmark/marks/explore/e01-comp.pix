@@ -1,0 +1,29 @@
+name: Comp 1
+desc: full-bleed water, centred
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  R = #e3aebc      *
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  WWWWWWWWWWWWWWWW
+  WWWWWWWWWWWWWWWW
+  WWWWWWWrrWWWWWWW
+  wwwrrrrRRrrrrwww
+  wwwrrRrRRrRrrwww
+  wwwrRRRccRRRrwww
+  WWWrrRccccRrrWWW
+  WWrRRccGGccRRrWW
+  WWrRRccGGccRRrWW
+  wwwrrRccccRrrwww
+  wwwrRRRccRRRrwww
+  wwwrrRrRRrRrrwww
+  WWWrrrrRRrrrrWWW
+  WWWWWWWrrWWWWWWW
+  WWWWWWWWWWWWWWWW
+  wwwwwwwwwwwwwwww

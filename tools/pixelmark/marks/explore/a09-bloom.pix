@@ -1,0 +1,27 @@
+name: Bloom 9
+desc: deep cut, dark
+
+palette:
+  . = none          
+  D = #8a4a63      ,
+  d = #a85f78      .
+  r = #d08aa2      o
+  G = #f0d178      @
+
+grid:
+  .......DD.......
+  ......DDDD......
+  ..DDD.DDDD.DDD..
+  ..DDDDDddDDDDD..
+  ..DDddDddDddDD..
+  ...DdddrrdddD...
+  .DDDDdrrrrdDDDD.
+  DDDddrrGGrrddDDD
+  DDDddrrGGrrddDDD
+  .DDDDdrrrrdDDDD.
+  ...DdddrrdddD...
+  ..DDddDddDddDD..
+  ..DDDDDddDDDDD..
+  ..DDD.DDDD.DDD..
+  ......DDDD......
+  .......DD.......

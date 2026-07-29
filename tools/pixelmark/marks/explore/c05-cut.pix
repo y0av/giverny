@@ -1,0 +1,25 @@
+name: Cut 5
+desc: cut petals, gold centre kept
+
+palette:
+  . = none          
+  G = #f0d178      @
+  w = #152935      -
+
+grid:
+  .....wwwwww.....
+  ...wwwwwwwwww...
+  ..wwwww..wwwww..
+  .ww..........ww.
+  .ww..........ww.
+  www...GGGG...www
+  www..GGGGGG..www
+  ww...GGGGGG...ww
+  ww...GGGGGG...ww
+  www..GGGGGG..www
+  www...GGGG...www
+  .ww..........ww.
+  .ww..........ww.
+  ..wwwww..wwwww..
+  ...wwwwwwwwww...
+  .....wwwwww.....

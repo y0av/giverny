@@ -1,0 +1,28 @@
+name: Comp 4
+desc: arch + reflection
+
+palette:
+  . = none          
+  k = #33502a      :
+  m = #4f7038      =
+  w = #152935      -
+  W = #20404f      ~
+  s = #3f7286      s
+
+grid:
+  ................
+  ................
+  ................
+  ................
+  ................
+  .....mmmmmm.....
+  ....mkkkkkkm....
+  ..mmk......kmm..
+  .mkk........kkm.
+  mk............km
+  kwwwwwwwwwwwwwws
+  WWsWWWWWWWWWsWsW
+  wwwwwswswswswwww
+  WWWWWWWWWWWWWWWW
+  wwwwwwwwwwwwwwww
+  WWWWWWWWWWWWWWWW

@@ -1,0 +1,27 @@
+name: Bloom 4
+desc: 8, rotated 22.5
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  ................
+  ....ddd..ddd....
+  ....dddddddd....
+  ....drrrrrrd....
+  .ddddrrrrrrdddd.
+  .ddrrrccccrrrdd.
+  .ddrrccGGccrrdd.
+  ..drrcGGGGcrrd..
+  ..drrcGGGGcrrd..
+  .ddrrccGGccrrdd.
+  .ddrrrccccrrrdd.
+  .ddddrrrrrrdddd.
+  ....drrrrrrd....
+  ....dddddddd....
+  ....ddd..ddd....
+  ................

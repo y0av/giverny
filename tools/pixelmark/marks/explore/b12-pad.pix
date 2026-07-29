@@ -1,0 +1,30 @@
+name: Pad 12
+desc: three pads — one per account
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  ................
+  ..PPPP..........
+  .PPPPpp...PPP...
+  PPPPpppkPPPPPpp.
+  PPPppppkPPPPppk.
+  PPppkkm.kPPppppk
+  Pppppk..kkkppppk
+  .pppmm.PPpppppmk
+  ..kkkPPPPppppmk.
+  ....PPPPppppmkk.
+  ...PPPPppprcr...
+  ...PPPppppcGc...
+  ...PPppkpmrcr...
+  ...Ppppkmmk.....
+  ....pppkmk......
+  .....kk.........

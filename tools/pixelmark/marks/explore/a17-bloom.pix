@@ -1,0 +1,29 @@
+name: Bloom 17
+desc: in a pond ring
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  R = #e3aebc      *
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  .....WWWWWW.....
+  ...WWWWrrWWWW...
+  ..WWWWrrrrWWWW..
+  .wwrrrrRRrrrrww.
+  .wwrRRrRRrRRrww.
+  wwwrRRRccRRRrwww
+  WWrrrRccccRrrrWW
+  WrrRRccGGccRRrrW
+  WrrRRccGGccRRrrW
+  wwrrrRccccRrrrww
+  wwwrRRRccRRRrwww
+  .wwrRRrRRrRRrww.
+  .WWrrrrRRrrrrWW.
+  ..WWWWrrrrWWWW..
+  ...WWWWrrWWWW...
+  .....wwwwww.....

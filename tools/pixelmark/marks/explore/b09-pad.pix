@@ -1,0 +1,30 @@
+name: Pad 9
+desc: bloom at the rim
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  .....PPPPPP.....
+  ...PPPPPPPPpp...
+  ..PPrPPPPPpppp..
+  .PPrcrPPPppppkk.
+  .PrcGcrPppppppk.
+  PPPrcrPppppppppk
+  PPPPrPpppppppppk
+  PPPPPpppppppppmk
+  PPPPppppkkpppmmk
+  PPPppppppkkpmmmk
+  PPpppppppppkkmmk
+  .pppppppppmmk...
+  .ppppppppmmmm...
+  ..pkppppmmmmkk..
+  ...kkppmmmmkk...
+  .....kkkkkk.....

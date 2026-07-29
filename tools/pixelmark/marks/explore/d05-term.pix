@@ -1,0 +1,29 @@
+name: Term 5
+desc: CRT scanlines
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  b = #2d5a6b      _
+
+grid:
+  .....bbbbbb.....
+  ...wwwwddwwww...
+  ..bbbbddddbbbb..
+  .wwddddrrddddww.
+  .bbddrdrrdrddbb.
+  wwwdrrrccrrrdwww
+  bbdddrccccrdddbb
+  wddrrccGGccrrddw
+  bddrrccGGccrrddb
+  wwdddrccccrdddww
+  bbbdrrrccrrrdbbb
+  .wwddrdrrdrddww.
+  .bbddddrrddddbb.
+  ..wwwwddddwwww..
+  ...bbbbddbbbb...
+  .....wwwwww.....

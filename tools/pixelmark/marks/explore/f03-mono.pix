@@ -1,0 +1,25 @@
+name: Mono 3
+desc: G on a pond disc
+
+palette:
+  . = none          
+  T = #84c5c5      ^
+  w = #152935      -
+
+grid:
+  .....TTTTTT.....
+  ...TTTTTTTTTT...
+  ..TTTTwwwwTTTT..
+  .TTTwwwwwwwwTTT.
+  TTTwwwwwwwwwwTTT
+  TTTwwwwwwwwwwwww
+  TTTwwwwwwwwwwwww
+  TTTwwwwwTTTTTTTT
+  TTTwwwwwTTTTTTTT
+  TTTwwwwwwwwwwTTT
+  TTTwwwwwwwwwwTTT
+  .TTTwwwwwwwwTTT.
+  .wTTTTwwwwTTTTw.
+  ..wTTTTTTTTTTw..
+  ...wwTTTTTTww...
+  .....wwwwww.....

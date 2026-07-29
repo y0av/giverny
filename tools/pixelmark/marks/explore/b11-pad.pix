@@ -1,0 +1,30 @@
+name: Pad 11
+desc: two pads + bloom
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+
+grid:
+  ................
+  ................
+  ........PPPPPp..
+  ........PPPPppk.
+  ........kkPpppk.
+  ...PPPPPPkkpppk.
+  ..PPPPPPPpppppk.
+  .PPPPPpPpppppmk.
+  PPPPPpppppppmkk.
+  PPPPppppkkkkkk..
+  PPPpppkppmrcr...
+  PPppppkkkmcGc...
+  Pppppppmk.rcr...
+  .pppppmmmk......
+  ..kppmmmk.......
+  ...kkkkk........

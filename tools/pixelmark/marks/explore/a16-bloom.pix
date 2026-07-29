@@ -1,0 +1,27 @@
+name: Bloom 16
+desc: bloom + bud
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  ......dddd..c...
+  ..ddd.dddd.rcr..
+  ..dddddrrddrdr..
+  ..ddrrrrrrrrdd..
+  ...drrrccrrrd...
+  .dddrrccccrrddd.
+  dddrrccGGccrrddd
+  dddrrccGGccrrddd
+  .dddrrccccrrddd.
+  ...drrrccrrrd...
+  ..ddrrrrrrrrdd..
+  ..dddddrrddddd..
+  ..ddd.dddd.ddd..
+  ......dddd......
+  .......dd.......

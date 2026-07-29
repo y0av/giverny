@@ -1,0 +1,32 @@
+name: Comp 6
+desc: three pads — one per account
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  k = #33502a      :
+  m = #4f7038      =
+  p = #7ba25a      %
+  P = #96bd6e      #
+  w = #152935      -
+  W = #20404f      ~
+
+grid:
+  ...WWWWWWWWWW...
+  .WWWWWWWWWWWWWW.
+  .WWPPPWWWWWWWWW.
+  wwPPPpkwwwwwwwww
+  wPPPpppkwPPPpwww
+  wPPpkkm..PPppkww
+  WWpppm.W.kkppkWW
+  WWWkkkWWPppppkWW
+  WWWWWPPPppppmkWW
+  wwwwPPPppkkkkwww
+  wwwPPPppkkrcrwww
+  wwwPPppppkcGcwww
+  WWWPppkpkkrcrWWW
+  .WWWpkkkkWWWWWW.
+  .WWWW...WWWWWWW.
+  ...wwwwwwwwww...

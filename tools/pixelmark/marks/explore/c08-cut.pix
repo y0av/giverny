@@ -1,0 +1,28 @@
+name: Cut 8
+desc: ripple rings from a bloom
+
+palette:
+  . = none          
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  b = #2d5a6b      _
+
+grid:
+  .....wwwwww.....
+  ...wwbbbbbbww...
+  ..wwbwwwwwwbww..
+  .wwbwwbbbbwwbww.
+  .wbwbbwwwwbbwbw.
+  wbwwbwbbbbwbwwbw
+  wbwbwbrcrbbwbwbw
+  wbwbwbcGcwbwbwbw
+  wbwbwbrcrwbwbwbw
+  wbwbwbbwwbbwbwbw
+  wbwwbwbbbbwbwwbw
+  .wbwbbwwwwbbwbw.
+  .wwbwwbbbbwwbww.
+  ..wwbwwwwwwbww..
+  ...wwbbbbbbww...
+  .....wwwwww.....

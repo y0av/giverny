@@ -1,0 +1,27 @@
+name: Bloom 6
+desc: 12, dense
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  ....dd.dd.dd....
+  ...dddddddddd...
+  ..d.drrrrrrd.d..
+  .ddddrrrrrrdddd.
+  .ddrrrccccrrrdd.
+  ..drrccGGccrrd..
+  dddrrcGGGGcrrddd
+  dddrrcGGGGcrrddd
+  ..drrccGGccrrd..
+  .ddrrrccccrrrdd.
+  .ddddrrrrrrdddd.
+  ..d.drrrrrrd.d..
+  ...dddddddddd...
+  ....dd.dd.dd....
+  .......dd.......

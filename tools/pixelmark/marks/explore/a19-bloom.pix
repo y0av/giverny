@@ -1,0 +1,29 @@
+name: Bloom 19
+desc: scanline water
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+  w = #152935      -
+  b = #2d5a6b      _
+
+grid:
+  .....bbddbb.....
+  ...wwwddddwww...
+  ..dddwddddwddd..
+  .bdddddrrdddddb.
+  .wddrrrrrrrrddw.
+  wwwdrrrccrrrdwww
+  bdddrrccccrrdddb
+  dddrrccGGccrrddd
+  dddrrccGGccrrddd
+  bdddrrccccrrdddb
+  wwwdrrrccrrrdwww
+  .wddrrrrrrrrddw.
+  .bdddddrrdddddb.
+  ..dddwddddwddd..
+  ...wwwddddwww...
+  .....bbddbb.....

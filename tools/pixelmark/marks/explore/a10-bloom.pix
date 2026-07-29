@@ -1,0 +1,27 @@
+name: Bloom 10
+desc: sun colourway
+
+palette:
+  . = none          
+  c = #f7ece4      O
+  C = #ffffff      8
+  y = #c99a3f      +
+  G = #f0d178      @
+
+grid:
+  .......yy.......
+  ......yyyy......
+  ......yyyy......
+  ..yyyyyGGyyyyy..
+  .yyyyyGGGGyyyyy.
+  .yyGGGGccGGGGyy.
+  ..yGGccccccGGy..
+  ..yyGcCCCCcGyy..
+  ..yyGcCCCCcGyy..
+  ..yGGccccccGGy..
+  .yyGGGGccGGGGyy.
+  .yyyyyGGGGyyyyy.
+  ..yyyyyGGyyyyy..
+  ......yyyy......
+  ......yyyy......
+  .......yy.......

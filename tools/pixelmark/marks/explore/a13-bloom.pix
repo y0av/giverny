@@ -1,0 +1,27 @@
+name: Bloom 13
+desc: off-centre core
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  c = #f7ece4      O
+  G = #f0d178      @
+
+grid:
+  .......dd.......
+  ......drrd......
+  ..drr.rrrd.ddd..
+  ..rrrrrcrrdddd..
+  ..rrcccccrrrdd..
+  ...rcGGGcrrrd...
+  .drrcGGGccrdddd.
+  drrccGGGcrrrdddd
+  drrrcccccrrrdddd
+  .ddrrrcrrrddddd.
+  ...drrrrrdrdd...
+  ..ddrrdrrddddd..
+  ..dddddddddddd..
+  ..ddd.dddd.ddd..
+  ......dddd......
+  .......dd.......

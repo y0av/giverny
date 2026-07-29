@@ -27,10 +27,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Tier 1.5 / tier 2 targets: build-only until the platform passes land.
+  # Tier 1.5 / tier 2 targets: build-only until the platform passes land, but
+  # they must build — a cfg-gated path that only compiles off-Linux is exactly
+  # the kind of break these catch.
   build-macos:
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +40,6 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

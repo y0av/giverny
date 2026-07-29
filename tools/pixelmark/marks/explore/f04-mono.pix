@@ -1,0 +1,27 @@
+name: Mono 4
+desc: G behind a bloom
+
+palette:
+  . = none          
+  d = #a85f78      .
+  r = #d08aa2      o
+  G = #f0d178      @
+  w = #152935      -
+
+grid:
+  .....wwwwww.....
+  ...wwwwwwwwww...
+  ..wwww....wwww..
+  .www........www.
+  www....dd....www
+  www..ddrrdd.....
+  www..drrrrd.....
+  www.drrGGrrdwwww
+  www.drrGGrrdwwww
+  www..drrrrd..www
+  www..ddrrdd..www
+  .www...dd...www.
+  ..wwww....wwww..
+  ...wwwwwwwwww...
+  .....wwwwww.....
+  ................

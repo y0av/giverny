@@ -4,8 +4,10 @@ mod capture;
 mod claude_watch;
 mod desktop;
 mod icon;
+mod keymap;
 mod overlays;
 mod rail;
+mod settings_ui;
 mod update;
 
 use std::collections::HashMap;
@@ -203,6 +205,12 @@ pub enum Action {
     /// Run the official install command in a visible tab.
     RunUpdate,
     DismissUpdate,
+    ToggleSettings,
+    ToggleKeys,
+    /// Write one option back to config.toml and apply it now.
+    SetSetting(String, giverny_core::settings::Value),
+    /// Open config.toml in $EDITOR, in a tab.
+    EditConfig,
 }
 
 pub struct TabRuntime {
@@ -244,6 +252,8 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    pub settings: Option<settings_ui::SettingsState>,
+    pub keys_overlay: Option<keymap::KeysOverlay>,
     capture: Option<capture::Capture>,
     /// Window size and rail width as last seen, persisted with the workspace.
     layout: state::Layout,
@@ -357,6 +367,8 @@ impl App {
             update: None,
             update_rx,
             update_dismissed: false,
+            settings: None,
+            keys_overlay: None,
             capture: capture::Capture::from_env(),
             layout,
             cfg_mtime,
@@ -527,6 +539,60 @@ impl App {
                 Err(e) => tracing::error!("statusline: {e}"),
             },
             Action::RefreshUsage => self.claude.refresh_stale_usage(0, true),
+            Action::ToggleSettings => {
+                self.settings = match self.settings.take() {
+                    Some(_) => None,
+                    None => Some(settings_ui::SettingsState::default()),
+                };
+                self.focus_terminal = self.settings.is_none();
+            }
+            Action::ToggleKeys => {
+                self.keys_overlay = match self.keys_overlay.take() {
+                    Some(_) => None,
+                    None => Some(keymap::KeysOverlay::default()),
+                };
+            }
+            Action::SetSetting(key, value) => {
+                let Some(def) = giverny_core::settings::by_key(&key) else {
+                    tracing::warn!("unknown setting {key}");
+                    return;
+                };
+                match giverny_core::settings::write(self.paths.base(), def, &value) {
+                    Ok(()) => {
+                        // Apply now rather than waiting for the mtime poll, and
+                        // record the mtime we just caused so the watcher does
+                        // not reload the same content a second later.
+                        self.apply_config(config::load(self.paths.base()));
+                        self.cfg_mtime = config_mtime(&self.paths);
+                    }
+                    Err(err) => tracing::error!("could not write {key}: {err:#}"),
+                }
+            }
+            Action::EditConfig => {
+                let editor = std::env::var("VISUAL")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_else(|_| "nano".into());
+                let path = config::config_path(self.paths.base());
+                let cat = self
+                    .ws
+                    .active_tab()
+                    .map(|t| t.category)
+                    .or_else(|| self.ws.categories.first().map(|c| c.id));
+                if let Some(cat) = cat {
+                    let id = self.ws.add_tab(cat);
+                    self.ws.tab_mut(id).unwrap().cwd = dirs::home_dir();
+                    self.spawn_session(ctx, id, None);
+                    // Same deferred injection the resume path uses: give the
+                    // shell time to be ready before typing into it.
+                    self.pending_inject.push((
+                        Instant::now() + Duration::from_millis(700),
+                        id,
+                        Inject::Raw(format!("{editor} {}\n", path.display()).into_bytes()),
+                    ));
+                    self.settings = None;
+                    self.focus_terminal = true;
+                }
+            }
             Action::TogglePalette => {
                 self.palette = if self.palette.is_some() {
                     None
@@ -753,6 +819,11 @@ impl App {
         }
         self.cfg_mtime = mtime;
         let cfg = config::load(self.paths.base());
+        self.apply_config(cfg);
+    }
+
+    /// Adopt a freshly loaded config, applying what can be applied live.
+    fn apply_config(&mut self, cfg: config::Config) {
         if cfg.theme.name != self.cfg.theme.name {
             self.shared.set_theme(Theme::by_name(&cfg.theme.name));
             for rt in self.rt.values() {
@@ -1015,6 +1086,13 @@ impl App {
             if i.consume_key(cs, Key::P) {
                 actions.push(Action::TogglePalette);
             }
+            if i.consume_key(Modifiers::CTRL, Key::Comma) {
+                actions.push(Action::ToggleSettings);
+            }
+            // F1 anywhere, and Ctrl+Shift+/ for muscle memory from editors.
+            if i.consume_key(Modifiers::NONE, Key::F1) || i.consume_key(cs, Key::Slash) {
+                actions.push(Action::ToggleKeys);
+            }
             if i.consume_key(Modifiers::CTRL, Key::PageDown) {
                 actions.push(Action::Cycle(1));
             }
@@ -1119,6 +1197,14 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // Settings take the terminal's place, so the rail stays visible
+            // and changes to it can be watched landing. The shell behind is
+            // untouched and keeps running.
+            if self.settings.is_some() {
+                let acts = settings_ui::settings_ui(self, ui);
+                actions.extend(acts);
+                return;
+            }
             let Some(active) = self.ws.active else {
                 ui.centered_and_justified(|ui| {
                     ui.label("no tabs — Ctrl+Shift+T opens one");
@@ -1180,6 +1266,7 @@ impl eframe::App for App {
 
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
+        actions.extend(keymap::overlay_ui(self, &ctx));
 
         for action in actions {
             self.apply(&ctx, action);

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod git;
 pub mod procs;
+pub mod settings;
 pub mod state;
 pub mod tabs;
 

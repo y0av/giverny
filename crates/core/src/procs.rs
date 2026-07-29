@@ -11,19 +11,21 @@ use std::path::PathBuf;
 /// monitors and browsers that are safe to re-run and pointless to restore
 /// half-way. Anything else is recorded but never replayed, because
 /// re-executing an arbitrary last command could redeploy, delete or push.
+/// Ordered most-recognisable first: the head of the list is what the config
+/// template shows as an example.
 pub const DEFAULT_RESTORE_APPS: &[&str] = &[
     "btop",
-    "btop4win",
-    "bpytop",
     "htop",
+    "k9s",
+    "lazygit",
     "top",
     "atop",
+    "bpytop",
+    "btop4win",
     "glances",
     "gotop",
     "s-tui",
     "nvtop",
-    "k9s",
-    "lazygit",
     "lazydocker",
     "gitui",
     "tig",
@@ -111,22 +113,27 @@ pub fn foreground_command(shell_pid: u32) -> Option<String> {
         })
 }
 
-/// Should `command` be restarted automatically? Matches on the program name
-/// only — `sudo btop` and `/usr/bin/btop --utf-force` both count, but the
-/// arguments are preserved when it is actually run.
-pub fn is_restorable(command: &str, allow: &[String]) -> bool {
+/// The program a command line actually runs: no directory, and seen through a
+/// leading `sudo`/`doas`/`env` wrapper. `""` when there is nothing to name.
+pub fn program_name(command: &str) -> &str {
     let mut words = command.split_whitespace();
     let Some(first) = words.next() else {
-        return false;
+        return "";
     };
-    // Look through a leading `sudo`/`doas` to the real program.
-    let program = match first.rsplit('/').next().unwrap_or(first) {
+    match first.rsplit('/').next().unwrap_or(first) {
         "sudo" | "doas" | "env" => words
             .find(|w| !w.contains('='))
             .map(|w| w.rsplit('/').next().unwrap_or(w))
             .unwrap_or(""),
         other => other,
-    };
+    }
+}
+
+/// Should `command` be restarted automatically? Matches on the program name
+/// only — `sudo btop` and `/usr/bin/btop --utf-force` both count, but the
+/// arguments are preserved when it is actually run.
+pub fn is_restorable(command: &str, allow: &[String]) -> bool {
+    let program = program_name(command);
     !program.is_empty() && allow.iter().any(|a| a == program)
 }
 

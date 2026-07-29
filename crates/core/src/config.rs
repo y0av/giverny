@@ -118,46 +118,6 @@ impl Default for BehaviorConfig {
     }
 }
 
-const TEMPLATE: &str = r#"# Giverny configuration.
-# Edit and save — the app picks changes up without restarting.
-
-[font]
-# family = "JetBrainsMono Nerd Font"   # empty = auto-detect
-family = ""
-size = 13.0
-
-[theme]
-# monet-dark | monet-light | ink
-name = "monet-dark"
-
-[behavior]
-# Re-run `claude --resume` in restored tabs: auto | prompt | off
-restore_claude = "auto"
-notifications = true
-scrollback_lines = 10000
-# Extra CLAUDE_CONFIG_DIRs to show as accounts (beyond ~/.claude and
-# anything in $CCTOP_CONFIG_DIRS).
-extra_profile_dirs = []
-# Full-screen programs a restored tab may relaunch on its own (btop, k9s,
-# lazygit and friends by default). Everything else is remembered but never
-# re-run, since replaying a last command could deploy or delete something.
-# restore_apps = ["btop", "htop", "k9s"]
-
-[usage]
-# Refresh account usage by asking Claude Code to update its own cache
-# (runs `claude -p /usage` for accounts whose numbers are older than this,
-# and no more often than that per account). Set 0 to never refresh.
-# The caches themselves are re-read every 60s regardless, plus immediately
-# after a refresh; live statusline pushes land the moment they arrive.
-refresh_minutes = 10
-
-[update]
-# Ask GitHub once a day whether a newer Giverny exists. This is the only
-# network request Giverny ever makes — set false and it makes none.
-# (Setting GIVERNY_NO_UPDATE in the environment also disables it.)
-check = true
-"#;
-
 pub fn config_path(base: &Path) -> PathBuf {
     base.join("config.toml")
 }
@@ -178,7 +138,9 @@ pub fn load(base: &Path) -> Config {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&path, TEMPLATE);
+            // Generated from the settings table, so the file can never
+            // document an option the app does not have.
+            let _ = std::fs::write(&path, crate::settings::template());
             Config::default()
         }
     }

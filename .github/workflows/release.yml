@@ -8,7 +8,25 @@ permissions:
   contents: write
 
 jobs:
+  # A tag push does not create a Release object, and the upload action waits
+  # for one — so make it first.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && exit 0
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Giverny $GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what's in this release.
+
+          Binaries below are unsigned; on macOS you may need \`xattr -d com.apple.quarantine\`. Building from source (\`cargo build --release\`) is equally supported."
+
   upload-binaries:
+    needs: create-release
     strategy:
       matrix:
         include:

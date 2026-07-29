@@ -11,7 +11,7 @@ Running many concurrent Claude Code sessions across projects — and across mult
 ## Features
 
 - **A real terminal first.** Kitty keyboard protocol (Shift+Enter newline in Claude works out of the box — no `/terminal-setup`), synchronized output (flicker-free Claude redraws), bracketed paste with escape-sequence sanitizing, SGR mouse reporting, selection with auto-copy (double-click word, triple-click line), OSC 52 (store capped, clipboard *reads* denied), truecolor + glyph atlas rendering with integer-pixel cell metrics.
-- **Vertical, categorized tabs.** Categories with Monet-palette colors (right-click to rename, recolor, assign an account, delete); tabs show live cwd (OSC 7 + `/proc` fallback), git branch (worktree-aware), and the Claude account they run under. A category-colored strip above the pane always tells you where you are.
+- **Vertical, categorized tabs.** Categories with Monet-palette colors (right-click to rename, recolor, assign an account, delete); drag tabs to reorder or move them between categories; tabs show live cwd (OSC 7 + process fallback), git branch (worktree-aware), and the Claude account they run under. A category-colored strip above the pane always tells you where you are.
 - **Everything persists.** Tabs, order, categories, titles, working directories, and scrollback (colors intact) survive app restarts and reboots. Shells respawn lazily on first focus, with restored scrollback above a `── restored ──` divider.
 - **Live Claude states.** Braille spinner while Claude works, a pulsing amber flag when it *needs you* (permission prompts, questions, agent input) with a desktop notification, a quiet ✓ when it finished in a background tab. Driven by Claude Code hooks (one-click install, non-destructive, reversible) with a zero-config fallback that reads Claude's own live session registry.
 - **Conversations resume.** Each tab remembers its Claude session; on restore, Giverny re-runs `claude --resume <id>` in the right directory *and* the right account, guarded against double-resuming a session that's already live elsewhere.
@@ -30,7 +30,7 @@ cargo build --release          # Rust 1.90+
 ./target/release/giverny
 ```
 
-Linux (Wayland/X11) is tier 1. macOS builds and should work (untested pass). Windows is tier 2 — the terminal core compiles against ConPTY but the hook relay is unix-only for now.
+Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
 
 Tagged releases upload prebuilt binaries via GitHub Actions.
 
@@ -56,7 +56,7 @@ Tagged releases upload prebuilt binaries via GitHub Actions.
 
 ## Status
 
-Early but daily-drivable. Built and verified against Claude Code 2.1.220 on Linux. Not yet done: drag-to-reorder tabs, split panes, SSH/remote tabs, macOS/Windows platform passes. The full design plan (7 milestones, research notes) lives in `docs/`.
+Early but daily-drivable, and built against Claude Code 2.1.220. Not yet done: split panes, SSH/remote tabs, a plugin system, and hardware passes on macOS/Windows. See [`docs/architecture.md`](docs/architecture.md) for how the terminal engine and Claude integration fit together, [`docs/claude-integration.md`](docs/claude-integration.md) for exactly which Claude Code files are touched, and [`CHANGELOG.md`](CHANGELOG.md) for what landed.
 
 ## License
 

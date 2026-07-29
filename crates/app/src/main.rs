@@ -1,5 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod capture;
 mod claude_watch;
 mod desktop;
 mod icon;
@@ -180,6 +181,7 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    capture: Option<capture::Capture>,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
     last_cfg_check: Instant,
@@ -289,6 +291,7 @@ impl App {
             update: None,
             update_rx,
             update_dismissed: false,
+            capture: capture::Capture::from_env(),
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
@@ -864,6 +867,13 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Documentation capture (GIVERNY_CAPTURE); no-op otherwise.
+        if let Some(cap) = &mut self.capture {
+            cap.on_frame(ui.ctx());
+            if cap.done() {
+                self.capture = None;
+            }
+        }
         self.drain_events();
         self.periodic_refresh();
 

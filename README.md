@@ -6,6 +6,10 @@
 
 Named for [Giverny](https://en.wikipedia.org/wiki/Giverny), Claude Monet's garden village — a home for the other famous Claude.
 
+![Giverny: categorised tabs with live Claude state and multi-account usage meters](assets/demo.gif)
+
+*One tab is working (spinner), one finished while you were away (✓), one is waiting on you (⚑) — and every account's limits are in the corner. Mock data; regenerate with [`tools/demo`](tools/demo).*
+
 ## Why
 
 Running many concurrent Claude Code sessions across projects — and across multiple subscription accounts — in ordinary terminals means losing track of which session is working, which is waiting on *you*, and how close each account is to its rate limits. Giverny is a real terminal emulator (Rust, GPU-rendered, `alacritty_terminal` core, no web engine) whose entire chrome is built for that workflow.

@@ -443,31 +443,61 @@ impl App {
     /// Queue the auto-resume command for a freshly restored tab, guarded
     /// against a second live resume of the same session.
     fn queue_resume(&mut self, id: TabId) {
+        use giverny_claude::registry;
         let Some(tab) = self.ws.tab(id) else { return };
         let Some(sid) = tab.claude_session.clone() else {
             return;
         };
-        if !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        if sid.len() != 36 || !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            tracing::warn!("tab {id:?}: malformed session id {sid:?} — not resuming");
             return;
         }
-        let dirs: Vec<std::path::PathBuf> = self
+        let all_dirs: Vec<PathBuf> = self
             .claude
             .profiles
             .iter()
             .map(|p| p.config_dir.clone())
             .collect();
-        if giverny_claude::registry::session_is_live(dirs, &sid) {
+        if registry::session_is_live(all_dirs.clone(), &sid) {
             tracing::info!("claude session {sid} already live elsewhere — not resuming");
             return;
         }
+
+        // Locate the transcript on disk — preferred profile first, then all
+        // (self-heals a lost account association). No transcript ⇒ nothing to
+        // resume; skip silently instead of letting claude error in the tab.
+        let preferred = tab.claude_config_dir.clone();
+        let mut search: Vec<PathBuf> = preferred.iter().cloned().collect();
+        search.extend(
+            all_dirs
+                .into_iter()
+                .filter(|d| Some(d) != preferred.as_ref()),
+        );
+        let Some((config_dir, transcript)) = search
+            .iter()
+            .find_map(|d| registry::find_transcript(d, &sid).map(|t| (d.clone(), t)))
+        else {
+            tracing::info!("tab {id:?}: no transcript for session {sid} — skipping resume");
+            return;
+        };
+
+        // `claude --resume` only finds a conversation from the directory it
+        // ran in — use the transcript's own recorded cwd, not the tab's
+        // (which drifts with every `cd`).
+        let resume_dir = registry::transcript_cwd(&transcript).or_else(|| tab.cwd.clone());
+
         let mut cmd = String::new();
-        if let Some(dir) = &tab.claude_config_dir {
-            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{}\" ", dir.display()));
+        if let Some(dir) = &resume_dir {
+            cmd.push_str(&format!("cd \"{}\" && ", dir.display()));
+        }
+        let is_default_profile = dirs::home_dir().is_some_and(|h| h.join(".claude") == config_dir);
+        if !is_default_profile {
+            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{}\" ", config_dir.display()));
         }
         // `command` bypasses shell wrapper functions named `claude`.
         cmd.push_str(&format!("command claude --resume {sid}\r"));
         self.pending_inject.push((
-            Instant::now() + Duration::from_millis(900),
+            Instant::now() + Duration::from_millis(1300),
             id,
             cmd.into_bytes(),
         ));

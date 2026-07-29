@@ -85,6 +85,41 @@ pub fn session_is_live(config_dirs: impl IntoIterator<Item = PathBuf>, session_i
         .any(|s| s.entry.session_id == session_id)
 }
 
+/// Locate a session's transcript inside one config dir:
+/// `projects/<munged-cwd>/<session_id>.jsonl`. The munging is lossy, so we
+/// scan project dirs instead of reconstructing it.
+pub fn find_transcript(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let projects = config_dir.join("projects");
+    for entry in std::fs::read_dir(projects).ok()?.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The working directory a transcript's conversation ran in — the *only*
+/// directory `claude --resume` will find it from. Early lines carry a `cwd`
+/// field (format is internal; we scan a bounded prefix and tolerate misses).
+pub fn transcript_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(50) {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
+            && !cwd.is_empty()
+        {
+            return Some(PathBuf::from(cwd));
+        }
+    }
+    None
+}
+
 /// Walk `/proc/<pid>/stat` parent links; true when `ancestor` is in the chain.
 /// Maps a claude process to the Giverny tab whose shell spawned it.
 #[cfg(target_os = "linux")]
@@ -158,6 +193,31 @@ mod tests {
         assert_eq!(live[0].entry.session_id, "alive");
         assert!(session_is_live([dir.clone()], "alive"));
         assert!(!session_is_live([dir.clone()], "dead"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_transcript_and_its_cwd() {
+        let dir = std::env::temp_dir().join(format!("giverny-transcript-{}", std::process::id()));
+        let proj = dir.join("projects").join("-home-u-Dev-myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let sid = "b263c7bf-2cc6-4ee1-b00a-948a4152f6ab";
+        std::fs::write(
+            proj.join(format!("{sid}.jsonl")),
+            concat!(
+                "{\"mode\":\"default\",\"sessionId\":\"x\",\"type\":\"mode\"}\n",
+                "{\"type\":\"user\",\"cwd\":\"/home/u/Dev/myproj\",\"sessionId\":\"x\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let found = find_transcript(&dir, sid).expect("transcript located");
+        assert_eq!(
+            transcript_cwd(&found),
+            Some(PathBuf::from("/home/u/Dev/myproj")),
+            "cwd read from early transcript lines"
+        );
+        assert!(find_transcript(&dir, "0000-not-there").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

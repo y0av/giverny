@@ -235,6 +235,7 @@ impl ClaudeWatch {
         // Registry scan: baseline busy/idle + identity, ~1 Hz.
         if self.last_scan.elapsed() >= Duration::from_secs(1) {
             self.last_scan = Instant::now();
+            let hooks_live = self.hooks_installed;
             for tab in self.tabs.values_mut() {
                 tab.seen_in_scan = false;
             }
@@ -255,20 +256,28 @@ impl ClaudeWatch {
                 if account.is_some() {
                     entry.account = account;
                 }
-                // Hook-set attention states are stickier than the registry.
-                match entry.state {
-                    ClaudeState::NeedsYou => {
-                        if live.entry.busy() {
-                            entry.state = ClaudeState::Busy;
+                // State authority: once hooks have spoken for a tab, they own
+                // its state. Claude's registry file can lag — a stale "busy"
+                // after a turn ends would stomp the crisp Stop transition and
+                // leave the spinner running. The registry drives states only
+                // as the no-hooks fallback, or for sessions hooks never saw
+                // (e.g. Claude was already running when Giverny launched).
+                let hooks_own = hooks_live && entry.state != ClaudeState::None;
+                if !hooks_own {
+                    match entry.state {
+                        ClaudeState::NeedsYou => {
+                            if live.entry.busy() {
+                                entry.state = ClaudeState::Busy;
+                            }
                         }
-                    }
-                    ClaudeState::DoneUnseen => {}
-                    _ => {
-                        entry.state = if live.entry.busy() {
-                            ClaudeState::Busy
-                        } else {
-                            ClaudeState::Idle
-                        };
+                        ClaudeState::DoneUnseen => {}
+                        _ => {
+                            entry.state = if live.entry.busy() {
+                                ClaudeState::Busy
+                            } else {
+                                ClaudeState::Idle
+                            };
+                        }
                     }
                 }
             }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Hebrew and Arabic render the right way round. The grid keeps text in logical
+  order — that is what programs read back — and rows containing RTL script are
+  reordered for display with the Unicode Bidi Algorithm, the way VTE does it.
+  Mixed lines only reorder the RTL run, and digits inside it stay readable. A
+  row with no RTL character never reaches the algorithm, so Latin output costs
+  one character test per cell. The cursor follows the reordering.
+  Not yet: clicking or drag-selecting inside an RTL run maps to the wrong cell,
+  because selection still works in logical columns.
+
 - `Ctrl+C` interrupts again. egui-winit converts the platform clipboard chords
   into `Copy`/`Cut` events and returns without emitting the key, so on Linux and
   Windows — where that chord is `Ctrl+C` — nothing reached the child: no

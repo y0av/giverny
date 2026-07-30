@@ -19,6 +19,12 @@ crates/
 - **Rendering**: `Snapshot::capture` copies the viewport (colors fully resolved) under the terminal lock; mesh building — including first-use swash rasterization into shelf-packed atlas pages — happens outside it. Cell metrics are integer physical pixels, which removes subpixel bins and seam shimmer. Never per-cell egui galleys.
 - **Input**: legacy xterm + kitty CSI-u encoders (`Shift+Enter` ⇒ `ESC[13;2u` when Claude enables the kitty protocol), SGR/legacy mouse reporting, sanitized bracketed paste.
 
+### Bidirectional text
+
+The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` reorders each row that contains RTL script, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.
+
+Rows with no RTL character skip the algorithm entirely, so the cost for ordinary output is one range test per cell. Mouse hit-testing and selection still work in logical columns, so a click inside an RTL run currently lands on the wrong cell — the mapping exists (`logical_to_visual`) and inverting it is the next step.
+
 ## Persistence (`crates/core`)
 
 `~/.config/giverny/state/tabs.json` (versioned, atomic tmp+rename, corruption sidelined) plus per-tab ANSI scrollback dumps. Restore **pre-seeds** the fresh `Term` with the dump before the shell spawns — scrollback returns with colors and re-wraps naturally because dumps store *logical* lines (WRAPLINE rows joined). Alt-screen content is never snapshotted. Sessions spawn lazily on first focus.

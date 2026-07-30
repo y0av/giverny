@@ -23,6 +23,7 @@ libc = "0.2.189"
 open = "5.4.0"
 regex-syntax = "0.8.11"
 dirs.workspace = true
+unicode-bidi = "0.3.18"
 
 # Linux reads /proc directly; other platforms need sysinfo for process cwd.
 [target.'cfg(not(target_os = "linux"))'.dependencies]

@@ -4,6 +4,8 @@
 //! so mesh building — including first-use glyph rasterization — never holds
 //! the terminal lock.
 
+use std::collections::HashMap;
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
@@ -53,6 +55,9 @@ impl Snapshot {
 
         let selection = content.selection;
         let mut cells = Vec::with_capacity(cols * rows / 2);
+        // Rows holding right-to-left script, so only those pay for the bidi
+        // pass below. One char test per cell is the cost for everyone else.
+        let mut rtl_rows: Vec<u16> = Vec::new();
 
         for indexed in content.display_iter {
             let point: Point = indexed.point;
@@ -88,6 +93,10 @@ impl Snapshot {
                 bg_opt = Some(blend(base, s));
             }
 
+            if super::bidi::is_rtl(cell.c) && !rtl_rows.contains(&(vp_line as u16)) {
+                rtl_rows.push(vp_line as u16);
+            }
+
             let blank_char = cell.c == ' ' || cell.flags.contains(Flags::HIDDEN);
             if blank_char
                 && bg_opt.is_none()
@@ -108,6 +117,40 @@ impl Snapshot {
             });
         }
 
+        // Reorder the RTL rows for display. The grid is untouched: only the
+        // column a cell is *drawn* at changes, so what the program reads back
+        // and what selection and search work on stay in logical order.
+        let mut visual_maps: Vec<(u16, Vec<usize>)> = Vec::new();
+        if !rtl_rows.is_empty() {
+            // Bucket cell indices by row in one pass. Scanning all cells per
+            // RTL row instead would be quadratic exactly when it hurts most —
+            // a screenful of Hebrew, which is the case this exists for.
+            let mut by_row: HashMap<u16, Vec<usize>> = HashMap::new();
+            for (idx, cell) in cells.iter().enumerate() {
+                if rtl_rows.contains(&cell.line) {
+                    by_row.entry(cell.line).or_default().push(idx);
+                }
+            }
+            for &line in &rtl_rows {
+                let Some(indices) = by_row.get(&line) else {
+                    continue;
+                };
+                let mut row = vec![' '; cols];
+                for &idx in indices {
+                    if let Some(slot) = row.get_mut(cells[idx].col as usize) {
+                        *slot = cells[idx].c;
+                    }
+                }
+                let map = super::bidi::logical_to_visual(&row);
+                for &idx in indices {
+                    if let Some(&visual) = map.get(cells[idx].col as usize) {
+                        cells[idx].col = visual as u16;
+                    }
+                }
+                visual_maps.push((line, map));
+            }
+        }
+
         let cursor = {
             let p = content.cursor.point;
             let vp_line = p.line.0 + display_offset as i32;
@@ -115,7 +158,14 @@ impl Snapshot {
                 && vp_line >= 0
                 && vp_line < rows as i32
                 && content.mode.contains(TermMode::SHOW_CURSOR);
-            visible.then_some((vp_line as u16, p.column.0 as u16, content.cursor.shape))
+            // The cursor follows the text it sits in, or it would sit at the
+            // wrong end of a Hebrew word.
+            let col = visual_maps
+                .iter()
+                .find(|(line, _)| *line == vp_line as u16)
+                .and_then(|(_, map)| map.get(p.column.0).copied())
+                .unwrap_or(p.column.0) as u16;
+            visible.then_some((vp_line as u16, col, content.cursor.shape))
         };
 
         Snapshot {

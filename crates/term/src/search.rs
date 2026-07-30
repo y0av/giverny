@@ -1,4 +1,6 @@
-//! Scrollback search and click targets (paths, URLs, OSC 8 hyperlinks).
+//! Scrollback search and click targets: paths and bare URLs in the visible
+//! text. OSC 8 hyperlinks are resolved from cell metadata instead — see
+//! `TermSession::hyperlink_at` — because their URL never appears on screen.
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;

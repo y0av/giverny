@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- OSC 8 hyperlinks are clickable. Ctrl+click already handled bare URLs and
+  file paths in the visible text, but a link emitted as OSC 8 keeps its URL in
+  the escape sequence and shows only a label, so there was nothing in the text
+  to match — which is how Claude, `gh` and `ls --hyperlink` print links. The
+  cell's link metadata is now consulted first, and hovering underlines the
+  whole label rather than one word.
+
 - Hebrew and Arabic render the right way round. The grid keeps text in logical
   order — that is what programs read back — and rows containing RTL script are
   reordered for display with the Unicode Bidi Algorithm, the way VTE does it.

@@ -284,6 +284,38 @@ impl TermSession {
             .collect()
     }
 
+    /// The OSC 8 hyperlink at a screen cell, and the run of cells sharing it.
+    ///
+    /// A program that emits OSC 8 puts the URL in the escape sequence and only
+    /// the label on screen — `click here`, or a shortened title. No amount of
+    /// looking at the visible text finds it, so the cell metadata is the only
+    /// place the link exists.
+    pub fn hyperlink_at(&self, row: u16, col: u16) -> Option<(String, u16, u16)> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = self.term.lock();
+        let grid = term.grid();
+        if row as usize >= grid.screen_lines() || col as usize >= grid.columns() {
+            return None;
+        }
+        let at = |c: usize| grid[Point::new(Line(row as i32), Column(c))].hyperlink();
+        let here = at(col as usize)?;
+        let uri = here.uri().to_string();
+        // Underline the whole link, not the character under the pointer. Cells
+        // are one link when they carry the same id — two adjacent links with
+        // the same target stay separate, which is what the id is for.
+        let same = |c: usize| at(c).is_some_and(|h| h.id() == here.id());
+        let mut start = col as usize;
+        while start > 0 && same(start - 1) {
+            start -= 1;
+        }
+        let mut end = col as usize;
+        while end + 1 < grid.columns() && same(end + 1) {
+            end += 1;
+        }
+        Some((uri, start as u16, (end - start + 1) as u16))
+    }
+
     /// Visible screen contents as text (row-major, newline-separated).
     /// Diagnostics/tests; trims trailing spaces per row.
     pub fn screen_text(&self) -> String {

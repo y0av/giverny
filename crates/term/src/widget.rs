@@ -768,6 +768,20 @@ impl TabView {
             return;
         };
         let (col, line, _) = cell_at(rect, ppp, m, pos);
+
+        // An OSC 8 hyperlink wins: its URL is in the escape sequence, so the
+        // visible text says nothing about it. This is how Claude, `gh`, `ls
+        // --hyperlink` and friends emit links.
+        if let Some((uri, start, len)) = session.hyperlink_at(line, col) {
+            let target = crate::search::ClickTarget::Url(uri);
+            self.hover_target = Some((target.clone(), line, start, len));
+            ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+            if response.clicked() {
+                target.open();
+            }
+            return;
+        }
+
         let text = session.row_text(line);
         let cwd = session.proc_cwd().unwrap_or_else(|| PathBuf::from("/"));
         let Some(target) = crate::search::target_at(&text, col as usize, &cwd) else {

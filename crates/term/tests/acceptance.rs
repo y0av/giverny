@@ -310,3 +310,44 @@ fn claude_tui_renders_in_session() {
     session.shutdown();
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// An OSC 8 hyperlink puts the URL in the escape sequence and only a label on
+/// screen. Claude prints links this way, and so do `gh`, `delta` and
+/// `ls --hyperlink` — so the visible text is never enough to find the target.
+#[test]
+fn osc8_hyperlinks_are_recoverable_from_the_grid() {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line, Point};
+
+    let mut term = Term::new(
+        Config::default(),
+        &TermSize::new(80, 24),
+        ReplyCapture::default(),
+    );
+    let mut parser: Processor = Processor::new();
+    parser.advance(
+        &mut term,
+        b"see \x1b]8;;https://example.com/docs\x1b\\click here\x1b]8;;\x1b\\ ok",
+    );
+
+    let grid = term.grid();
+    let row: String = (0..grid.columns())
+        .map(|c| grid[Point::new(Line(0), Column(c))].c)
+        .collect();
+    assert!(row.starts_with("see click here ok"), "{row:?}");
+    // The URL is nowhere in the text — which is exactly why the cell metadata
+    // has to be consulted.
+    assert!(!row.contains("example.com"));
+
+    let link_at = |col: usize| {
+        grid[Point::new(Line(0), Column(col))]
+            .hyperlink()
+            .map(|h| h.uri().to_string())
+    };
+    // "click here" spans columns 4..=13.
+    assert_eq!(link_at(4).as_deref(), Some("https://example.com/docs"));
+    assert_eq!(link_at(13).as_deref(), Some("https://example.com/docs"));
+    // The label's neighbours are not part of the link.
+    assert_eq!(link_at(3), None, "space before the label");
+    assert_eq!(link_at(15), None, "text after the label");
+}

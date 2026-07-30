@@ -340,6 +340,9 @@ pub enum Action {
     SetSetting(String, giverny_core::settings::Value),
     /// Open config.toml in $EDITOR, in a tab.
     EditConfig,
+    /// Attach a tab to a background agent: its directory, its account, its
+    /// conversation.
+    AttachJob(Box<giverny_claude::jobs::Job>),
 }
 
 pub struct TabRuntime {
@@ -716,6 +719,26 @@ impl App {
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
                 }
+            }
+            Action::AttachJob(job) => {
+                let cat = self
+                    .ws
+                    .active_tab()
+                    .map(|t| t.category)
+                    .or_else(|| self.ws.categories.first().map(|c| c.id));
+                let (Some(cat), Some(sid)) = (cat, job.resume_target().map(str::to_string)) else {
+                    tracing::warn!("job {} has no conversation to attach to", job.id);
+                    return;
+                };
+                let id = self.ws.add_tab(cat);
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    // The agent's own directory: `claude --resume` only finds a
+                    // conversation from where it ran.
+                    tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
+                    tab.custom_title = Some(job.name.clone());
+                }
+                self.spawn_session(ctx, id, None);
+                self.apply(ctx, Action::ResumeSpecific(id, sid, job.config_dir.clone()));
             }
             Action::EditConfig => {
                 let editor = std::env::var("VISUAL")

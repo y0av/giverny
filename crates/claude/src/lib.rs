@@ -6,6 +6,7 @@
 //! titles. Never reads credentials, never calls the network.
 
 pub mod hooks;
+pub mod jobs;
 pub mod profiles;
 pub mod registry;
 pub mod usage;

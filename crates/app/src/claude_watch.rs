@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use giverny_claude::hooks::{self, RelayMsg};
+use giverny_claude::jobs::{self, Job};
 use giverny_claude::profiles::{self, Profile};
 use giverny_claude::registry;
 use giverny_claude::usage::{self, AccountUsage};
@@ -92,10 +93,13 @@ pub struct ClaudeWatch {
     /// numbers on the next frame instead of waiting out the read interval.
     cache_dirty: Arc<AtomicBool>,
     pub tabs: HashMap<TabId, ClaudeTab>,
+    /// Background agents across every account — the Claudes with no tab.
+    pub jobs: Vec<Job>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
     last_scan: Instant,
+    last_jobs: Instant,
     last_usage: Instant,
 }
 
@@ -148,9 +152,11 @@ impl ClaudeWatch {
             hooks_installed: Self::check_installed(&profiles),
             profiles,
             tabs: HashMap::new(),
+            jobs: Vec::new(),
             accounts: Vec::new(),
             hook_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
+            last_jobs: Instant::now() - Duration::from_secs(10),
             last_usage: Instant::now() - USAGE_READ_INTERVAL,
         };
         watch.refresh_usage();
@@ -384,6 +390,14 @@ impl ClaudeWatch {
             }
         }
 
+        // Background agents: a handful of small files, so a slower tick than
+        // the session registry is plenty.
+        if self.last_jobs.elapsed() >= Duration::from_secs(3) {
+            self.last_jobs = Instant::now();
+            let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+            self.jobs = jobs::scan(dirs);
+        }
+
         // Re-read the caches on a slow timer, or straight away when a refresh
         // we asked for has just rewritten one.
         if self.cache_dirty.swap(false, Ordering::Relaxed)
@@ -395,7 +409,11 @@ impl ClaudeWatch {
         effects.animating = self
             .tabs
             .values()
-            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou));
+            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou))
+            || self
+                .jobs
+                .iter()
+                .any(|j| j.live && j.state == jobs::JobState::Working);
         effects
     }
 
@@ -657,10 +675,12 @@ impl ClaudeWatch {
         ClaudeWatch {
             profiles: Vec::new(),
             tabs: HashMap::new(),
+            jobs: Vec::new(),
             accounts: Vec::new(),
             hooks_installed: true,
             hook_rx: None,
             last_scan: Instant::now(),
+            last_jobs: Instant::now(),
             last_usage: Instant::now(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),

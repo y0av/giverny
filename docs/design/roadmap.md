@@ -8,7 +8,7 @@ head, and the terminal should keep track.** Everything below is judged against
 that. A feature that any terminal could have is worth less here than one only
 this terminal can have.
 
-## 1. Background agents are invisible — the biggest gap
+## 1. Background agents are invisible — the biggest gap  ✅ built
 
 Claude Code runs work with no tab attached: `/fork` copies a conversation into a
 background session, the Bash tool runs commands with `run_in_background`, and
@@ -121,7 +121,7 @@ would corrupt state. Visibility only.
 
 ## Ordering
 
-1. **Background agents** — the premise gap, and it reuses everything.
+1. ~~Background agents~~ — built.
 2. **Prompt marks** + **hints** — small, daily, built on parsers that already run.
 3. **Tokens per tab** — makes the meters actionable.
 

@@ -39,6 +39,12 @@ An account is a `CLAUDE_CONFIG_DIR`. Giverny finds them, in order: `~/.claude`; 
 
 The last is the general answer for accounts kept anywhere else, and it is what the others feed into: a directory named only by the environment is copied into the config the first time Giverny sees it. Environment variables usually come from a shell rc, so without that step the account list changes depending on whether the app was started from a terminal or from a launcher. `giverny doctor` prints which source each account came from.
 
+## Background agents
+
+`<config>/jobs/<id>/state.json` holds each background agent's state (`working` / `blocked` / `done`), a line of its own description, in-flight task counts, its cwd, and `resumeSessionId` — everything needed to attach a tab. `<config>/daemon/roster.json` lists the workers the daemon is actually running, so a state file that still says `working` after its process died is shown as stale rather than spinning forever. `jobs/pins.json` sorts first.
+
+Parsed defensively out of `serde_json::Value` rather than a derived struct: this is Claude Code's private state and it changes shape. `updatedAt` is an ISO-8601 string where a number looks obvious, and with a derived struct that single mismatch made serde reject the whole record — the agent vanished from the list with no error anywhere.
+
 ## Usage meters
 
 Claude Code caches its own usage payload per account in `.claude.json → cachedUsageUtilization`, including the `limits[]` array with the 5-hour window, the weekly window, and model-scoped buckets. Giverny renders `limits[]` only — the legacy scalar keys beside it are placeholder-ridden. A window whose `resets_at` has passed renders 0%: the server keeps the lapsed window's percentage rather than zeroing it.

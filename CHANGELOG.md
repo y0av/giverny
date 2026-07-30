@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Background agents appear in the rail. Claude Code runs work with no tab —
+  `/fork` into a background session, `run_in_background` commands, agents that
+  outlive the session that started them — and until now the one Claude you are
+  most likely to forget was the only one Giverny could not see. A BACKGROUND
+  section lists them with the same grammar as tabs: spinner while working, ⚑
+  when blocked, ✓ when done. Clicking one opens a tab attached to it, in the
+  agent's own directory and account.
+  A job whose state file says "working" but whose worker process is gone reads
+  as *stale* rather than spinning forever.
+
 - OSC 8 hyperlinks are clickable. Ctrl+click already handled bare URLs and
   file paths in the visible text, but a link emitted as OSC 8 keeps its URL in
   the escape sequence and shows only a label, so there was nothing in the text

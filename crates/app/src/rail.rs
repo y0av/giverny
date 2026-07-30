@@ -114,6 +114,10 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             usage_panel(app, ui, dim, fg, &mut actions);
         });
 
+    // Background agents sit above the categories: they have no tab, which is
+    // exactly why they are easy to forget.
+    jobs_section(app, ui, dim, fg, &mut actions);
+
     // Drag-and-drop bookkeeping: where would a drop land right now?
     let pointer = ui.input(|i| i.pointer.interact_pos());
     let mut drop_target: Option<(CategoryId, usize, f32)> = None;
@@ -183,6 +187,124 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     }
 
     actions
+}
+
+/// Background agents, above the categories. Same grammar as tabs — spinner
+/// while working, flag when it wants you — because it is the same question.
+fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+    use giverny_claude::jobs::JobState;
+    if app.claude.jobs.is_empty() {
+        return;
+    }
+    let c = app.chrome;
+    let needs: usize = app
+        .claude
+        .jobs
+        .iter()
+        .filter(|j| j.state.needs_you())
+        .count();
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("BACKGROUND")
+                .font(FontId::monospace(9.5))
+                .color(dim),
+        );
+        ui.label(
+            egui::RichText::new(format!("{}", app.claude.jobs.len()))
+                .font(FontId::monospace(9.5))
+                .color(dim),
+        );
+        if needs > 0 {
+            ui.label(
+                egui::RichText::new(format!("{needs}⚑"))
+                    .font(FontId::monospace(9.5))
+                    .color(c.amber),
+            );
+        }
+    });
+
+    let now = ui.input(|i| i.time);
+    for job in &app.claude.jobs {
+        let (glyph, color) = match job.state {
+            // Only a *live* worker gets a spinner. A state file that still
+            // says "working" after its process died would otherwise spin
+            // forever, which is worse than saying nothing.
+            JobState::Working if job.live => (
+                SPINNER[(now * 10.0) as usize % SPINNER.len()].to_string(),
+                c.accent,
+            ),
+            JobState::Working => ("·".into(), dim),
+            JobState::Blocked => ("⚑".into(), c.amber),
+            JobState::Done => ("✓".into(), c.accent),
+            JobState::Unknown => ("·".into(), dim),
+        };
+        let resp = ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(glyph)
+                    .font(FontId::monospace(11.0))
+                    .color(color),
+            );
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(truncate_chars(&job.name, 22))
+                        .font(FontId::monospace(11.5))
+                        .color(if job.live { fg } else { dim }),
+                );
+                let mut sub = match job.state {
+                    JobState::Working if job.live && job.tasks > 0 => {
+                        format!(
+                            "{} task{}",
+                            job.tasks,
+                            if job.tasks == 1 { "" } else { "s" }
+                        )
+                    }
+                    JobState::Working if !job.live => "stale".into(),
+                    JobState::Blocked => "needs you".into(),
+                    JobState::Done => "done".into(),
+                    _ => String::new(),
+                };
+                if let Some(detail) = &job.detail {
+                    sub = if sub.is_empty() {
+                        detail.clone()
+                    } else {
+                        format!("{sub} · {detail}")
+                    };
+                }
+                if !sub.is_empty() {
+                    ui.label(
+                        egui::RichText::new(truncate_chars(&sub, 30))
+                            .font(FontId::monospace(9.5))
+                            .color(dim),
+                    );
+                }
+            });
+        });
+        let resp = resp.response.interact(Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let hover = match job.resume_target() {
+            Some(_) => "open a tab attached to this agent",
+            None => "no conversation recorded for this agent",
+        };
+        let resp = resp.on_hover_text(format!(
+            "{}\n{}",
+            job.cwd
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            hover
+        ));
+        if resp.clicked() && job.resume_target().is_some() {
+            actions.push(Action::AttachJob(Box::new(job.clone())));
+        }
+    }
+    ui.add_space(4.0);
+    ui.separator();
 }
 
 fn category_header(

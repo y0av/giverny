@@ -55,19 +55,24 @@ pub fn category_color(index: usize) -> Color32 {
 /// visible and editable in settings rather than hidden in a shell rc.
 /// Whether dropping a file into a tab can work here.
 ///
-/// winit delivers file drops on X11, Windows and macOS, and has no
-/// `wl_data_device` handling at all — so on a Wayland session nothing ever
-/// reaches the app. Worth stating outright: silence looks like a bug in
-/// Giverny, and the workaround (run under XWayland) is not guessable.
+/// The winit we build against (0.30.x, the version egui pins) delivers drops
+/// on X11, Windows and macOS and has no `wl_data_device` handling, so a
+/// Wayland session never sees them. This is a released-stack limit, not a
+/// Wayland one: winit master has `winit-wayland/src/dnd.rs` and emits
+/// `DragEntered { position }` — it arrives here once winit 0.31 ships that
+/// work and egui finishes its 0.31 migration, and it brings drag positions
+/// with it (which is what per-tab drop targeting needs).
+///
+/// Worth stating outright either way: silence looks like a bug in Giverny.
 fn drag_drop_status() {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     if wayland {
         println!("file drag-and-drop  unavailable on this Wayland session");
-        println!("      winit has no Wayland drop support. To get it, set");
+        println!("      the winit egui pins has no Wayland drop support yet. To get it now, set");
         println!("      behavior.prefer_x11 = true (settings → terminal) and restart:");
         println!("      Giverny then runs under XWayland, where text is softer at");
-        println!("      fractional scaling. A drop always lands in the active tab —");
-        println!("      winit reports no pointer position during a drag.");
+        println!("      fractional scaling. A drop lands in the active tab: this winit");
+        println!("      reports no drag position (winit master does; it is unreleased).");
     } else {
         println!("file drag-and-drop  available (X11/Windows/macOS)");
     }
@@ -1427,9 +1432,10 @@ impl eframe::App for App {
 
             // Files hovering over the window: say what a drop will do, so a
             // drag is not a guess. Wayland never reports this (below).
-            // Name the destination: a drop cannot be aimed at a particular
-            // tab (winit reports no pointer position during a drag), so the
-            // one thing to be clear about is which tab it lands in.
+            // Name the destination: with this winit a drop cannot be aimed at
+            // a particular tab — no drag position is reported — so the one
+            // thing to be clear about is which tab it lands in. winit master
+            // does report positions, which is what hovering a tab would need.
             let hovering = ctx.input(|i| i.raw.hovered_files.len());
             if hovering > 0 {
                 let into = self

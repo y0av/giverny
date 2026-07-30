@@ -284,8 +284,10 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Terminal,
         doc: "Run under X11/XWayland, which is the only way file drag-and-drop works today.",
         note: &[
-            "winit delivers dropped files on X11, Windows and macOS, and has no",
-            "Wayland drop support, so on a Wayland session a drag does nothing.",
+            "The winit egui pins delivers dropped files on X11, Windows and",
+            "macOS only, so on Wayland a drag does nothing. Wayland support",
+            "exists in winit master and arrives when egui moves to winit 0.31;",
+            "until then this is how to have drag-and-drop.",
             "The cost: under XWayland, text is softer at fractional scaling.",
             "Ignored where there is no X server.",
         ],

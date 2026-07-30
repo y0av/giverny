@@ -351,6 +351,9 @@ impl TabView {
                         ..
                     } => {
                         // Terminal-standard chords first (never reach the shell).
+                        // Reached on macOS, where `command` is Cmd so Ctrl+C
+                        // and Ctrl+Shift+C arrive as keys. Elsewhere egui turns
+                        // both into `Copy`, handled below.
                         if modifiers.ctrl && modifiers.shift && *key == Key::C {
                             copied = true;
                             continue;
@@ -369,6 +372,23 @@ impl TabView {
                         }
                         if let Some(seq) = input::encode_key(*key, *modifiers, mode) {
                             bytes.extend(seq);
+                        }
+                    }
+                    // egui-winit swallows the platform clipboard chords: it
+                    // pushes Copy/Cut and returns *without* emitting the key.
+                    // On Linux and Windows `command` is Ctrl, so Ctrl+C never
+                    // reached the shell — no interrupt, and no copy either,
+                    // since the branch above could not fire. Shift is what
+                    // separates the two: Ctrl+Shift+C copies, Ctrl+C signals.
+                    EguiEvent::Copy | EguiEvent::Cut => {
+                        let cut = matches!(ev, EguiEvent::Cut);
+                        match input::clipboard_chord(
+                            cut,
+                            i.modifiers.shift,
+                            cfg!(target_os = "macos"),
+                        ) {
+                            input::ClipboardChord::CopySelection => copied = true,
+                            input::ClipboardChord::Signal(b) => bytes.push(b),
                         }
                     }
                     EguiEvent::Paste(s) => bytes.extend(input::encode_paste(s, mode)),

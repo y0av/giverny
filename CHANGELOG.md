@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `Ctrl+C` interrupts again. egui-winit converts the platform clipboard chords
+  into `Copy`/`Cut` events and returns without emitting the key, so on Linux and
+  Windows — where that chord is `Ctrl+C` — nothing reached the child: no
+  interrupt, and no copy either, since `Ctrl+Shift+C` was equally swallowed
+  (auto-copy-on-selection hid that). Shift now separates them: `Ctrl+Shift+C`
+  copies, `Ctrl+C` sends ETX, `Ctrl+X` sends CAN, and on macOS `Cmd+C` still
+  copies.
+
 - Dropping files into a tab types their paths, quoted for the shell and routed
   through the same sanitized, bracketed paste as Ctrl+V — a filename is
   untrusted input.

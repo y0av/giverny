@@ -276,6 +276,30 @@ pub fn sanitize_text(text: &str) -> Vec<u8> {
     out
 }
 
+/// What a clipboard chord means when the terminal has focus.
+///
+/// egui-winit turns the platform copy/cut chords into `Copy`/`Cut` events and
+/// never emits the key, so the terminal has to decide what they mean. On Linux
+/// and Windows the platform chord *is* `Ctrl+C`, which in a terminal is an
+/// interrupt, not a copy — `Ctrl+Shift+C` copies. On macOS the platform chord
+/// is `Cmd+C`, which does not collide with `Ctrl+C` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardChord {
+    CopySelection,
+    /// A control byte for the child: ETX for interrupt, CAN for cut.
+    Signal(u8),
+}
+
+pub fn clipboard_chord(cut: bool, shift: bool, macos: bool) -> ClipboardChord {
+    if macos || shift {
+        ClipboardChord::CopySelection
+    } else if cut {
+        ClipboardChord::Signal(0x18) // CAN
+    } else {
+        ClipboardChord::Signal(0x03) // ETX — SIGINT
+    }
+}
+
 /// One dropped path as a shell word: quoted only when it has to be.
 ///
 /// Dropping a file types its path, the way every other terminal behaves, so
@@ -389,6 +413,22 @@ mod tests {
         );
         assert_eq!(encode_key(Key::Enter, none(), kitty).unwrap(), b"\r");
         assert_eq!(encode_key(Key::Escape, none(), kitty).unwrap(), b"\x1b[27u");
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_and_ctrl_shift_c_copies() {
+        use ClipboardChord::*;
+        // Linux/Windows: the platform chord is Ctrl+C, which must interrupt.
+        assert_eq!(clipboard_chord(false, false, false), Signal(0x03));
+        assert_eq!(clipboard_chord(false, true, false), CopySelection);
+        assert_eq!(clipboard_chord(true, false, false), Signal(0x18));
+        // macOS: the chord is Cmd+C, so it really is a copy; Ctrl+C arrives as
+        // an ordinary key and the encoder turns it into ETX.
+        assert_eq!(clipboard_chord(false, false, true), CopySelection);
+        assert_eq!(
+            encode_key(Key::C, Modifiers::CTRL, TermMode::empty()).unwrap(),
+            vec![0x03]
+        );
     }
 
     #[test]

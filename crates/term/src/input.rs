@@ -276,6 +276,45 @@ pub fn sanitize_text(text: &str) -> Vec<u8> {
     out
 }
 
+/// One dropped path as a shell word: quoted only when it has to be.
+///
+/// Dropping a file types its path, the way every other terminal behaves, so
+/// the text has to survive the shell — and Claude's prompt, which reads a
+/// path for images and attachments. Single quotes are POSIX-proof against
+/// spaces, `$`, and everything else except a single quote, which is spliced.
+pub fn quote_path(path: &str) -> String {
+    let safe =
+        |c: char| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | ':');
+    if !path.is_empty() && path.chars().all(safe) {
+        return path.to_string();
+    }
+    // Windows shells do not understand single quotes; double-quote there and
+    // accept that a literal `"` in a filename is not worth chasing.
+    #[cfg(windows)]
+    {
+        return format!("\"{}\"", path.replace('"', ""));
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
+/// The text a drop inserts: every path as a shell word, space separated, with
+/// a trailing space so the next thing typed does not run into it.
+pub fn dropped_paths_text(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut out = paths
+        .iter()
+        .map(|p| quote_path(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push(' ');
+    out
+}
+
 /// Wrap pasted text for the terminal: bracketed when the mode is on
 /// (sanitized so the payload cannot fake the closing bracket), plain
 /// sanitized bytes otherwise.
@@ -350,6 +389,24 @@ mod tests {
         );
         assert_eq!(encode_key(Key::Enter, none(), kitty).unwrap(), b"\r");
         assert_eq!(encode_key(Key::Escape, none(), kitty).unwrap(), b"\x1b[27u");
+    }
+
+    #[test]
+    fn dropped_paths_become_shell_words() {
+        // The common case stays readable.
+        assert_eq!(quote_path("/home/u/img.png"), "/home/u/img.png");
+        // Spaces and shell metacharacters are the whole point of quoting.
+        assert_eq!(quote_path("/tmp/my file.png"), "'/tmp/my file.png'");
+        assert_eq!(quote_path("/tmp/$(rm -rf x).png"), "'/tmp/$(rm -rf x).png'");
+        assert_eq!(quote_path("/tmp/a;b.png"), "'/tmp/a;b.png'");
+        // A quote in the name cannot be allowed to end the quoting.
+        let tricky = quote_path("/tmp/it's.png");
+        assert_eq!(tricky, r"'/tmp/it'\''s.png'");
+
+        // Several files land as several words, ready for the next word.
+        let text = dropped_paths_text(&["/a/b.png".into(), "/c/d e.png".into()]);
+        assert_eq!(text, "/a/b.png '/c/d e.png' ");
+        assert_eq!(dropped_paths_text(&[]), "");
     }
 
     #[test]

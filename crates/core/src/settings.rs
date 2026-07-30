@@ -279,6 +279,20 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: true },
     },
     SettingDef {
+        key: "behavior.prefer_x11",
+        label: "prefer X11 (Linux)",
+        section: Section::Terminal,
+        doc: "Run under X11/XWayland, which is the only way file drag-and-drop works today.",
+        note: &[
+            "winit delivers dropped files on X11, Windows and macOS, and has no",
+            "Wayland drop support, so on a Wayland session a drag does nothing.",
+            "The cost: under XWayland, text is softer at fractional scaling.",
+            "Ignored where there is no X server.",
+        ],
+        needs_restart: true,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "behavior.restore_claude",
         label: "resume conversations",
         section: Section::Restore,

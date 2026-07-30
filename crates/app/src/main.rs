@@ -53,6 +53,27 @@ pub fn category_color(index: usize) -> Color32 {
 /// Writing them into the config the first time we see them makes the list
 /// ours: from then on it is the same however Giverny was started, and it is
 /// visible and editable in settings rather than hidden in a shell rc.
+/// Whether dropping a file into a tab can work here.
+///
+/// winit delivers file drops on X11, Windows and macOS, and has no
+/// `wl_data_device` handling at all — so on a Wayland session nothing ever
+/// reaches the app. Worth stating outright: silence looks like a bug in
+/// Giverny, and the workaround (run under XWayland) is not guessable.
+fn drag_drop_status() {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if wayland {
+        println!("file drag-and-drop  unavailable on this Wayland session");
+        println!("      winit has no Wayland drop support. To get it, set");
+        println!("      behavior.prefer_x11 = true (settings → terminal) and restart:");
+        println!("      Giverny then runs under XWayland, where text is softer at");
+        println!("      fractional scaling. A drop always lands in the active tab —");
+        println!("      winit reports no pointer position during a drag.");
+    } else {
+        println!("file drag-and-drop  available (X11/Windows/macOS)");
+    }
+    println!();
+}
+
 fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
     let mut from_env: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -202,9 +223,27 @@ fn main() -> eframe::Result {
         )
         .init();
 
+    // Backend choice has to happen before the event loop exists. winit picks
+    // Wayland whenever WAYLAND_DISPLAY is set, and has no drop support there,
+    // so this is the switch that buys file drag-and-drop.
+    let paths = Paths::default_dirs();
+    // `GIVERNY_NO_X11` is set by the fallback below, so a second attempt
+    // cannot loop.
+    let try_x11 = config::load(paths.base()).behavior.prefer_x11
+        && std::env::var_os("GIVERNY_NO_X11").is_none()
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut wayland_stashed = None;
+    if try_x11 {
+        wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
+        // SAFETY: no threads yet — this runs before the event loop.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+        tracing::info!("prefer_x11: using X11/XWayland so file drops arrive");
+    }
+
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
-    let layout = state::load_layout(&Paths::default_dirs());
+    let layout = state::load_layout(&paths);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("giverny")
@@ -215,11 +254,40 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Giverny",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    );
+
+    // No X server after all — no XWayland, or no XAUTHORITY. Preferring
+    // drag-and-drop must not be able to leave the app unlaunchable, with the
+    // only remedy being to edit a config file you cannot see.
+    //
+    // Re-exec rather than retry: winit refuses to build a second event loop in
+    // one process (`RecreationAttempt`), so the only way back is a fresh one.
+    if let Err(err) = &result
+        && try_x11
+    {
+        tracing::warn!("prefer_x11 failed ({err}); restarting on Wayland");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let exe = std::env::current_exe().unwrap_or_else(|_| "giverny".into());
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(std::env::args_os().skip(1))
+                .env("GIVERNY_NO_X11", "1");
+            // The child inherits *this* environment, where WAYLAND_DISPLAY was
+            // removed — so it has to be put back explicitly or the child picks
+            // X11 again and fails the same way.
+            if let Some(wl) = wayland_stashed {
+                cmd.env("WAYLAND_DISPLAY", wl);
+            }
+            let error = cmd.exec();
+            tracing::error!("could not restart: {error}");
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -924,6 +992,33 @@ impl App {
         tracing::info!("config reloaded");
     }
 
+    /// Dropping files types their paths into the active tab, the way every
+    /// other terminal behaves — and the way you hand Claude an image.
+    ///
+    /// Routed through the paste encoder, so the text is bracketed-paste
+    /// wrapped and escape-sanitized: a filename is untrusted input, and a
+    /// path arriving as if typed must not be able to run anything.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let paths: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.as_ref())
+                .map(|p| p.display().to_string())
+                .collect()
+        });
+        if paths.is_empty() {
+            return;
+        }
+        let text = giverny_term::input::dropped_paths_text(&paths);
+        let Some(id) = self.ws.active else { return };
+        if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) {
+            session.write(giverny_term::input::encode_paste(&text, session.mode()));
+            session.note_user_input();
+            self.focus_terminal = true;
+        }
+    }
+
     /// Notice window and rail resizes so they persist with everything else.
     ///
     /// Read back from the window rather than tracked at the drag, because the
@@ -1226,6 +1321,7 @@ impl eframe::App for App {
 
         let ctx = ui.ctx().clone();
         self.periodic_refresh(&ctx);
+        self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
 
         // Claude awareness: hooks + registry + usage.
@@ -1328,6 +1424,31 @@ impl eframe::App for App {
                 egui::Sense::hover(),
             );
             ui.painter().rect_filled(strip, 0.0, accent);
+
+            // Files hovering over the window: say what a drop will do, so a
+            // drag is not a guess. Wayland never reports this (below).
+            // Name the destination: a drop cannot be aimed at a particular
+            // tab (winit reports no pointer position during a drag), so the
+            // one thing to be clear about is which tab it lands in.
+            let hovering = ctx.input(|i| i.raw.hovered_files.len());
+            if hovering > 0 {
+                let into = self
+                    .ws
+                    .tab(active)
+                    .map(|t| t.display_title(&self.cfg.titles))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "drop {} path{} into  {into}",
+                            hovering,
+                            if hovering == 1 { "" } else { "s" }
+                        ))
+                        .font(egui::FontId::monospace(11.0))
+                        .color(self.chrome.accent),
+                    );
+                });
+            }
 
             let exited = self.ws.tab(active).is_some_and(|t| t.exited);
             if exited {
@@ -1472,6 +1593,7 @@ fn doctor() {
         profs.len(),
         sources.join(" + ")
     );
+    drag_drop_status();
     println!("      an account kept elsewhere? add its directory in settings → claude,");
     println!("      or as behavior.extra_profile_dirs in config.toml");
     let now = jiff::Timestamp::now();

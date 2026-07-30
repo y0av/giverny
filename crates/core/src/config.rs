@@ -160,6 +160,9 @@ pub struct BehaviorConfig {
     pub scrollback_lines: usize,
     /// Extra `CLAUDE_CONFIG_DIR`s to treat as accounts.
     pub extra_profile_dirs: Vec<PathBuf>,
+    /// Ask winit for the X11 backend on Linux (drag-and-drop works there;
+    /// Wayland has no drop support in winit). Softer text under XWayland.
+    pub prefer_x11: bool,
     /// Programs a restored tab may start again by itself. Anything not
     /// listed is remembered but never re-run — replaying an arbitrary last
     /// command could deploy, delete or push something.
@@ -194,6 +197,7 @@ impl Default for ThemeConfig {
 impl Default for BehaviorConfig {
     fn default() -> Self {
         BehaviorConfig {
+            prefer_x11: false,
             restore_claude: RestoreClaude::Auto,
             notifications: true,
             scrollback_lines: 10_000,

@@ -4,8 +4,6 @@
 
 **A native GPU terminal built around Claude Code.** Categorized, persistent tabs on a left rail; live Claude activity on every tab; usage meters for all your Claude accounts. *Where your Claudes live.*
 
-Named for [Giverny](https://en.wikipedia.org/wiki/Giverny), Claude Monet's garden village — a home for the other famous Claude.
-
 ![Giverny: categorised tabs with live Claude state and multi-account usage meters](assets/demo.gif)
 
 *One tab is working (spinner), one finished while you were away (✓), one is waiting on you (⚑) — and every account's limits are in the corner.*

@@ -19,6 +19,14 @@ crates/
 - **Rendering**: `Snapshot::capture` copies the viewport (colors fully resolved) under the terminal lock; mesh building — including first-use swash rasterization into shelf-packed atlas pages — happens outside it. Cell metrics are integer physical pixels, which removes subpixel bins and seam shimmer. Never per-cell egui galleys.
 - **Input**: legacy xterm + kitty CSI-u encoders (`Shift+Enter` ⇒ `ESC[13;2u` when Claude enables the kitty protocol), SGR/legacy mouse reporting, sanitized bracketed paste.
 
+### Images
+
+The kitty graphics protocol arrives as APC (`ESC _ G … ESC \\`), which `vte` has no callback for and `alacritty_terminal` does not implement — so `tee.rs` scans the raw bytes for it alongside the parser, and reports the byte offset where each sequence ended.
+
+That offset is the whole point. An image is placed at the cursor, so `io_loop` advances the terminal up to the escape, applies the command with the cursor exactly where the program left it, then advances the rest. Handling it a read later — even one frame later on the UI thread — puts the image wherever the following output happened to end up, which is what the first implementation did.
+
+Placements are anchored to `history_size + cursor_line` so they scroll with their text, and are pruned when it leaves the scrollback. Beyond the scrollback cap that anchor drifts; it is exact for everything still in history.
+
 ### Bidirectional text
 
 The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` reorders each row that contains RTL script, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.

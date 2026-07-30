@@ -84,7 +84,7 @@ Search works inside one tab. With thirty tabs the more common question is
 "which tab was that in". Same index, wider scope, one extra column in the
 results.
 
-## 6. Images (kitty graphics protocol)
+## 6. Images (kitty graphics protocol)  ✅ built
 
 The one real capability gap against kitty, Ghostty and WezTerm. Programs that
 draw images print nothing here.

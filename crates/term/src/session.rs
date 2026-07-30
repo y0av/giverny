@@ -57,6 +57,7 @@ impl TermSession {
         let dirty = Arc::new(AtomicBool::new(true));
         let write_back = Arc::new(WriteBack::default());
         let shared = Arc::new(SharedTermState {
+            graphics: parking_lot::Mutex::new(crate::graphics::Graphics::default()),
             theme: RwLock::new(theme),
             size: RwLock::new(cfg.size),
         });

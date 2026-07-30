@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Images. The kitty graphics protocol is implemented: transmit (inline base64
+  or from a file), display, delete, and the support query programs use to
+  decide whether to bother — PNG and raw RGB/RGBA, reassembled from the 4 KiB
+  chunks real senders use. Not implemented: animation, shared memory, z-index,
+  Unicode placeholders.
+  Images are applied *mid-stream*, with the terminal advanced exactly as far as
+  the escape and no further, so an image lands on the cursor the program left
+  it on rather than wherever the following output ended up. They scroll with
+  their text and are dropped once it leaves the scrollback.
+
 - `Ctrl+Shift+E` labels every path and URL on screen. A letter opens it;
   Shift+letter types it at the cursor. It reads the rendered screen, so it
   works inside a full-screen program like Claude — where the shell's own

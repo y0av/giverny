@@ -136,6 +136,8 @@ pub struct TabView {
     hover_target: Option<(ClickTarget, u16, u16, u16)>,
     /// Keyboard hints (`Ctrl+Shift+E`): every URL and path on screen, labelled.
     hints: Option<Hints>,
+    /// Uploaded image textures, keyed by graphics id.
+    textures: std::collections::HashMap<u32, egui::TextureHandle>,
 }
 
 /// Labelled targets on the visible screen.
@@ -164,6 +166,7 @@ impl Default for TabView {
             search: None,
             hover_target: None,
             hints: None,
+            textures: std::collections::HashMap::new(),
         }
     }
 }
@@ -304,6 +307,10 @@ impl TabView {
                 painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(217, 181, 95, 40));
             }
         }
+        // Images from the kitty graphics protocol, drawn over the grid at the
+        // cells they were placed on, scrolling with the text.
+        self.paint_images(ui, session, &painter, rect, ppp, metrics);
+
         // Painted here, after the grid mesh: anything drawn before it is
         // covered by the terminal's own background.
         if let Some(hints) = &self.hints {
@@ -772,6 +779,91 @@ impl TabView {
         if !close {
             self.hints = Some(hints);
         }
+    }
+
+    /// Draw placed images.
+    ///
+    /// Textures are uploaded once per image and kept until the placement goes;
+    /// a screenful of images must not re-upload every frame.
+    fn paint_images(
+        &mut self,
+        ui: &Ui,
+        session: &TermSession,
+        painter: &egui::Painter,
+        rect: Rect,
+        ppp: f32,
+        m: CellMetrics,
+    ) {
+        use alacritty_terminal::grid::Dimensions;
+        let (history, display_offset, screen_rows) = {
+            let term = session.term.lock();
+            let grid = term.grid();
+            (
+                grid.history_size() as i64,
+                grid.display_offset() as i64,
+                grid.screen_lines() as i64,
+            )
+        };
+        let mut gfx = session.shared.graphics.lock();
+        if gfx.placements.is_empty() {
+            self.textures.clear();
+            return;
+        }
+        // Anything older than the retained scrollback can never be shown again.
+        gfx.prune(-1);
+
+        let placements: Vec<crate::graphics::Placement> = gfx.placements.clone();
+        for p in placements {
+            // Absolute row -> row on screen right now.
+            let row = p.abs_row - (history - display_offset);
+            if row < 0 || row >= screen_rows {
+                continue;
+            }
+            let Some(image) = gfx.images.get(&p.image_id) else {
+                continue;
+            };
+            let key = p.image_id;
+            let texture = match self.textures.get(&key) {
+                Some(t) => t.clone(),
+                None => {
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width as usize, image.height as usize],
+                        &image.rgba,
+                    );
+                    let t = ui.ctx().load_texture(
+                        format!("giverny-img-{key}"),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.textures.insert(key, t.clone());
+                    t
+                }
+            };
+            // Cell counts when the program gave them, natural size otherwise.
+            let w = if p.cols > 0 {
+                p.cols as f32 * m.cell_w as f32
+            } else {
+                image.width as f32
+            };
+            let h = if p.rows > 0 {
+                p.rows as f32 * m.cell_h as f32
+            } else {
+                image.height as f32
+            };
+            let origin = Pos2::new(
+                rect.min.x + (p.col as f32 * m.cell_w as f32) / ppp,
+                rect.min.y + (row as f32 * m.cell_h as f32) / ppp,
+            );
+            let area = Rect::from_min_size(origin, Vec2::new(w / ppp, h / ppp));
+            painter.image(
+                texture.id(),
+                area.intersect(rect),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        // Drop textures for images that have gone.
+        self.textures.retain(|id, _| gfx.images.contains_key(id));
     }
 
     /// Scan the visible rows for things worth reaching.

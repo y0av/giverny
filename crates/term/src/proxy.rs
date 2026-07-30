@@ -33,6 +33,8 @@ pub enum TabEvent {
 pub struct SharedTermState {
     pub theme: RwLock<Theme>,
     pub size: RwLock<GridSize>,
+    /// Images transmitted by the kitty graphics protocol.
+    pub graphics: parking_lot::Mutex<crate::graphics::Graphics>,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,11 @@ impl EventListener for EventProxy {
 }
 
 impl LoopHooks for EventProxy {
+    /// Shared state, so the io loop can apply graphics commands mid-stream.
+    fn shared_state(&self) -> Option<&Arc<SharedTermState>> {
+        Some(&self.shared)
+    }
+
     fn on_tee_events(&self, events: Vec<TeeEvent>) {
         self.send(TabEvent::Tee(events));
     }

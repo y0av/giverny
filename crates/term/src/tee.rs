@@ -52,11 +52,30 @@ pub enum TeeEvent {
     AltScreen(bool),
 }
 
+/// Where the APC scanner is in `ESC _ … ESC \` (or `… BEL`).
+#[derive(Debug, Default, PartialEq)]
+enum ApcScan {
+    #[default]
+    Outside,
+    /// Saw `ESC`, waiting to see whether `_` follows.
+    SawEsc,
+    Inside,
+    /// Inside, and just saw `ESC` — `\` ends it, anything else is content.
+    InsideSawEsc,
+}
+
 /// The tee. Feed every PTY read through [`Tee::observe`] *before* advancing
 /// the real terminal, then drain [`Tee::take_events`].
+/// One APC payload is one image chunk; 8 MiB is far past any real one.
+const APC_CAP: usize = 8 * 1024 * 1024;
+
 pub struct Tee {
     parser: vte::Parser,
     perform: TeePerform,
+    /// APC is scanned here rather than by `vte`, which has no callback for it.
+    apc: ApcScan,
+    apc_buf: Vec<u8>,
+    apc_done: Vec<(usize, Vec<u8>)>,
 }
 
 impl Tee {
@@ -66,6 +85,9 @@ impl Tee {
     pub fn new(nonce: String, local_hostname: Option<String>) -> Self {
         Self {
             parser: vte::Parser::new(),
+            apc: ApcScan::default(),
+            apc_buf: Vec::new(),
+            apc_done: Vec::new(),
             perform: TeePerform {
                 events: Vec::new(),
                 nonce,
@@ -74,8 +96,81 @@ impl Tee {
         }
     }
 
-    pub fn observe(&mut self, bytes: &[u8]) {
+    /// `base` is the offset of `bytes` inside the caller's buffer, so the
+    /// spans reported by [`Tee::take_apc`] are usable against that buffer.
+    pub fn observe_at(&mut self, bytes: &[u8], base: usize) {
+        self.scan_apc(bytes, base);
         self.parser.advance(&mut self.perform, bytes);
+    }
+
+    pub fn observe(&mut self, bytes: &[u8]) {
+        self.observe_at(bytes, 0);
+    }
+
+    /// Complete APC payloads seen since the last call, each with the offset
+    /// just past its terminator.
+    ///
+    /// The offset is the point of it: an image is placed at the cursor, so the
+    /// terminal has to be advanced exactly this far — no further — before the
+    /// command is applied. Handling it a whole read later puts the image
+    /// wherever the cursor happened to end up.
+    pub fn take_apc(&mut self) -> Vec<(usize, Vec<u8>)> {
+        std::mem::take(&mut self.apc_done)
+    }
+
+    /// Pull complete APC payloads out of the stream.
+    ///
+    /// Runs alongside `vte` rather than through it: `vte` consumes APC and
+    /// offers no hook, and `alacritty_terminal` ignores it, so the bytes pass
+    /// through both harmlessly while this collects them. Payloads span reads —
+    /// an image is megabytes of base64 in 4 KiB chunks — so the state and the
+    /// buffer live across calls.
+    fn scan_apc(&mut self, bytes: &[u8], base: usize) {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.apc = match (&self.apc, b) {
+                (ApcScan::Outside, 0x1b) => ApcScan::SawEsc,
+                (ApcScan::Outside, _) => ApcScan::Outside,
+                (ApcScan::SawEsc, b'_') => {
+                    self.apc_buf.clear();
+                    ApcScan::Inside
+                }
+                // Any other escape: not ours, and the next byte may itself be
+                // an ESC starting one that is.
+                (ApcScan::SawEsc, 0x1b) => ApcScan::SawEsc,
+                (ApcScan::SawEsc, _) => ApcScan::Outside,
+                (ApcScan::Inside, 0x1b) => ApcScan::InsideSawEsc,
+                // BEL terminates too; some senders use it.
+                (ApcScan::Inside, 0x07) => {
+                    self.finish_apc(base + i + 1);
+                    ApcScan::Outside
+                }
+                (ApcScan::Inside, _) => {
+                    // A runaway APC must not eat memory forever.
+                    if self.apc_buf.len() < APC_CAP {
+                        self.apc_buf.push(b);
+                    }
+                    ApcScan::Inside
+                }
+                (ApcScan::InsideSawEsc, b'\\') => {
+                    self.finish_apc(base + i + 1);
+                    ApcScan::Outside
+                }
+                (ApcScan::InsideSawEsc, _) => {
+                    if self.apc_buf.len() + 1 < APC_CAP {
+                        self.apc_buf.push(0x1b);
+                        self.apc_buf.push(b);
+                    }
+                    ApcScan::Inside
+                }
+            };
+        }
+    }
+
+    fn finish_apc(&mut self, end: usize) {
+        if !self.apc_buf.is_empty() {
+            let payload = std::mem::take(&mut self.apc_buf);
+            self.apc_done.push((end, payload));
+        }
     }
 
     /// Drain events extracted since the last call.
@@ -251,6 +346,43 @@ impl vte::Perform for TeePerform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apc_spans_end_where_the_terminator_does() {
+        // The offset is what lets the io loop advance the terminal exactly up
+        // to the image and no further, so it lands at the cursor.
+        let mut tee = Tee::new("n".into(), None);
+        let stream = b"hi\x1b_Gi=1,a=T;AAAA\x1b\\bye";
+        tee.observe(stream);
+        let spans = tee.take_apc();
+        assert_eq!(spans.len(), 1);
+        let (end, payload) = &spans[0];
+        assert_eq!(payload, b"Gi=1,a=T;AAAA");
+        assert_eq!(&stream[..*end], b"hi\x1b_Gi=1,a=T;AAAA\x1b\\");
+        assert_eq!(&stream[*end..], b"bye", "the rest advances afterwards");
+    }
+
+    #[test]
+    fn an_apc_split_across_reads_is_still_one_payload() {
+        // Images arrive as 4 KiB chunks; the sequence itself can land across a
+        // read boundary too.
+        let mut tee = Tee::new("n".into(), None);
+        tee.observe_at(b"\x1b_Gi=2,a=T;AA", 0);
+        assert!(tee.take_apc().is_empty(), "not finished yet");
+        tee.observe_at(b"BB\x1b\\rest", 14);
+        let spans = tee.take_apc();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, b"Gi=2,a=T;AABB");
+        assert_eq!(spans[0].0, 18, "offset counts from the caller's buffer");
+    }
+
+    #[test]
+    fn a_bare_escape_inside_an_apc_is_content_not_a_terminator() {
+        let mut tee = Tee::new("n".into(), None);
+        tee.observe(b"\x1b_Gi=3;A\x1bXB\x1b\\");
+        let spans = tee.take_apc();
+        assert_eq!(spans[0].1, b"Gi=3;A\x1bXB");
+    }
 
     fn collect(tee: &mut Tee, chunks: &[&[u8]]) -> Vec<TeeEvent> {
         for c in chunks {

@@ -70,6 +70,11 @@ pub enum Msg {
 pub trait LoopHooks: EventListener {
     /// Events the tee extracted from the output stream, in order.
     fn on_tee_events(&self, events: Vec<TeeEvent>);
+
+    /// State the loop may touch directly; `None` for listeners that have none.
+    fn shared_state(&self) -> Option<&std::sync::Arc<crate::proxy::SharedTermState>> {
+        None
+    }
     /// The loop is finished: child exited (with status when known) or a
     /// `Msg::Shutdown` was processed (`None`).
     fn on_loop_done(&self, exit: Option<ExitStatus>);
@@ -180,7 +185,8 @@ where
                 Ok(got) => {
                     // Giverny delta: tee sees every byte exactly once, before
                     // terminal state advances and independent of locking.
-                    self.tee.observe(&buf[unprocessed..unprocessed + got]);
+                    self.tee
+                        .observe_at(&buf[unprocessed..unprocessed + got], unprocessed);
                     unprocessed += got;
                 }
                 Err(err) => match err.kind() {
@@ -206,8 +212,34 @@ where
                 }),
             };
 
-            // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            // Parse the incoming bytes, stopping at each graphics command so
+            // it is applied with the cursor where the program left it. An
+            // image lands at the cursor; advancing the whole read first would
+            // place it wherever the following output ended up.
+            let mut at = 0usize;
+            for (end, payload) in self.tee.take_apc() {
+                let end = end.min(unprocessed);
+                if end > at {
+                    state.parser.advance(&mut **terminal, &buf[at..end]);
+                    at = end;
+                }
+                if let Some(shared) = self.event_proxy.shared_state() {
+                    use alacritty_terminal::grid::Dimensions;
+                    let (abs_row, col) = {
+                        let grid = terminal.grid();
+                        let cursor = grid.cursor.point;
+                        (
+                            grid.history_size() as i64 + cursor.line.0 as i64,
+                            cursor.column.0 as u16,
+                        )
+                    };
+                    let response = shared.graphics.lock().apc(&payload, (abs_row, col));
+                    if let Some(reply) = response.reply {
+                        self.write_back.push(std::borrow::Cow::Owned(reply));
+                    }
+                }
+            }
+            state.parser.advance(&mut **terminal, &buf[at..unprocessed]);
 
             processed += unprocessed;
             unprocessed = 0;

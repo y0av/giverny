@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `Ctrl+Shift+E` labels every path and URL on screen. A letter opens it;
+  Shift+letter types it at the cursor. It reads the rendered screen, so it
+  works inside a full-screen program like Claude — where the shell's own
+  completion does not exist, because the shell is not running. Same detector as
+  Ctrl+click. If there are more targets than labels it says how many were left
+  out rather than quietly dropping them.
+
 - Background agents appear in the rail. Claude Code runs work with no tab —
   `/fork` into a background session, `run_in_background` commands, agents that
   outlive the session that started them — and until now the one Claude you are

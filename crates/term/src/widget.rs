@@ -134,7 +134,24 @@ pub struct TabView {
     pub search: Option<Search>,
     /// Click target under the pointer while Ctrl is held.
     hover_target: Option<(ClickTarget, u16, u16, u16)>,
+    /// Keyboard hints (`Ctrl+Shift+E`): every URL and path on screen, labelled.
+    hints: Option<Hints>,
 }
+
+/// Labelled targets on the visible screen.
+///
+/// The point is reaching what is *printed* without the mouse — including
+/// inside a full-screen program like Claude, where the shell's own completion
+/// does not exist because the shell is not running.
+struct Hints {
+    /// `(label, row, target)`, in reading order.
+    items: Vec<(char, u16, crate::search::RowTarget)>,
+    /// More targets than labels — say so rather than silently dropping them.
+    dropped: usize,
+}
+
+/// Home row first: the labels should be reachable without looking.
+const HINT_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
 
 impl Default for TabView {
     fn default() -> Self {
@@ -146,6 +163,7 @@ impl Default for TabView {
             last_blink: true,
             search: None,
             hover_target: None,
+            hints: None,
         }
     }
 }
@@ -190,6 +208,7 @@ impl TabView {
         let mouse_reporting = mode.intersects(TermMode::MOUSE_MODE) && !shift_held;
 
         self.handle_search(ui, session, rect, ppp, metrics);
+        self.handle_hints(ui, session, rect, ppp, metrics);
         self.handle_click_targets(ui, session, &response, rect, ppp, metrics);
         self.handle_keyboard(ui, shared, session, &response, mode);
         if mouse_reporting {
@@ -283,6 +302,31 @@ impl TabView {
                     Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
                 );
                 painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(217, 181, 95, 40));
+            }
+        }
+        // Painted here, after the grid mesh: anything drawn before it is
+        // covered by the terminal's own background.
+        if let Some(hints) = &self.hints {
+            for (label, row, item) in &hints.items {
+                let x = rect.min.x + (item.col as f32 * metrics.cell_w as f32) / ppp;
+                let y = rect.min.y + (*row as f32 * metrics.cell_h as f32) / ppp;
+                let w = (item.len as f32 * metrics.cell_w as f32) / ppp;
+                let h = metrics.cell_h as f32 / ppp;
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)),
+                    2.0,
+                    Color32::from_rgba_unmultiplied(0x5f, 0xa3, 0xa3, 70),
+                );
+                let chip =
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(metrics.cell_w as f32 / ppp, h));
+                painter.rect_filled(chip, 2.0, Color32::from_rgb(0xd9, 0xb5, 0x5f));
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label.to_string(),
+                    egui::FontId::monospace(h * 0.72),
+                    Color32::BLACK,
+                );
             }
         }
         if let Some((_, line, col, len)) = &self.hover_target {
@@ -643,6 +687,111 @@ impl TabView {
 
 impl TabView {
     /// Search overlay: query box, next/prev, Esc to close.
+    /// `Ctrl+Shift+E`: label every URL and path on screen; a letter opens it,
+    /// Shift+letter types it at the prompt.
+    fn handle_hints(
+        &mut self,
+        ui: &mut Ui,
+        session: &TermSession,
+        rect: Rect,
+        ppp: f32,
+        m: CellMetrics,
+    ) {
+        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::E));
+        if toggle {
+            self.hints = match self.hints.take() {
+                Some(_) => None,
+                None => Some(Self::collect_hints(session, rect, ppp, m)),
+            };
+        }
+        let Some(hints) = self.hints.take() else {
+            return;
+        };
+        if hints.items.is_empty() {
+            return;
+        }
+
+        // Read the choice before painting, so a hit closes in the same frame.
+        let mut chosen: Option<(char, bool)> = None;
+        let mut close = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        ui.input_mut(|i| {
+            i.events.retain(|ev| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                else {
+                    return true;
+                };
+                let Some(name) = key.name().chars().next().map(|c| c.to_ascii_lowercase()) else {
+                    return true;
+                };
+                if key.name().len() == 1 && HINT_LABELS.contains(&(name as u8)) {
+                    chosen = Some((name, modifiers.shift));
+                    // Swallow it: the letter chose a hint, it is not input.
+                    return false;
+                }
+                true
+            });
+        });
+
+        if let Some((label, insert)) = chosen {
+            if let Some((_, _, item)) = hints.items.iter().find(|(l, ..)| *l == label) {
+                if insert {
+                    // Type it where the cursor is — the whole point inside a
+                    // program that is not a shell.
+                    session.write(input::sanitize_text(&item.text));
+                    session.note_user_input();
+                } else {
+                    item.target.open();
+                }
+            }
+            close = true;
+        }
+
+        // The key bar: memory is not a prerequisite.
+        let mut hint = format!(
+            "{} targets · letter opens · shift+letter types · esc",
+            hints.items.len()
+        );
+        if hints.dropped > 0 {
+            hint.push_str(&format!(" · {} more not labelled", hints.dropped));
+        }
+        let bar = Rect::from_min_size(
+            Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0),
+            Vec2::new(rect.width() - 16.0, 24.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new(hint).font(egui::FontId::monospace(11.0)));
+            });
+        });
+
+        if !close {
+            self.hints = Some(hints);
+        }
+    }
+
+    /// Scan the visible rows for things worth reaching.
+    fn collect_hints(session: &TermSession, rect: Rect, ppp: f32, m: CellMetrics) -> Hints {
+        let cwd = session.proc_cwd().unwrap_or_else(|| PathBuf::from("/"));
+        let rows = rows_now(rect, ppp, m).max(0) as u16;
+        let mut items = Vec::new();
+        let mut dropped = 0usize;
+        for row in 0..rows {
+            let text = session.row_text(row);
+            for target in crate::search::targets_in_row(&text, &cwd) {
+                match HINT_LABELS.get(items.len()) {
+                    Some(&label) => items.push((label as char, row, target)),
+                    None => dropped += 1,
+                }
+            }
+        }
+        Hints { items, dropped }
+    }
+
     fn handle_search(
         &mut self,
         ui: &mut Ui,

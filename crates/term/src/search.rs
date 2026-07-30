@@ -183,9 +183,88 @@ pub fn target_at(text: &str, col: usize, cwd: &std::path::Path) -> Option<ClickT
     }
 }
 
+/// One actionable thing on a row: where it starts, how wide, and what it is.
+#[derive(Debug, Clone)]
+pub struct RowTarget {
+    pub col: u16,
+    pub len: u16,
+    pub target: ClickTarget,
+    /// The literal text, for inserting at a prompt.
+    pub text: String,
+}
+
+/// Every URL and existing path on one row, left to right.
+///
+/// The same detector as Ctrl+click, applied to a whole line: hints are a
+/// keyboard front-end over it, not a second idea of what counts as a target.
+pub fn targets_in_row(text: &str, cwd: &std::path::Path) -> Vec<RowTarget> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<RowTarget> = Vec::new();
+    let mut col = 0usize;
+    while col < chars.len() {
+        if chars[col].is_whitespace() {
+            col += 1;
+            continue;
+        }
+        // Token bounds, the same way `target_at` finds them.
+        let is_stop = |c: char| TOKEN_STOPS.contains(&c) || c.is_control();
+        let end = (col..chars.len())
+            .take_while(|&i| !is_stop(chars[i]))
+            .last()
+            .unwrap_or(col);
+        if let Some(target) = target_at(text, col, cwd) {
+            let raw: String = chars[col..=end].iter().collect();
+            // `target_at` drops trailing prose punctuation; the label and the
+            // underline have to cover the same span it actually uses.
+            let text = raw
+                .trim_end_matches([',', '.', ';', ':', '!', '?'])
+                .to_string();
+            out.push(RowTarget {
+                col: col as u16,
+                len: text.chars().count().max(1) as u16,
+                text,
+                target,
+            });
+        }
+        col = end + 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_yields_every_target_left_to_right() {
+        let dir = std::env::temp_dir();
+        let file = dir.join("giverny-hint-probe.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let row = format!("see https://example.com and {name}, then https://b.example");
+
+        let found = targets_in_row(&row, &dir);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[0].text, "https://example.com");
+        assert_eq!(
+            found[1].text, name,
+            "trailing comma is not part of the path"
+        );
+        assert_eq!(found[2].text, "https://b.example");
+        // Columns must land on the first character, or labels sit in the wrong place.
+        let chars: Vec<char> = row.chars().collect();
+        for t in &found {
+            let at: String = chars[t.col as usize..][..t.len as usize].iter().collect();
+            assert_eq!(at, t.text);
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_row_with_nothing_actionable_yields_nothing() {
+        let found = targets_in_row("cargo build --release  # no targets", &std::env::temp_dir());
+        assert!(found.is_empty(), "{found:?}");
+    }
 
     #[test]
     fn finds_urls() {

@@ -82,6 +82,11 @@ pub const BINDINGS: &[Binding] = &[
         scope: Scope::Terminal,
     },
     Binding {
+        chord: "Ctrl+Shift+E",
+        action: "label every path and URL on screen; letter opens, shift+letter types it",
+        scope: Scope::Terminal,
+    },
+    Binding {
         chord: "Ctrl+Shift+C",
         action: "copy the selection",
         scope: Scope::Terminal,

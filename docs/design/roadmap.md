@@ -3,10 +3,14 @@
 Written 2026-07-30, after a fortnight of daily use. Ordered by what the app is
 *for*, not by what terminals usually have.
 
-Giverny's premise is: **you are running more Claudes than you can hold in your
-head, and the terminal should keep track.** Everything below is judged against
-that. A feature that any terminal could have is worth less here than one only
-this terminal can have.
+Giverny is meant to be **a real terminal** that happens to be built around
+Claude Code — not a Claude dashboard that can run a shell. Both halves count:
+an item that makes daily terminal work better earns its place even when it has
+nothing to do with Claude.
+
+An earlier version of this document ranked general-terminal features below
+Claude-aware ones on principle. That was the wrong test, and the images entry
+below was marked down because of it.
 
 ## 1. Background agents are invisible — the biggest gap  ✅ built
 
@@ -53,7 +57,7 @@ data is already flowing through the parser.
 
 Cheap, self-contained, immediately useful.
 
-## 3. Hints: act on what is on screen without the mouse
+## 3. Hints: act on what is on screen without the mouse  ✅ built
 
 kitty's `hints` kitten labels every URL/path on screen and you pick one with a
 keystroke — open it, insert it at the prompt, or copy it.
@@ -85,10 +89,9 @@ results.
 The one real capability gap against kitty, Ghostty and WezTerm. Programs that
 draw images print nothing here.
 
-Honest assessment: it is the largest item on this list and the least aligned
-with the premise — it does not make Claude sessions easier to keep track of. It
-matters if Giverny is meant to be a general-purpose terminal that happens to be
-Claude-aware, and can wait if it is not.
+It is the largest item here and the clearest gap for a terminal that means to
+stand on its own: image previews in file managers, plots from a REPL, `timg`,
+charts from a build. Worth doing on its own merits.
 
 ## 7. Broadcast to a category
 
@@ -122,8 +125,12 @@ would corrupt state. Visibility only.
 ## Ordering
 
 1. ~~Background agents~~ — built.
-2. **Prompt marks** + **hints** — small, daily, built on parsers that already run.
+2. ~~Hints~~ — built. **Prompt marks** need shell integration installed first
+   (nothing emits OSC 133 here), and do not exist inside a full-screen program
+   like Claude, so they rank lower than they first appeared.
 3. **Tokens per tab** — makes the meters actionable.
+
+See `terminal.md` for the general-terminal side.
 
 Then, depending on what Giverny is for: **images** if it should stand as a
 general terminal, **broadcast** if it should lean further into orchestration.

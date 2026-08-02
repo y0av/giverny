@@ -1101,7 +1101,8 @@ impl App {
         if events.is_empty() {
             return;
         }
-        let (native, ppp) = ctx.input(|i| (i.viewport().native_pixels_per_point, i.pixels_per_point()));
+        let (native, ppp) =
+            ctx.input(|i| (i.viewport().native_pixels_per_point, i.pixels_per_point()));
         let to_points = |(x, y): (f32, f32)| {
             let scale = native.unwrap_or(ppp) / ppp;
             egui::Pos2::new(x * scale, y * scale)

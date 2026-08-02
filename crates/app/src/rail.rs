@@ -501,7 +501,11 @@ fn tab_row(
     // A file drag aimed at this row: say so before the drop, since the drop
     // types into whichever tab is under the pointer.
     if app.drag_hover.is_some_and(|p| rect.contains(p)) {
-        p.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, c.accent.gamma_multiply(0.22));
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            c.accent.gamma_multiply(0.22),
+        );
         p.rect_stroke(
             rect.shrink2(Vec2::new(4.0, 1.0)),
             4.0,

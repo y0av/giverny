@@ -1,25 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-08-02
 
-- Dropping files works on Wayland. It never did: winit 0.30 — the version egui
-  pins — creates no `wl_data_device` at all, so a drag over the window was
-  never offered to us and `prefer_x11` was the only way to get drops.
-  Binding a second data device is the obvious fix and is a trap: Mutter keeps
-  one per client and evicts the old one, so ours would have taken the
-  clipboard's selection events with it and paste would have stopped working —
-  visible in `meta-wayland-data-device.c`, and on the wire under
-  `WAYLAND_DEBUG=1`. The one device this process has belongs to the clipboard,
-  so drags now come from there: `vendor/smithay-clipboard` is upstream 0.7.3
-  with the four drag handlers it leaves empty filled in.
-  Because we track the drag ourselves, we know where the pointer is: the tab
-  under it highlights, and that is the tab the paths are typed into. X11 still
-  drops into the active tab, since winit reports no position there.
-
-- The rail's `+` and close buttons no longer sit under the scrollbar once
-  there are enough tabs to scroll. egui's floating scrollbars are drawn over
-  the last 10px of content; that width is now reserved when a bar is shown.
-
+### Terminal
 - Images. The kitty graphics protocol is implemented: transmit (inline base64
   or from a file), display, delete, and the support query programs use to
   decide whether to bother — PNG and raw RGB/RGBA, reassembled from the 4 KiB
@@ -30,6 +13,31 @@
   it on rather than wherever the following output ended up. They scroll with
   their text and are dropped once it leaves the scrollback.
 
+- Hebrew and Arabic render the right way round. The grid keeps text in logical
+  order — that is what programs read back — and rows containing RTL script are
+  reordered for display with the Unicode Bidi Algorithm, the way VTE does it.
+  Mixed lines only reorder the RTL run, and digits inside it stay readable. A
+  row with no RTL character never reaches the algorithm, so Latin output costs
+  one character test per cell. The cursor follows the reordering.
+  Not yet: clicking or drag-selecting inside an RTL run maps to the wrong cell,
+  because selection still works in logical columns.
+
+- Dropping files into a tab types their paths, quoted for the shell and routed
+  through the same sanitized, bracketed paste as Ctrl+V — a filename is
+  untrusted input. It is how you hand Claude an image.
+  It works on Wayland now, where it never did: winit 0.30 — the version egui
+  pins — creates no `wl_data_device` at all, so a drag over the window was
+  never offered to us. Binding a second data device is the obvious fix and is
+  a trap: Mutter keeps one per client and evicts the old one, so ours would
+  have taken the clipboard's selection events with it and paste would have
+  stopped working — visible in `meta-wayland-data-device.c`, and on the wire
+  under `WAYLAND_DEBUG=1`. The one device this process has belongs to the
+  clipboard, so drags come from there: `vendor/smithay-clipboard` is upstream
+  0.7.3 with the four drag handlers it leaves empty filled in.
+  Because the drag is tracked here, we know where the pointer is: the tab
+  under it highlights, and that is the tab the paths are typed into. X11 drops
+  into the active tab, since winit reports no position there.
+
 - `Ctrl+Shift+E` labels every path and URL on screen. A letter opens it;
   Shift+letter types it at the cursor. It reads the rendered screen, so it
   works inside a full-screen program like Claude — where the shell's own
@@ -37,6 +45,14 @@
   Ctrl+click. If there are more targets than labels it says how many were left
   out rather than quietly dropping them.
 
+- OSC 8 hyperlinks are clickable. Ctrl+click already handled bare URLs and
+  file paths in the visible text, but a link emitted as OSC 8 keeps its URL in
+  the escape sequence and shows only a label, so there was nothing in the text
+  to match — which is how Claude, `gh` and `ls --hyperlink` print links. The
+  cell's link metadata is now consulted first, and hovering underlines the
+  whole label rather than one word.
+
+### Claude Code
 - Background agents appear in the rail. Claude Code runs work with no tab —
   `/fork` into a background session, `run_in_background` commands, agents that
   outlive the session that started them — and until now the one Claude you are
@@ -47,22 +63,7 @@
   A job whose state file says "working" but whose worker process is gone reads
   as *stale* rather than spinning forever.
 
-- OSC 8 hyperlinks are clickable. Ctrl+click already handled bare URLs and
-  file paths in the visible text, but a link emitted as OSC 8 keeps its URL in
-  the escape sequence and shows only a label, so there was nothing in the text
-  to match — which is how Claude, `gh` and `ls --hyperlink` print links. The
-  cell's link metadata is now consulted first, and hovering underlines the
-  whole label rather than one word.
-
-- Hebrew and Arabic render the right way round. The grid keeps text in logical
-  order — that is what programs read back — and rows containing RTL script are
-  reordered for display with the Unicode Bidi Algorithm, the way VTE does it.
-  Mixed lines only reorder the RTL run, and digits inside it stay readable. A
-  row with no RTL character never reaches the algorithm, so Latin output costs
-  one character test per cell. The cursor follows the reordering.
-  Not yet: clicking or drag-selecting inside an RTL run maps to the wrong cell,
-  because selection still works in logical columns.
-
+### Fixes
 - `Ctrl+C` interrupts again. egui-winit converts the platform clipboard chords
   into `Copy`/`Cut` events and returns without emitting the key, so on Linux and
   Windows — where that chord is `Ctrl+C` — nothing reached the child: no
@@ -70,10 +71,9 @@
   (auto-copy-on-selection hid that). Shift now separates them: `Ctrl+Shift+C`
   copies, `Ctrl+C` sends ETX, `Ctrl+X` sends CAN, and on macOS `Cmd+C` still
   copies.
-
-- Dropping files into a tab types their paths, quoted for the shell and routed
-  through the same sanitized, bracketed paste as Ctrl+V — a filename is
-  untrusted input.
+- The rail's `+` and close buttons no longer sit under the scrollbar once
+  there are enough tabs to scroll. egui's floating scrollbars are drawn over
+  the last 10px of content; that width is now reserved when a bar is shown.
 - `behavior.prefer_x11` runs Giverny under X11/XWayland on Linux. It was how
   drops used to arrive and is now rarely needed; if X11 turns out to be
   unavailable, Giverny restarts itself on Wayland rather than refusing to

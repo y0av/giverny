@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Dropping files works on Wayland. It never did: winit 0.30 — the version egui
+  pins — creates no `wl_data_device` at all, so a drag over the window was
+  never offered to us and `prefer_x11` was the only way to get drops.
+  Binding a second data device is the obvious fix and is a trap: Mutter keeps
+  one per client and evicts the old one, so ours would have taken the
+  clipboard's selection events with it and paste would have stopped working —
+  visible in `meta-wayland-data-device.c`, and on the wire under
+  `WAYLAND_DEBUG=1`. The one device this process has belongs to the clipboard,
+  so drags now come from there: `vendor/smithay-clipboard` is upstream 0.7.3
+  with the four drag handlers it leaves empty filled in.
+  Because we track the drag ourselves, we know where the pointer is: the tab
+  under it highlights, and that is the tab the paths are typed into. X11 still
+  drops into the active tab, since winit reports no position there.
+
+- The rail's `+` and close buttons no longer sit under the scrollbar once
+  there are enough tabs to scroll. egui's floating scrollbars are drawn over
+  the last 10px of content; that width is now reserved when a bar is shown.
+
 - Images. The kitty graphics protocol is implemented: transmit (inline base64
   or from a file), display, delete, and the support query programs use to
   decide whether to bother — PNG and raw RGB/RGBA, reassembled from the 4 KiB
@@ -56,15 +74,10 @@
 - Dropping files into a tab types their paths, quoted for the shell and routed
   through the same sanitized, bracketed paste as Ctrl+V — a filename is
   untrusted input.
-- `behavior.prefer_x11` runs Giverny under X11/XWayland on Linux, which is how
-  drops arrive today: the winit egui pins (0.30) has no Wayland drop support.
-  Wayland DnD is implemented in winit master and reaches us with egui's winit
-  0.31 migration. If X11 turns out to be unavailable, Giverny restarts itself
-  on Wayland rather than refusing to start.
-- A drop lands in the active tab, and the hint says which one. Aiming a drop at
-  a specific tab needs a drag position, which this winit does not report (X11
-  reads the XdndPosition coordinates and discards them). winit master reports
-  positions, so per-tab targeting becomes possible with the same upgrade.
+- `behavior.prefer_x11` runs Giverny under X11/XWayland on Linux. It was how
+  drops used to arrive and is now rarely needed; if X11 turns out to be
+  unavailable, Giverny restarts itself on Wayland rather than refusing to
+  start.
 
 ## v0.3.0 — 2026-07-29
 

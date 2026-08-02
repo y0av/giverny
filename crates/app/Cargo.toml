@@ -26,3 +26,10 @@ crossbeam-channel.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
+
+# Wayland drag-and-drop, which winit 0.30 does not implement. It arrives
+# through the clipboard crate eframe already uses — patched in the workspace
+# root; see src/wayland_dnd.rs.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+smithay-clipboard = "0.7.3"
+raw-window-handle = "0.6"

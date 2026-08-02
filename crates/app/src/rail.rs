@@ -37,6 +37,7 @@ struct CatData {
 
 pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let mut actions = Vec::new();
+    app.row_rects.clear();
 
     // Precollect display data so rendering never borrows the workspace.
     let cats: Vec<CatData> = app
@@ -493,6 +494,21 @@ fn tab_row(
     // Geometry-based hover: `resp.hovered()` flickers when the close button
     // overlays the row in the hit-test stack.
     let hovered = ui.rect_contains_pointer(rect);
+    // Remembered for file drags, which are tracked outside egui and so have
+    // to hit-test themselves.
+    app.row_rects.push((rect, row.id));
+
+    // A file drag aimed at this row: say so before the drop, since the drop
+    // types into whichever tab is under the pointer.
+    if app.drag_hover.is_some_and(|p| rect.contains(p)) {
+        p.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, c.accent.gamma_multiply(0.22));
+        p.rect_stroke(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Stroke::new(1.0, c.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     if row.active {
         p.rect_filled(

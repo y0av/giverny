@@ -14,7 +14,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
 | `behavior.notifications` | `true` | Notify when Claude needs you in a background tab. |
-| `behavior.prefer_x11` | `false` | Run under X11/XWayland, which is the only way file drag-and-drop works today. Takes effect on restart. |
+| `behavior.prefer_x11` | `false` | Run under X11/XWayland instead of Wayland. Takes effect on restart. |
 | `behavior.restore_claude` | `"auto"` | Re-run `claude --resume` in restored tabs. One of: auto, prompt, off. |
 | `behavior.restore_apps` | 26 programs | Full-screen programs a restored tab may start again by itself. |
 | `behavior.extra_profile_dirs` | `[]` | Account directories kept somewhere Giverny would not find on its own. Takes effect on restart. |

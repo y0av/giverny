@@ -91,6 +91,14 @@ impl Chrome {
         v.widgets.active.bg_fill = mix(self.panel, self.accent, 0.35);
         v.widgets.active.weak_bg_fill = mix(self.panel, self.accent, 0.28);
         ctx.set_visuals(v);
+        // egui's floating scrollbars are drawn *over* the last ~10px of the
+        // content, so as soon as the rail has enough tabs to scroll, the "+"
+        // and close buttons at the right edge end up underneath the bar.
+        // Reserve the width instead — only when a bar is actually shown, so
+        // short rails keep the full width.
+        ctx.all_styles_mut(|s| {
+            s.spacing.scroll.floating_allocated_width = s.spacing.scroll.bar_width;
+        });
     }
 }
 

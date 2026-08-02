@@ -10,6 +10,8 @@ mod overlays;
 mod rail;
 mod settings_ui;
 mod update;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wayland_dnd;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -55,26 +57,18 @@ pub fn category_color(index: usize) -> Color32 {
 /// visible and editable in settings rather than hidden in a shell rc.
 /// Whether dropping a file into a tab can work here.
 ///
-/// The winit we build against (0.30.x, the version egui pins) delivers drops
-/// on X11, Windows and macOS and has no `wl_data_device` handling, so a
-/// Wayland session never sees them. This is a released-stack limit, not a
-/// Wayland one: winit master has `winit-wayland/src/dnd.rs` and emits
-/// `DragEntered { position }` — it arrives here once winit 0.31 ships that
-/// work and egui finishes its 0.31 migration, and it brings drag positions
-/// with it (which is what per-tab drop targeting needs).
-///
-/// Worth stating outright either way: silence looks like a bug in Giverny.
+/// Two different paths, and it is worth saying which one is in play: winit
+/// delivers drops on X11, Windows and macOS, while on Wayland it has no
+/// `wl_data_device` at all and Giverny reads the drags itself (see
+/// `wayland_dnd`). Only the Wayland path knows where the pointer is, so only
+/// it can aim a drop at a particular tab.
 fn drag_drop_status() {
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    if wayland {
-        println!("file drag-and-drop  unavailable on this Wayland session");
-        println!("      the winit egui pins has no Wayland drop support yet. To get it now, set");
-        println!("      behavior.prefer_x11 = true (settings → terminal) and restart:");
-        println!("      Giverny then runs under XWayland, where text is softer at");
-        println!("      fractional scaling. A drop lands in the active tab: this winit");
-        println!("      reports no drag position (winit master does; it is unreleased).");
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        println!("file drag-and-drop  available (Wayland, via the clipboard data device)");
+        println!("      a drop lands in the tab under the pointer.");
     } else {
-        println!("file drag-and-drop  available (X11/Windows/macOS)");
+        println!("file drag-and-drop  available (X11/Windows/macOS, via winit)");
+        println!("      a drop lands in the active tab: winit reports no drag position.");
     }
     println!();
 }
@@ -377,6 +371,15 @@ pub struct App {
     input_seen: HashMap<TabId, u64>,
     /// Tab currently being dragged in the rail.
     pub dragging: Option<TabId>,
+    /// Wayland file drops, which winit 0.30 cannot deliver.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    dnd: Option<wayland_dnd::DragDrop>,
+    /// Where a file drag currently hovers, in egui points. Set only on
+    /// Wayland, where we track the drag ourselves and so know the position;
+    /// winit's X11 drops report no coordinates at all.
+    pub drag_hover: Option<egui::Pos2>,
+    /// Tab rows as painted this frame, so a drag can be aimed at one.
+    pub row_rects: Vec<(egui::Rect, TabId)>,
     /// Every live claude session started before hooks/statusline were
     /// installed, so none of them report anything (recomputed periodically).
     pub stale_sessions: bool,
@@ -405,6 +408,21 @@ enum Inject {
     /// `cd` on startup (e.g. `cd ~/Dev`) override our spawn cwd — type a
     /// visible `cd` back when that happened.
     CwdFix(PathBuf),
+}
+
+/// Start our own Wayland drag-and-drop listener, on the connection eframe
+/// already has. Returns `None` on X11, where winit delivers drops itself.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::DragDrop> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::Wayland(surface) = cc.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let wake = cc.egui_ctx.clone();
+    Some(wayland_dnd::DragDrop::start(
+        surface.surface.as_ptr(),
+        move || wake.request_repaint(),
+    ))
 }
 
 impl App {
@@ -513,6 +531,10 @@ impl App {
             session_picker: None,
             input_seen: HashMap::new(),
             dragging: None,
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            dnd: start_wayland_dnd(cc),
+            drag_hover: None,
+            row_rects: Vec::new(),
             stale_sessions: false,
             update: None,
             update_rx,
@@ -1027,25 +1049,79 @@ impl App {
     /// wrapped and escape-sanitized: a filename is untrusted input, and a
     /// path arriving as if typed must not be able to run anything.
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let paths: Vec<String> = ctx.input(|i| {
+        let paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.as_ref())
-                .map(|p| p.display().to_string())
+                .filter_map(|f| f.path.clone())
                 .collect()
         });
+        self.deliver_drop(ctx, paths, None);
+        self.handle_wayland_drag(ctx);
+    }
+
+    /// Type dropped paths into a tab: the one under the pointer when we know
+    /// where the drag was (Wayland — we track it ourselves), otherwise the
+    /// active one.
+    fn deliver_drop(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>, at: Option<egui::Pos2>) {
         if paths.is_empty() {
             return;
         }
+        let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         let text = giverny_term::input::dropped_paths_text(&paths);
-        let Some(id) = self.ws.active else { return };
+        let Some(id) = at.and_then(|p| self.tab_at(p)).or(self.ws.active) else {
+            return;
+        };
+        // Dropping on an inactive tab means you want that tab: switch to it,
+        // spawning its shell if it was never focused.
+        if self.ws.active != Some(id) {
+            self.apply(ctx, Action::Select(id));
+        }
         if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) {
             session.write(giverny_term::input::encode_paste(&text, session.mode()));
             session.note_user_input();
             self.focus_terminal = true;
         }
     }
+
+    /// The tab whose rail row contains a point, if any.
+    pub fn tab_at(&self, pos: egui::Pos2) -> Option<TabId> {
+        self.row_rects
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|&(_, id)| id)
+    }
+
+    /// Wayland: drain the drag thread. Positions arrive in surface-local
+    /// logical pixels; egui works in points, which differ by the zoom factor.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    fn handle_wayland_drag(&mut self, ctx: &egui::Context) {
+        let Some(dnd) = &self.dnd else { return };
+        let events = dnd.poll();
+        if events.is_empty() {
+            return;
+        }
+        let (native, ppp) = ctx.input(|i| (i.viewport().native_pixels_per_point, i.pixels_per_point()));
+        let to_points = |(x, y): (f32, f32)| {
+            let scale = native.unwrap_or(ppp) / ppp;
+            egui::Pos2::new(x * scale, y * scale)
+        };
+        for event in events {
+            match event {
+                wayland_dnd::DragEvent::Enter(at) | wayland_dnd::DragEvent::Motion(at) => {
+                    self.drag_hover = at.map(to_points);
+                }
+                wayland_dnd::DragEvent::Leave => self.drag_hover = None,
+                wayland_dnd::DragEvent::Drop(paths) => {
+                    let at = self.drag_hover.take();
+                    self.deliver_drop(ctx, paths, at);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+    fn handle_wayland_drag(&mut self, _ctx: &egui::Context) {}
 
     /// Notice window and rail resizes so they persist with everything else.
     ///
@@ -1454,27 +1530,31 @@ impl eframe::App for App {
             ui.painter().rect_filled(strip, 0.0, accent);
 
             // Files hovering over the window: say what a drop will do, so a
-            // drag is not a guess. Wayland never reports this (below).
-            // Name the destination: with this winit a drop cannot be aimed at
-            // a particular tab — no drag position is reported — so the one
-            // thing to be clear about is which tab it lands in. winit master
-            // does report positions, which is what hovering a tab would need.
+            // drag is not a guess. On X11 winit counts the files but reports
+            // no position, so the destination is the active tab; on Wayland
+            // we track the drag ourselves and can name the tab under the
+            // pointer instead.
             let hovering = ctx.input(|i| i.raw.hovered_files.len());
-            if hovering > 0 {
+            if hovering > 0 || self.drag_hover.is_some() {
+                let target = self
+                    .drag_hover
+                    .and_then(|p| self.tab_at(p))
+                    .unwrap_or(active);
                 let into = self
                     .ws
-                    .tab(active)
+                    .tab(target)
                     .map(|t| t.display_title(&self.cfg.titles))
                     .unwrap_or_default();
+                let what = match hovering {
+                    0 => "drop into".to_string(),
+                    1 => "drop 1 path into".to_string(),
+                    n => format!("drop {n} paths into"),
+                };
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "drop {} path{} into  {into}",
-                            hovering,
-                            if hovering == 1 { "" } else { "s" }
-                        ))
-                        .font(egui::FontId::monospace(11.0))
-                        .color(self.chrome.accent),
+                        egui::RichText::new(format!("{what}  {into}"))
+                            .font(egui::FontId::monospace(11.0))
+                            .color(self.chrome.accent),
                     );
                 });
             }

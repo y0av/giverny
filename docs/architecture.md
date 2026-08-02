@@ -27,6 +27,21 @@ That offset is the whole point. An image is placed at the cursor, so `io_loop` a
 
 Placements are anchored to `history_size + cursor_line` so they scroll with their text, and are pruned when it leaves the scrollback. Beyond the scrollback cap that anchor drifts; it is exact for everything still in history.
 
+### Dropped files
+
+Wayland has one drag-and-drop channel, `wl_data_device`, and Mutter keeps
+**one per client** — `get_data_device` evicts the client's previous device
+from the list it resolves drags against. winit 0.30 creates none, so drops
+never arrived; creating our own would have taken the clipboard's selection
+events with it and broken paste. Both facts were read from
+`meta-wayland-data-device.c` and confirmed on the wire with `WAYLAND_DEBUG=1`.
+
+So the drags arrive on the device the clipboard already owns:
+`vendor/smithay-clipboard` is upstream with its empty drag handlers filled in,
+applied through `[patch.crates-io]` so eframe and Giverny share one copy. It
+goes away when egui moves to winit 0.31. Paths are typed through the same
+sanitized bracketed paste as `Ctrl+V` — a filename is untrusted input.
+
 ### Bidirectional text
 
 The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` reorders each row that contains RTL script, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.

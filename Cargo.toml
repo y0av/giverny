@@ -47,6 +47,12 @@ jiff = "0.2"
 sysinfo = "0.39"
 notify = "8"
 
+# Wayland drag-and-drop. A Wayland client gets one wl_data_device, and this
+# crate — which eframe uses for the clipboard — is the one that owns ours, so
+# drops have to be taught there. See vendor/smithay-clipboard/README.md.
+[patch.crates-io]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

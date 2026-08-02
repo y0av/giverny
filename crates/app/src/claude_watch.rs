@@ -116,11 +116,58 @@ fn needs_you(notification_type: &str) -> bool {
     )
 }
 
-fn done_kind(notification_type: &str) -> bool {
-    matches!(
-        notification_type,
-        "idle_prompt" | "agent_completed" | "task_completed"
-    )
+/// The session is back at its prompt. Only `idle_prompt` says that.
+fn idle_kind(notification_type: &str) -> bool {
+    notification_type == "idle_prompt"
+}
+
+/// A *piece* of work finished — a subagent, a task. Worth a done-marker in a
+/// background tab, but it is not evidence the session stopped: these fire
+/// mid-turn, while the main agent carries on with the result. Treating them
+/// as "finished" is what used to kill the spinner half way through the work.
+fn finished_kind(notification_type: &str) -> bool {
+    matches!(notification_type, "agent_completed" | "task_completed")
+}
+
+/// One tab's state, reconciled with what Claude Code says about that session
+/// right now.
+///
+/// Hooks and the registry answer different questions. Hooks bracket a *turn*:
+/// crisp, but silent in between. The registry says what the session is doing
+/// *right now* — including the two states no hook marks the start of, a
+/// command running (`shell`) and blocked on the user (`waiting`).
+fn merge_registry(
+    current: ClaudeState,
+    hooks_own: bool,
+    live: &giverny_claude::registry::SessionEntry,
+) -> ClaudeState {
+    // Working is unambiguous evidence Claude is running again, so it always
+    // clears a stale attention flag — even under hook authority (a declined
+    // prompt emits no hook to clear it).
+    if current == ClaudeState::NeedsYou && live.busy() {
+        return ClaudeState::Busy;
+    }
+    if hooks_own {
+        // Hooks decide when work *ends*, and a session can keep working past
+        // the end of a turn: running a long command, or carrying on after a
+        // subagent reported in. Between hook events the registry is the only
+        // thing that knows, so let it hold the spinner up — but never let it
+        // *end* anything, which is what a lagging "busy" would do.
+        if current == ClaudeState::Idle && live.busy() {
+            return ClaudeState::Busy;
+        }
+        return current;
+    }
+    match current {
+        // Nothing here has heard from a hook, so these are ours to keep until
+        // the user attends to them.
+        ClaudeState::NeedsYou | ClaudeState::DoneUnseen => current,
+        _ if live.busy() => ClaudeState::Busy,
+        // Blocked on the user with no hook to say so — the state a session
+        // started before hooks were installed would otherwise sit silent in.
+        _ if live.waiting() => ClaudeState::NeedsYou,
+        _ => ClaudeState::Idle,
+    }
 }
 
 impl ClaudeWatch {
@@ -284,12 +331,19 @@ impl ClaudeWatch {
                                 .unwrap_or("Claude is waiting for input")
                                 .to_string(),
                         ));
-                    } else if done_kind(kind) {
+                    } else if idle_kind(kind) {
                         entry.state = if is_active {
                             ClaudeState::Idle
                         } else {
                             ClaudeState::DoneUnseen
                         };
+                    } else if finished_kind(kind) {
+                        // A subagent or task finished. Only meaningful if the
+                        // session itself is not working — otherwise the main
+                        // agent is still going and the spinner stays.
+                        if entry.state != ClaudeState::Busy && !is_active {
+                            entry.state = ClaudeState::DoneUnseen;
+                        }
                     }
                 }
             }
@@ -357,23 +411,7 @@ impl ClaudeWatch {
                 // hooks-installed check would freeze such tabs; per-tab
                 // evidence keeps the registry driving exactly those.
                 let hooks_own = entry.last_hook.is_some();
-                // "busy" is unambiguous evidence Claude is running again, so
-                // it always clears a stale attention flag — even under hook
-                // authority (a declined prompt emits no hook to clear it).
-                if entry.state == ClaudeState::NeedsYou && live.entry.busy() {
-                    entry.state = ClaudeState::Busy;
-                } else if !hooks_own {
-                    match entry.state {
-                        ClaudeState::NeedsYou | ClaudeState::DoneUnseen => {}
-                        _ => {
-                            entry.state = if live.entry.busy() {
-                                ClaudeState::Busy
-                            } else {
-                                ClaudeState::Idle
-                            };
-                        }
-                    }
-                }
+                entry.state = merge_registry(entry.state, hooks_own, &live.entry);
             }
             // Sessions gone from the registry: clear unless hooks spoke recently.
             for tab in self.tabs.values_mut() {
@@ -769,6 +807,81 @@ mod tests {
         let m = hook("Notification", r#","notification_type":"agent_completed""#);
         let fx = feed(&mut w, &m, Some(TabId(1)));
         assert!(fx.notify.is_empty(), "completions must not notify");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+    }
+
+    fn session(status: &str) -> giverny_claude::registry::SessionEntry {
+        serde_json::from_str(&format!(
+            r#"{{"pid":1,"sessionId":"s-1","status":"{status}"}}"#
+        ))
+        .expect("session fixture")
+    }
+
+    #[test]
+    fn a_running_command_still_counts_as_working() {
+        // Claude Code's own vocabulary, and its own UI treats `shell` — a
+        // command running — as working. Reading only "busy" made a tab go
+        // quiet for exactly as long as the command took.
+        assert!(session("busy").busy());
+        assert!(session("shell").busy(), "a running command is working");
+        assert!(!session("idle").busy());
+        assert!(!session("waiting").busy());
+        assert!(session("waiting").waiting(), "blocked on the user");
+    }
+
+    #[test]
+    fn the_registry_holds_the_spinner_up_between_hook_events() {
+        use ClaudeState::*;
+        // Hooks bracket a turn and say nothing during it. A session that is
+        // still working when the turn's hook lands must not read as finished.
+        assert_eq!(merge_registry(Idle, true, &session("shell")), Busy);
+        assert_eq!(merge_registry(Idle, true, &session("busy")), Busy);
+        // ...but the registry may never *end* anything under hook authority:
+        // its file lags, and a stale "idle" would cut a spinner short.
+        assert_eq!(merge_registry(Busy, true, &session("idle")), Busy);
+        assert_eq!(
+            merge_registry(DoneUnseen, true, &session("idle")),
+            DoneUnseen
+        );
+        // A working session always clears a stale attention flag.
+        assert_eq!(merge_registry(NeedsYou, true, &session("busy")), Busy);
+        assert_eq!(merge_registry(NeedsYou, true, &session("idle")), NeedsYou);
+    }
+
+    #[test]
+    fn without_hooks_the_registry_drives_every_state() {
+        use ClaudeState::*;
+        assert_eq!(merge_registry(Idle, false, &session("shell")), Busy);
+        assert_eq!(merge_registry(Busy, false, &session("idle")), Idle);
+        // A session blocked on a permission prompt with no hook to report it
+        // used to read as idle: the flag now comes from the registry.
+        assert_eq!(merge_registry(Idle, false, &session("waiting")), NeedsYou);
+        // Attention states are the user's to clear, not the registry's.
+        assert_eq!(
+            merge_registry(DoneUnseen, false, &session("idle")),
+            DoneUnseen
+        );
+    }
+
+    #[test]
+    fn a_subagent_finishing_does_not_end_the_turn() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TabId(1)));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TabId(1)));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+
+        // These fire mid-turn, while the main agent carries on with the
+        // result. Treating them as "finished" is what stopped the spinner
+        // half way through the work.
+        for kind in ["agent_completed", "task_completed"] {
+            let m = hook("Notification", &format!(r#","notification_type":"{kind}""#));
+            feed(&mut w, &m, Some(TabId(1)));
+            assert_eq!(w.state_of(TAB), ClaudeState::Busy, "{kind} mid-turn");
+        }
+
+        // Once the session is genuinely at its prompt, it is done.
+        let m = hook("Notification", r#","notification_type":"idle_prompt""#);
+        feed(&mut w, &m, Some(TabId(1)));
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
     }
 

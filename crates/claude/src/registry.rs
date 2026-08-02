@@ -1,8 +1,8 @@
 //! Claude Code's live session registry: `$CONFIG_DIR/sessions/<pid>.json`.
 //!
 //! Written by Claude Code itself (verified against 2.1.220): gives per-session
-//! `status: busy|idle` with zero hook setup. Stale files are never cleaned up
-//! upstream, so PID liveness gating is mandatory.
+//! status with zero hook setup. Stale files are never cleaned up upstream, so
+//! PID liveness gating is mandatory.
 
 use std::path::{Path, PathBuf};
 
@@ -28,8 +28,19 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
+    /// Claude is working. Its own vocabulary is `["busy", "shell", "idle",
+    /// "waiting"]`, and its own UI counts *both* `busy` and `shell` as
+    /// working — `shell` is a command running, which is the longest a session
+    /// stays working and the easiest to mistake for a finished one.
     pub fn busy(&self) -> bool {
-        self.status == "busy"
+        matches!(self.status.as_str(), "busy" | "shell")
+    }
+
+    /// Claude is blocked on the user. Same bucket Claude Code puts it in, and
+    /// the reason a session waiting on a permission prompt used to read as
+    /// idle here when no hook reported it.
+    pub fn waiting(&self) -> bool {
+        self.status == "waiting"
     }
 }
 

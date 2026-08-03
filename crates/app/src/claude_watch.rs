@@ -38,6 +38,9 @@ pub struct ClaudeTab {
     pub session_name: Option<String>,
     /// Short account name (profile) this tab's Claude runs under.
     pub account: Option<String>,
+    /// A background shell is alive in this session while the agent itself is
+    /// at its prompt. Not a working state — marked, never animated.
+    pub background: bool,
     last_hook: Option<Instant>,
     seen_in_scan: bool,
 }
@@ -132,10 +135,9 @@ fn finished_kind(notification_type: &str) -> bool {
 /// One tab's state, reconciled with what Claude Code says about that session
 /// right now.
 ///
-/// Hooks and the registry answer different questions. Hooks bracket a *turn*:
-/// crisp, but silent in between. The registry says what the session is doing
-/// *right now* — including the two states no hook marks the start of, a
-/// command running (`shell`) and blocked on the user (`waiting`).
+/// Hooks and the registry answer different questions. Hooks bracket a *turn*;
+/// the registry says what the session is doing right now, including the one
+/// state no hook marks the start of: blocked on the user (`waiting`).
 fn merge_registry(
     current: ClaudeState,
     hooks_own: bool,
@@ -148,14 +150,9 @@ fn merge_registry(
         return ClaudeState::Busy;
     }
     if hooks_own {
-        // Hooks decide when work *ends*, and a session can keep working past
-        // the end of a turn: running a long command, or carrying on after a
-        // subagent reported in. Between hook events the registry is the only
-        // thing that knows, so let it hold the spinner up — but never let it
-        // *end* anything, which is what a lagging "busy" would do.
-        if current == ClaudeState::Idle && live.busy() {
-            return ClaudeState::Busy;
-        }
+        // Hooks are authoritative for a session that emits them: they mark
+        // the end of a turn exactly, and the registry must not re-open one it
+        // closed.
         return current;
     }
     match current {
@@ -398,6 +395,7 @@ impl ClaudeWatch {
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
                 entry.seen_in_scan = true;
+                entry.background = live.entry.background_shell();
                 entry.session_id = Some(live.entry.session_id.clone());
                 entry.session_name = live.entry.name.clone();
                 if account.is_some() {
@@ -420,6 +418,7 @@ impl ClaudeWatch {
                     .is_some_and(|t| t.elapsed() < Duration::from_secs(5));
                 if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
                     tab.state = ClaudeState::None;
+                    tab.background = false;
                     tab.session_name = None;
                     // The session is gone — its hook evidence goes with it, so
                     // a future claude (with or without hooks) starts fresh.
@@ -818,32 +817,36 @@ mod tests {
     }
 
     #[test]
-    fn a_running_command_still_counts_as_working() {
-        // Claude Code's own vocabulary, and its own UI treats `shell` — a
-        // command running — as working. Reading only "busy" made a tab go
-        // quiet for exactly as long as the command took.
+    fn a_background_shell_is_not_the_agent_working() {
+        // Measured against a live session: `busy` holds through minutes of
+        // back-to-back tool calls, so `shell` is not "running a command" — it
+        // is a shell left running while the agent waits at its prompt, often
+        // with a question for you. Claude Code's own session list calls that
+        // working; a spinner must not, or the tab that wants you looks like
+        // the tab that doesn't.
         assert!(session("busy").busy());
-        assert!(session("shell").busy(), "a running command is working");
+        assert!(!session("shell").busy(), "the agent is at its prompt");
+        assert!(session("shell").background_shell());
         assert!(!session("idle").busy());
         assert!(!session("waiting").busy());
         assert!(session("waiting").waiting(), "blocked on the user");
     }
 
     #[test]
-    fn the_registry_holds_the_spinner_up_between_hook_events() {
+    fn hooks_stay_authoritative_over_the_registry() {
         use ClaudeState::*;
-        // Hooks bracket a turn and say nothing during it. A session that is
-        // still working when the turn's hook lands must not read as finished.
-        assert_eq!(merge_registry(Idle, true, &session("shell")), Busy);
-        assert_eq!(merge_registry(Idle, true, &session("busy")), Busy);
-        // ...but the registry may never *end* anything under hook authority:
-        // its file lags, and a stale "idle" would cut a spinner short.
+        // Hooks mark the end of a turn exactly. The registry may not re-open
+        // one they closed — a session left with a background shell reads as
+        // "shell" for as long as that shell lives, which is hours.
+        assert_eq!(merge_registry(Idle, true, &session("shell")), Idle);
+        assert_eq!(merge_registry(Idle, true, &session("busy")), Idle);
         assert_eq!(merge_registry(Busy, true, &session("idle")), Busy);
         assert_eq!(
             merge_registry(DoneUnseen, true, &session("idle")),
             DoneUnseen
         );
-        // A working session always clears a stale attention flag.
+        // The one exception: a working session clears a stale attention flag,
+        // because declining a prompt emits no hook to clear it.
         assert_eq!(merge_registry(NeedsYou, true, &session("busy")), Busy);
         assert_eq!(merge_registry(NeedsYou, true, &session("idle")), NeedsYou);
     }
@@ -851,8 +854,11 @@ mod tests {
     #[test]
     fn without_hooks_the_registry_drives_every_state() {
         use ClaudeState::*;
-        assert_eq!(merge_registry(Idle, false, &session("shell")), Busy);
+        assert_eq!(merge_registry(Idle, false, &session("busy")), Busy);
         assert_eq!(merge_registry(Busy, false, &session("idle")), Idle);
+        // A background shell leaves the agent idle: marked in the rail, not
+        // spun.
+        assert_eq!(merge_registry(Busy, false, &session("shell")), Idle);
         // A session blocked on a permission prompt with no hook to report it
         // used to read as idle: the flag now comes from the registry.
         assert_eq!(merge_registry(Idle, false, &session("waiting")), NeedsYou);

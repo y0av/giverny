@@ -28,12 +28,23 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
-    /// Claude is working. Its own vocabulary is `["busy", "shell", "idle",
-    /// "waiting"]`, and its own UI counts *both* `busy` and `shell` as
-    /// working — `shell` is a command running, which is the longest a session
-    /// stays working and the easiest to mistake for a finished one.
+    /// The agent is working: thinking, or running a tool call. Measured, not
+    /// assumed — a session stays `busy` through minutes of back-to-back Bash
+    /// calls.
     pub fn busy(&self) -> bool {
-        matches!(self.status.as_str(), "busy" | "shell")
+        self.status == "busy"
+    }
+
+    /// A background shell is alive while the agent itself is at its prompt —
+    /// a `run_in_background` command, or one that outlived its timeout and
+    /// was moved to the background.
+    ///
+    /// Claude Code's own session list counts this as "working", which is a
+    /// fair answer to "is anything happening in there" and the wrong one for
+    /// a spinner: the agent is waiting on *you*, often with a question, while
+    /// something polls in the background. Marked, not animated.
+    pub fn background_shell(&self) -> bool {
+        self.status == "shell"
     }
 
     /// Claude is blocked on the user. Same bucket Claude Code puts it in, and

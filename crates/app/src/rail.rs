@@ -22,6 +22,8 @@ struct RowData {
     exited: bool,
     color: Color32,
     claude: ClaudeState,
+    /// A background shell is alive while Claude itself waits at its prompt.
+    background: bool,
 }
 
 struct CatData {
@@ -78,6 +80,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                         exited: t.exited,
                         color,
                         claude: ct.map(|c| c.state).unwrap_or_default(),
+                        background: ct.is_some_and(|c| c.background),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -567,11 +570,20 @@ fn tab_row(
             );
         }
         ClaudeState::Idle => {
+            // A background shell keeps running while Claude waits at its
+            // prompt. Worth showing — it is why a directory is still churning
+            // — but it is not the agent working, and animating it would say
+            // "come back later" about a tab that is waiting on you.
+            let (glyph, size) = if row.background {
+                ("⠿", 12.0)
+            } else {
+                ("✳", 11.0)
+            };
             p.text(
                 dot,
                 Align2::CENTER_CENTER,
-                "✳",
-                FontId::monospace(11.0),
+                glyph,
+                FontId::monospace(size),
                 dim,
             );
         }

@@ -2,21 +2,22 @@
 
 ## Unreleased
 
-- A tab stops going quiet while Claude is still working. Claude Code publishes
-  four session statuses — `busy`, `shell`, `idle`, `waiting` — and its own UI
-  counts `busy` *and* `shell` as working. Giverny read only `busy`, so a tab
-  running a command (`shell`) looked finished for exactly as long as the
-  command took, and a session blocked on a permission prompt (`waiting`) read
-  as idle instead of raising the flag.
+- A background shell no longer reads as Claude working. Claude Code publishes
+  four session statuses — `busy`, `shell`, `idle`, `waiting` — and its own
+  session list counts `shell` as working. Measured against a live session,
+  `busy` holds through minutes of back-to-back tool calls, so `shell` does not
+  mean "running a command": it means a shell is still alive while the agent
+  waits at its prompt, usually with a question for you. A tab in that state now
+  shows a static ⠿ beside an idle marker instead of a spinner — animating it
+  said "come back later" about the tab most likely to want you.
+- A session blocked on the user (`waiting`) raises the attention flag. With no
+  hook to report it — every session started before hooks were installed — it
+  used to read as idle.
 - A subagent finishing no longer ends the turn. `agent_completed` and
   `task_completed` fire mid-turn, while the main agent carries on with the
   result; they were treated as "the session finished" and stopped the spinner
   half way through the work. Only `idle_prompt` — or `Stop` — means the prompt
   is back.
-- Between hook events, Claude Code's own status now holds the spinner up.
-  Hooks bracket a turn and say nothing during it, so work that outlives the
-  turn had nothing reporting it. The registry may sustain a working state but
-  never end one: its file lags, and a stale `idle` would cut a spinner short.
 
 ## v0.4.0 — 2026-08-02
 

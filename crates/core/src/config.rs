@@ -13,7 +13,20 @@ pub struct Config {
     pub titles: TitlesConfig,
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
+    pub claude: ClaudeConfig,
     pub update: UpdateConfig,
+}
+
+/// How Claude Code itself is launched in a tab.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// Start every session in auto mode, by setting `permissions.defaultMode`
+    /// in each account's `settings.json`.
+    pub auto_mode: bool,
+    /// Suppress Claude Code's "resume from summary / resume full session
+    /// as-is" prompt, so a resumed conversation comes back whole.
+    pub skip_resume_summary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

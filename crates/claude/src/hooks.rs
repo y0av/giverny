@@ -321,6 +321,81 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Start every Claude session in auto mode, via Claude Code's own
+/// `permissions.defaultMode`.
+///
+/// Its own setting rather than a flag on the command line, because most
+/// sessions are started by typing `claude`, not by Giverny. Verified against
+/// 2.1.220's validator, which lists the accepted values as `acceptEdits`,
+/// `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`.
+///
+/// Turning it off only removes a mode *we* set: a `defaultMode` the user
+/// picked by hand is left alone, since silently reverting someone's
+/// permission posture is the last thing this should do.
+pub fn set_auto_mode(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
+    let mut root: serde_json::Value = match std::fs::read(settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(_) => serde_json::json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings root is not an object"))?;
+    let current = obj
+        .get("permissions")
+        .and_then(|p| p.get("defaultMode"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    match (enable, current.as_deref()) {
+        (true, Some("auto")) | (false, None) => return Ok(()),
+        (false, Some(mode)) if mode != "auto" => {
+            anyhow::bail!("permissions.defaultMode is set to {mode:?} — leaving it alone")
+        }
+        _ => {}
+    }
+    let permissions = obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("permissions is not an object"))?;
+    if enable {
+        permissions.insert("defaultMode".into(), serde_json::json!("auto"));
+    } else {
+        permissions.remove("defaultMode");
+    }
+    // An empty block we created is noise in someone's config file.
+    if permissions.is_empty() {
+        obj.remove("permissions");
+    }
+    write_settings(settings_path, &root)
+}
+
+/// The permission mode this settings file starts sessions in, if it says.
+pub fn default_mode_in(settings_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(settings_path).ok()?;
+    let root: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        root.get("permissions")?
+            .get("defaultMode")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
+/// Is auto mode the default in this settings file?
+pub fn auto_mode_in(settings_path: &Path) -> bool {
+    default_mode_in(settings_path).as_deref() == Some("auto")
+}
+
+fn write_settings(settings_path: &Path, root: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(root)?)?;
+    std::fs::rename(&tmp, settings_path)?;
+    Ok(())
+}
+
 fn is_our_entry(v: &serde_json::Value) -> bool {
     v.get("hooks")
         .and_then(|h| h.as_array())
@@ -474,6 +549,55 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_is_written_and_taken_back() {
+        let settings = scratch("automode");
+        std::fs::write(
+            &settings,
+            br#"{"model":"opus","permissions":{"allow":["Bash(ls:*)"]}}"#,
+        )
+        .unwrap();
+
+        set_auto_mode(&settings, true).unwrap();
+        assert!(auto_mode_in(&settings));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(root["model"], "opus", "the rest of the file survives");
+        assert_eq!(
+            root["permissions"]["allow"][0], "Bash(ls:*)",
+            "existing permission rules survive"
+        );
+
+        set_auto_mode(&settings, false).unwrap();
+        assert!(!auto_mode_in(&settings));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert!(root["permissions"]["defaultMode"].is_null());
+        assert_eq!(root["permissions"]["allow"][0], "Bash(ls:*)");
+    }
+
+    #[test]
+    fn a_mode_set_by_hand_is_left_alone() {
+        let settings = scratch("automode-manual");
+        std::fs::write(&settings, br#"{"permissions":{"defaultMode":"plan"}}"#).unwrap();
+        // Turning the toggle off must not revert someone else's choice.
+        assert!(set_auto_mode(&settings, false).is_err());
+        assert_eq!(default_mode_in(&settings).as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn auto_mode_creates_a_settings_file_that_did_not_exist() {
+        let settings = scratch("automode-new");
+        std::fs::remove_file(&settings).ok();
+        set_auto_mode(&settings, true).unwrap();
+        assert!(auto_mode_in(&settings));
+        // ...and turning it off leaves no empty scaffolding behind.
+        set_auto_mode(&settings, false).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert!(root.get("permissions").is_none(), "no empty block left");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("giverny-hooks-{name}-{}", std::process::id()));

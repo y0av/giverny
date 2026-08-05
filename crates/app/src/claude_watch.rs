@@ -593,6 +593,51 @@ impl ClaudeWatch {
         !self.refreshing.lock().unwrap().is_empty()
     }
 
+    /// Start every Claude session in auto mode, in every account.
+    ///
+    /// Claude Code reads `settings.json` when a session starts, so this
+    /// changes the next `claude`, not the ones already running.
+    pub fn set_auto_mode(&mut self, enable: bool) {
+        for p in &self.profiles {
+            let settings = p.config_dir.join("settings.json");
+            match hooks::set_auto_mode(&settings, enable) {
+                Ok(()) => tracing::info!(
+                    "auto mode {} for {}",
+                    if enable { "on" } else { "off" },
+                    p.name
+                ),
+                Err(err) => tracing::warn!("auto mode unchanged for {}: {err}", p.name),
+            }
+        }
+    }
+
+    /// Apply the auto-mode setting to accounts that have no permission mode
+    /// of their own — an account added after the toggle was turned on, or one
+    /// whose settings.json was rewritten. A mode set by hand is never
+    /// overridden here; only the explicit toggle does that.
+    pub fn ensure_auto_mode(&mut self) {
+        let missing: Vec<PathBuf> = self
+            .profiles
+            .iter()
+            .map(|p| p.config_dir.join("settings.json"))
+            .filter(|s| hooks::default_mode_in(s).is_none())
+            .collect();
+        for settings in missing {
+            if let Err(err) = hooks::set_auto_mode(&settings, true) {
+                tracing::warn!("auto mode unchanged for {}: {err}", settings.display());
+            }
+        }
+    }
+
+    /// Do all accounts start Claude in auto mode?
+    pub fn auto_mode_on(&self) -> bool {
+        !self.profiles.is_empty()
+            && self
+                .profiles
+                .iter()
+                .all(|p| hooks::auto_mode_in(&p.config_dir.join("settings.json")))
+    }
+
     /// Turn the live-usage statusline on/off for every profile.
     pub fn set_statusline(&mut self, enable: bool) -> Result<(), String> {
         let mut errs = Vec::new();

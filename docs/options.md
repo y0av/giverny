@@ -18,5 +18,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `behavior.restore_claude` | `"auto"` | Re-run `claude --resume` in restored tabs. One of: auto, prompt, off. |
 | `behavior.restore_apps` | 26 programs | Full-screen programs a restored tab may start again by itself. |
 | `behavior.extra_profile_dirs` | `[]` | Account directories kept somewhere Giverny would not find on its own. Takes effect on restart. |
+| `claude.auto_mode` | `false` | Every new Claude session starts in auto mode instead of asking for each permission. |
+| `claude.skip_resume_summary` | `false` | Skip Claude Code's offer to resume from a summary, and resume the full session. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
 | `update.check` | `true` | Ask GitHub once a day whether a newer Giverny exists. |

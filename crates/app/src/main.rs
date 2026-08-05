@@ -346,6 +346,12 @@ pub struct TabRuntime {
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
 /// tab titles, and the clamp a restored width is held to.
+/// A thousand years in minutes, and more tokens than a context window will
+/// ever hold: the two thresholds Claude Code compares a resumed session
+/// against, set where nothing reaches them.
+const FOREVER_MINUTES: u64 = 525_600_000;
+const UNREACHABLE_TOKENS: u64 = 1_000_000_000;
+
 const RAIL_MIN: f32 = 180.0;
 const RAIL_MAX: f32 = 420.0;
 
@@ -423,6 +429,28 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
         surface.surface.as_ptr(),
         move || wake.request_repaint(),
     ))
+}
+
+/// Environment every tab's shell inherits, so `claude` behaves the way the
+/// settings screen says however it is started — typed, resumed, or attached.
+fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if claude.skip_resume_summary {
+        // Claude Code offers "resume from summary" for a session older than
+        // 70 minutes and bigger than 100k tokens, and reads both thresholds
+        // from the environment. Put them out of reach and the question never
+        // comes up, which is the same answer as picking "Resume full session
+        // as-is" every time.
+        env.push((
+            "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES".into(),
+            FOREVER_MINUTES.to_string(),
+        ));
+        env.push((
+            "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD".into(),
+            UNREACHABLE_TOKENS.to_string(),
+        ));
+    }
+    env
 }
 
 impl App {
@@ -548,6 +576,9 @@ impl App {
             cfg,
             last_cfg_check: Instant::now(),
         };
+        if app.cfg.claude.auto_mode {
+            app.claude.ensure_auto_mode();
+        }
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -895,7 +926,7 @@ impl App {
         let cfg = SpawnCfg {
             shell: None,
             cwd: cwd.clone(),
-            env_extra: vec![],
+            env_extra: self.claude_env(),
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
             claude_config_dir: profile_dir,
@@ -1038,6 +1069,9 @@ impl App {
         if cfg.font.family != self.cfg.font.family {
             tracing::info!("font family changed — restart Giverny to apply");
         }
+        if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
+            self.claude.set_auto_mode(cfg.claude.auto_mode);
+        }
         self.cfg = cfg;
         tracing::info!("config reloaded");
     }
@@ -1123,6 +1157,10 @@ impl App {
 
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     fn handle_wayland_drag(&mut self, _ctx: &egui::Context) {}
+
+    fn claude_env(&self) -> Vec<(String, String)> {
+        claude_env(&self.cfg.claude)
+    }
 
     /// Notice window and rail resizes so they persist with everything else.
     ///
@@ -1828,4 +1866,28 @@ fn fresh_nonce(salt: u64) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{:x}{:x}{:x}", nanos, std::process::id(), salt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_thresholds_are_set_only_when_asked() {
+        let mut claude = config::ClaudeConfig::default();
+        assert!(claude_env(&claude).is_empty(), "nothing by default");
+
+        claude.skip_resume_summary = true;
+        let env = claude_env(&claude);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.parse::<u64>().expect("a number"))
+                .unwrap_or_else(|| panic!("{key} missing"))
+        };
+        // Claude Code's own defaults are 70 minutes and 100k tokens; the
+        // prompt appears only above both, so both have to be out of reach.
+        assert!(value("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES") > 70);
+        assert!(value("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD") > 100_000);
+    }
 }

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Two Claude settings (settings → Claude):
+  - **start Claude in auto mode** writes `permissions.defaultMode = "auto"`
+    into each account's `settings.json`. Claude Code's own setting, so it
+    applies however you start a session — typed, resumed, or attached — not
+    only to ones Giverny launches. Turning it off removes the key again, and
+    refuses to touch a mode you set by hand.
+  - **resume conversations whole** answers Claude Code's "Resume from summary
+    (recommended)" / "Resume full session as-is" prompt with as-is, every
+    time. It appears for a session over 70 minutes old and 100k tokens, and
+    both thresholds come from the environment, so tabs are spawned with them
+    out of reach rather than the prompt being answered for you.
+
 - A background shell no longer reads as Claude working. Claude Code publishes
   four session statuses — `busy`, `shell`, `idle`, `waiting` — and its own
   session list counts `shell` as working. Measured against a live session,

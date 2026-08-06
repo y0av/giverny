@@ -172,6 +172,12 @@ impl Workspace {
             },
         );
         self.active = Some(id);
+        // A new tab is the active one, and a collapsed category would hide it:
+        // the rail would show no selection anywhere while you typed into it.
+        // Opening the category is what asking for a tab in it means.
+        if let Some(cat) = self.category_mut(category) {
+            cat.collapsed = false;
+        }
         id
     }
 
@@ -285,6 +291,20 @@ mod tests {
         let ws = Workspace::default();
         assert_eq!(ws.categories.len(), 1);
         assert_eq!(ws.categories[0].name, "main");
+    }
+
+    #[test]
+    fn a_new_tab_opens_the_category_it_lands_in() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        ws.categories[0].collapsed = true;
+
+        let id = ws.add_tab(cat);
+        assert_eq!(ws.active, Some(id));
+        assert!(
+            !ws.categories[0].collapsed,
+            "the new tab is the active one — a collapsed category would hide it"
+        );
     }
 
     #[test]

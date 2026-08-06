@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A new tab opens the category it lands in. Creating one in a collapsed
+  category left the rail with no selection anywhere while you typed into it,
+  since the new tab is the active one. Applies to `+` on a collapsed header,
+  `Ctrl+Shift+T` into a collapsed active category, and attaching to a
+  background agent.
+
 - Two Claude settings (settings → Claude):
   - **start Claude in auto mode** writes `permissions.defaultMode = "auto"`
     into each account's `settings.json`. Claude Code's own setting, so it

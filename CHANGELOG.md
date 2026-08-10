@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Tabs remember the conversation they are holding even when it started before
+  hooks were installed. `tab.claude_session` — the thing restore resumes — was
+  written only by the `SessionStart` hook, so a session already running when
+  hooks landed was never recorded, and came back after a restart as a plain
+  shell. The registry names that session every second and the rail was showing
+  it the whole time; now it is saved too.
+
 - A new tab opens the category it lands in. Creating one in a collapsed
   category left the rail with no selection anywhere while you typed into it,
   since the new tab is the active one. Applies to `+` on a collapsed header,

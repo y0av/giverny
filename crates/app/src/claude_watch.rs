@@ -396,6 +396,18 @@ impl ClaudeWatch {
                 let entry = self.tabs.entry(tab_id).or_default();
                 entry.seen_in_scan = true;
                 entry.background = live.entry.background_shell();
+                // Remember which conversation this tab is holding, so it can
+                // be resumed after a restart. Hooks report this too, but only
+                // for sessions that started *after* they were installed —
+                // every older session would otherwise be lost on restart
+                // despite the registry naming it the whole time.
+                if entry.session_id.as_deref() != Some(live.entry.session_id.as_str()) {
+                    effects.captured.push((
+                        tab_id,
+                        Some(live.entry.session_id.clone()),
+                        Some(live.config_dir.clone()),
+                    ));
+                }
                 entry.session_id = Some(live.entry.session_id.clone());
                 entry.session_name = live.entry.name.clone();
                 if account.is_some() {

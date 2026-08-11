@@ -450,6 +450,15 @@ impl TabView {
                         }
                     }
                     EguiEvent::Paste(s) => bytes.extend(input::encode_paste(s, mode)),
+                    // Composed input — Hebrew, Arabic, CJK, anything going
+                    // through the platform input method — arrives as an IME
+                    // commit and never as `Text`, so it used to vanish
+                    // entirely. Pre-edit is deliberately not forwarded: the
+                    // composition is not final, and the line editor on the
+                    // other end of the pty is the one that owns the line.
+                    EguiEvent::Ime(egui::ImeEvent::Commit(t)) => {
+                        bytes.extend(input::sanitize_text(t));
+                    }
                     _ => {}
                 }
             }

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Typing through an input method works. Hebrew, Arabic, CJK — anything the
+  platform IME composes — arrives as an IME commit rather than a text event,
+  and the terminal matched only text: every composed character was dropped on
+  the floor. Pre-edit is still not forwarded, since the composition is not
+  final and the program on the other end of the pty owns the line.
+- Hebrew and Arabic are legible. DejaVu Sans *Mono* covers neither, so both
+  fell through to the proportional DejaVu Sans and were drawn into monospace
+  cells. Script-specific faces (Miriam Mono CLM, Noto Sans Hebrew, Noto Naskh
+  / Sans Arabic) are now tried first; they can only serve the scripts they
+  cover, so nothing else changes.
+
 - Ctrl+click opens a link once. Giverny opened what was under the pointer and
   then forwarded the same click to the program, and Claude Code opens
   hyperlinks itself (`onHyperlinkClick` → `xdg-open`) — so two browser tabs.

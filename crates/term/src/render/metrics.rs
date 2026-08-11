@@ -32,6 +32,16 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "PowerlineSymbols",
     "Noto Color Emoji",
     "Noto Emoji",
+    // Right-to-left scripts, before the generic faces below. DejaVu Sans
+    // *Mono* has no Hebrew or Arabic at all, so those fell through to the
+    // proportional DejaVu Sans and were drawn into monospace cells — legible
+    // in the sense that a shape appeared, and hard to read as words. These
+    // are script-specific, so they can only ever serve the scripts they
+    // cover; everything else resolves exactly as before.
+    "Miriam Mono CLM",
+    "Noto Sans Hebrew",
+    "Noto Naskh Arabic",
+    "Noto Sans Arabic",
     "DejaVu Sans Mono",
     "DejaVu Sans",
 ];
@@ -282,6 +292,22 @@ impl CellMetrics {
 
 #[cfg(test)]
 mod tests {
+    use super::FALLBACK_CANDIDATES;
+
+    #[test]
+    fn rtl_faces_are_tried_before_the_generic_ones() {
+        // DejaVu Sans Mono covers neither Hebrew nor Arabic, so both used to
+        // land on the proportional DejaVu Sans — a shape in every cell, and
+        // hard to read as words. Order is the whole fix: a script-specific
+        // face has to be reached first.
+        let at = |name: &str| FALLBACK_CANDIDATES.iter().position(|f| *f == name);
+        let generic = at("DejaVu Sans Mono").expect("generic fallback present");
+        for face in ["Miriam Mono CLM", "Noto Sans Hebrew", "Noto Sans Arabic"] {
+            let pos = at(face).unwrap_or_else(|| panic!("{face} missing from fallbacks"));
+            assert!(pos < generic, "{face} must be tried before DejaVu");
+        }
+    }
+
     use super::*;
 
     fn set() -> FontSet {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Ctrl+click opens a link once. Giverny opened what was under the pointer and
+  then forwarded the same click to the program, and Claude Code opens
+  hyperlinks itself (`onHyperlinkClick` → `xdg-open`) — so two browser tabs.
+  Ctrl over a path or URL now claims the pointer: the click is ours, and no
+  longer reported to the application.
+
 - Tabs remember the conversation they are holding even when it started before
   hooks were installed. `tab.claude_session` — the thing restore resumes — was
   written only by the `SessionStart` hook, so a session already running when

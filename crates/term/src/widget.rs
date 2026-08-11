@@ -213,8 +213,15 @@ impl TabView {
         self.handle_search(ui, session, rect, ppp, metrics);
         self.handle_hints(ui, session, rect, ppp, metrics);
         self.handle_click_targets(ui, session, &response, rect, ppp, metrics);
+        // Ctrl over a path or URL makes the pointer ours: we open what is
+        // under it, so the click must not also reach the program. Claude Code
+        // opens hyperlinks itself (`onHyperlinkClick` → `xdg-open`), and a
+        // forwarded click opened the same link a second time.
+        let pointer_is_ours = self.hover_target.is_some();
         self.handle_keyboard(ui, shared, session, &response, mode);
-        if mouse_reporting {
+        if pointer_is_ours {
+            // Neither reported nor treated as a selection drag.
+        } else if mouse_reporting {
             self.handle_mouse_reporting(ui, session, rect, ppp, metrics, mode);
         } else {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);

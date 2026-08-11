@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A tab whose conversation was never recorded recovers it from the command it
+  remembers. `claude --resume <id>` names its own conversation, and that was
+  the one place a crash left the id written down — sitting in the tab's saved
+  foreground command, ignored. It is adopted onto the tab, so the next save
+  has it whether or not the resume runs.
+
 - Typing through an input method works. Hebrew, Arabic, CJK — anything the
   platform IME composes — arrives as an IME commit rather than a text event,
   and the terminal matched only text: every composed character was dropped on

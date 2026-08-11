@@ -1305,7 +1305,7 @@ impl App {
 
     /// Queue the auto-resume command for a freshly restored tab.
     fn queue_resume(&mut self, id: TabId) {
-        let Some(sid) = self.ws.tab(id).and_then(|t| t.claude_session.clone()) else {
+        let Some(sid) = self.session_to_resume(id) else {
             return;
         };
         if let Some(cmd) = self.resume_command(&sid, id) {
@@ -1315,6 +1315,29 @@ impl App {
                 Inject::Raw(cmd),
             ));
         }
+    }
+
+    /// Which conversation this tab should come back to.
+    ///
+    /// Normally the id captured while the session was live. Failing that, the
+    /// command the tab was last running: a `claude --resume <id>` names its
+    /// own conversation, and that is the one thing still written down when a
+    /// crash beats everything else to it. Adopted onto the tab, so the next
+    /// save has it even if this resume never runs.
+    fn session_to_resume(&mut self, id: TabId) -> Option<String> {
+        let tab = self.ws.tab(id)?;
+        if let Some(sid) = tab.claude_session.clone() {
+            return Some(sid);
+        }
+        let mined = tab
+            .foreground
+            .as_deref()
+            .and_then(giverny_core::procs::resume_session_of)
+            .map(str::to_string)?;
+        tracing::info!("tab {id:?}: recovered session {mined} from its last command");
+        self.ws.tab_mut(id)?.claude_session = Some(mined.clone());
+        self.state_dirty = true;
+        Some(mined)
     }
 
     /// Build the shell command that resumes `sid` in tab `id`, with every

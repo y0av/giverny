@@ -137,6 +137,43 @@ pub fn is_restorable(command: &str, allow: &[String]) -> bool {
     !program.is_empty() && allow.iter().any(|a| a == program)
 }
 
+/// The conversation a remembered command would resume, if it is a
+/// `claude --resume`.
+///
+/// A tab records the command it was last running. When that command carries a
+/// session id, it is a second place the tab's conversation is written down —
+/// worth reading when the id was never captured any other way, which is what
+/// a crash before the session registry was consulted leaves behind.
+pub fn resume_session_of(command: &str) -> Option<&str> {
+    if program_name(command) != "claude" {
+        return None;
+    }
+    let mut words = command.split_whitespace();
+    while let Some(word) = words.next() {
+        let candidate = match word {
+            "--resume" | "-r" => words.next()?,
+            _ => match word.strip_prefix("--resume=") {
+                Some(rest) => rest,
+                None => continue,
+            },
+        };
+        if is_session_id(candidate) {
+            return Some(candidate);
+        }
+        return None;
+    }
+    None
+}
+
+/// A Claude Code session id: a canonical UUID, which is what `--resume` takes.
+fn is_session_id(s: &str) -> bool {
+    s.len() == 36
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
 /// Where a shell is currently sitting, for tabs whose cwd we track.
 pub fn shell_cwd(shell_pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
@@ -152,6 +189,41 @@ pub fn shell_cwd(shell_pid: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_remembered_resume_command_names_its_conversation() {
+        let sid = "4ed93c6b-fc1e-4f2d-8de9-25d80eb9bf27";
+        // The three shapes the flag takes, and the wrapper form a tab records.
+        assert_eq!(
+            resume_session_of(&format!("claude --resume {sid}")),
+            Some(sid)
+        );
+        assert_eq!(resume_session_of(&format!("claude -r {sid}")), Some(sid));
+        assert_eq!(
+            resume_session_of(&format!("claude --resume={sid}")),
+            Some(sid)
+        );
+        assert_eq!(
+            resume_session_of(&format!("claude --model opus --resume {sid}")),
+            Some(sid)
+        );
+    }
+
+    #[test]
+    fn only_a_claude_resume_with_a_real_id_counts() {
+        let sid = "4ed93c6b-fc1e-4f2d-8de9-25d80eb9bf27";
+        // No id: `--resume` alone opens Claude's own picker.
+        assert_eq!(resume_session_of("claude --resume"), None);
+        assert_eq!(resume_session_of("claude"), None);
+        // Something else entirely, which happens to take the same flag.
+        assert_eq!(resume_session_of(&format!("rsync --resume {sid}")), None);
+        // Not a session id.
+        assert_eq!(resume_session_of("claude --resume yesterday"), None);
+        assert_eq!(
+            resume_session_of("claude --resume 4ed93c6b-fc1e-4f2d-8de9-25d80eb9bf2"),
+            None
+        );
+    }
     use super::*;
 
     fn allow() -> Vec<String> {

@@ -15,6 +15,8 @@ mod wayland_dnd;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
@@ -355,6 +357,69 @@ const UNREACHABLE_TOKENS: u64 = 1_000_000_000;
 const RAIL_MIN: f32 = 180.0;
 const RAIL_MAX: f32 = 420.0;
 
+/// How much scrollback a snapshot keeps, and how far behind the tab it is
+/// allowed to fall.
+///
+/// Snapshots used to be written only on the way out, which left them worth
+/// least in the case they exist for: a process that is killed rather than
+/// closed never runs that code, so every tab came back showing whatever it
+/// had at the last clean quit. Both kills on this machine were the kernel
+/// picking a runaway process inside Giverny's cgroup, and neither left a
+/// single snapshot behind.
+///
+/// One tab per tick rather than all of them at once: building a dump walks
+/// the grid under the terminal lock, so a whole sweep on a timer would be a
+/// stutter you could set your watch by.
+const SNAPSHOT_ROWS: usize = 4000;
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// What was last written for a tab, so an unchanged screen costs no write.
+struct Snapshot {
+    at: Instant,
+    hash: u64,
+}
+
+fn hash_of(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Shut down the way closing the window does when the close never comes
+/// through the window: systemd stops the app's scope with SIGTERM at logout,
+/// a launch from a terminal gets SIGINT from Ctrl-C, and a dying login
+/// session sends SIGHUP. Nothing was listening for any of them, so those
+/// exits skipped every write the shutdown path makes.
+///
+/// SIGKILL stays unstoppable — the periodic snapshot above is what bounds
+/// its cost.
+#[cfg(unix)]
+fn shut_down_on_signal(ctx: egui::Context, asked: Arc<AtomicBool>) {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = match signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+        Ok(signals) => signals,
+        Err(err) => {
+            tracing::warn!("no signal handler installed: {err}");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("giverny signals".into())
+        // The iterator hands signals to an ordinary thread rather than to a
+        // handler, so waking the UI from here is allowed.
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                tracing::info!("signal {signal}: saving and closing");
+                asked.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!("no signal thread: {err}");
+    }
+}
+
 pub struct App {
     pub shared: RenderShared,
     pub ws: Workspace,
@@ -398,6 +463,13 @@ pub struct App {
     pub settings: Option<settings_ui::SettingsState>,
     pub keys_overlay: Option<keymap::KeysOverlay>,
     capture: Option<capture::Capture>,
+    /// Last scrollback written per live tab.
+    snapshots: HashMap<TabId, Snapshot>,
+    /// Whether this process is on its way out on purpose, which is the
+    /// difference between a clean shutdown and a crash in the state file.
+    closing: bool,
+    /// Set by the signal thread; read on the next frame.
+    terminating: Arc<AtomicBool>,
     /// Window size and rail width as last seen, persisted with the workspace.
     layout: state::Layout,
     pub cfg: config::Config,
@@ -472,6 +544,15 @@ impl App {
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
+        // Say so when the last run ended without going through the shutdown
+        // path — a kill, an OOM, or a compositor that took the session with
+        // it. The marker was written and never read, which made every crash
+        // look from the logs like an ordinary quit.
+        if restored.as_ref().is_some_and(|st| !st.clean_shutdown) {
+            tracing::warn!(
+                "last run did not shut down cleanly; tabs restore from their last snapshot"
+            );
+        }
         // Font size now lives in config.toml alone. One-time migration for
         // state files written when it lived here instead, so nobody's zoom
         // level is lost the first time they run this build.
@@ -571,11 +652,16 @@ impl App {
             settings: None,
             keys_overlay: None,
             capture: capture::Capture::from_env(),
+            snapshots: HashMap::new(),
+            closing: false,
+            terminating: Arc::new(AtomicBool::new(false)),
             layout,
             cfg_mtime,
             cfg,
             last_cfg_check: Instant::now(),
         };
+        #[cfg(unix)]
+        shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         if app.cfg.claude.auto_mode {
             app.claude.ensure_auto_mode();
         }
@@ -590,16 +676,78 @@ impl App {
             );
         }
         // Sessions for restored tabs spawn lazily on first focus; the state
-        // file is rewritten now with clean_shutdown=false (crash marker).
-        app.save_state(false);
+        // file is rewritten now, marked as a crash until a shutdown says
+        // otherwise.
+        app.save_state();
         app
     }
 
-    fn save_state(&mut self, clean_shutdown: bool) {
+    /// Write one tab's scrollback, skipping the write when the screen has not
+    /// changed since the last one — an idle tab would otherwise cost an fsync
+    /// a minute for a file already holding exactly those bytes.
+    fn snapshot_tab(&mut self, id: TabId) {
+        let dump = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .and_then(|session| session.snapshot_ansi(SNAPSHOT_ROWS));
+        // `None` means the alt screen is up: vim or a full-screen Claude owns
+        // the terminal, and what it draws is not what the tab should come back
+        // as. Keep whatever was saved before it took over.
+        let Some(dump) = dump else { return };
+        let hash = hash_of(&dump);
+        let at = Instant::now();
+        if self.snapshots.get(&id).is_some_and(|s| s.hash == hash) {
+            self.snapshots.insert(id, Snapshot { at, hash });
+            return;
+        }
+        match state::save_snapshot(&self.paths, id, &dump) {
+            Ok(()) => {
+                self.snapshots.insert(id, Snapshot { at, hash });
+            }
+            Err(err) => tracing::error!("snapshot save failed for {id:?}: {err:#}"),
+        }
+    }
+
+    /// Snapshot the live tab that has gone longest without one.
+    fn snapshot_stalest_tab(&mut self) {
+        let due = self
+            .rt
+            .iter()
+            .filter(|(_, rt)| rt.session.is_some())
+            .map(|(&id, _)| id)
+            .filter(|id| {
+                self.snapshots
+                    .get(id)
+                    .is_none_or(|s| s.at.elapsed() >= SNAPSHOT_MAX_AGE)
+            })
+            // A tab that has never been snapshotted sorts first: `None` is
+            // less than any `Some`.
+            .min_by_key(|id| self.snapshots.get(id).map(|s| s.at));
+        if let Some(id) = due {
+            self.snapshot_tab(id);
+        }
+    }
+
+    /// Everything that has to reach disk before the process ends. Safe to
+    /// call twice — the second pass finds nothing changed.
+    fn persist_all(&mut self) {
+        let ids: Vec<TabId> = self.rt.keys().copied().collect();
+        for id in ids {
+            self.snapshot_tab(id);
+        }
+        self.save_state();
+    }
+
+    /// The marker is taken from `closing` rather than passed in: the frames
+    /// between asking to close and the process actually ending still save,
+    /// and any one of them saying "clean: no" would undo the record of a
+    /// deliberate quit.
+    fn save_state(&mut self) {
         let st = SaveState {
             version: state::STATE_VERSION,
             boot_id: state::boot_id(),
-            clean_shutdown,
+            clean_shutdown: self.closing,
             workspace: self.ws.clone(),
             font_size: self.shared.font_size,
             layout: self.layout,
@@ -639,6 +787,7 @@ impl App {
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
+                self.snapshots.remove(&id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
@@ -1256,12 +1405,13 @@ impl App {
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
         self.reload_config_if_changed(ctx);
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
-            self.save_state(false);
+            self.save_state();
         }
         if self.last_info_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
         self.last_info_refresh = Instant::now();
+        self.snapshot_stalest_tab();
         if let Some(rx) = &self.update_rx
             && let Ok(found) = rx.try_recv()
         {
@@ -1486,6 +1636,21 @@ impl eframe::App for App {
         self.drain_events();
 
         let ctx = ui.ctx().clone();
+        // A close asked for through the window and one asked for with a
+        // signal end the same way, but only the first arrives as an event.
+        // Both are written down here: the state file's clean-shutdown marker
+        // is only true if one of them happened.
+        if !self.closing
+            && (self.terminating.load(Ordering::Relaxed)
+                || ctx.input(|i| i.viewport().close_requested()))
+        {
+            self.closing = true;
+            // Save now rather than leaving it to the drop. A signal at logout
+            // races the compositor going away, and a frame that never
+            // finishes writes nothing.
+            self.persist_all();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
@@ -1672,17 +1837,10 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Scrollback snapshots for every live tab, then the final state write.
-        let ids: Vec<TabId> = self.rt.keys().copied().collect();
-        for id in ids {
-            if let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref())
-                && let Some(dump) = session.snapshot_ansi(4000)
-                && let Err(err) = state::save_snapshot(&self.paths, id, &dump)
-            {
-                tracing::error!("snapshot save failed for {id:?}: {err:#}");
-            }
-        }
-        self.save_state(true);
+        // Reached on the way out of the event loop whether the window was
+        // closed or the compositor died under it, so `closing` is what tells
+        // the two apart in the state file.
+        self.persist_all();
         for (_, rt) in self.rt.drain() {
             if let Some(session) = rt.session {
                 session.shutdown();

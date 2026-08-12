@@ -33,3 +33,8 @@ serde = { workspace = true, features = ["derive"] }
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
 smithay-clipboard = "0.7.3"
 raw-window-handle = "0.6"
+
+# Shutting down on a signal, so a logout or a `kill` gets the same
+# scrollback-and-state write that closing the window does.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.4"

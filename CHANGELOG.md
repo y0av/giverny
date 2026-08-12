@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-08-12
+
+- Scrollback is saved while the app is running, not only as it closes. It was
+  written in one place, on the way out, so the exits that skip that code —
+  a kill, an out-of-memory, a compositor that takes the session with it — came
+  back showing whatever the tab held at the last clean quit. One tab is now
+  snapshotted every couple of seconds, the one longest without, skipping any
+  whose screen has not changed. A kill costs a tab a minute of output.
+- `SIGTERM`, `SIGINT` and `SIGHUP` shut down the way closing the window does.
+  Nothing was listening for them, and systemd stops the app's scope with
+  `SIGTERM` at logout, so an ordinary end of session skipped every write the
+  shutdown path makes.
+- The clean-shutdown marker is true. It was set unconditionally by a path that
+  also runs when the event loop errors out, so losing the compositor recorded
+  itself as an ordinary quit; a start that finds the previous run unclean now
+  says so.
 
 - A tab whose conversation was never recorded recovers it from the command it
   remembers. `claude --resume <id>` names its own conversation, and that was

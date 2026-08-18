@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.1 — 2026-08-18
+
+- An out-of-memory kill in one tab no longer closes the whole terminal.
+  Everything a tab starts — a shell, an agent, a dev server, a headless
+  browser — runs inside the systemd scope the launcher created for Giverny,
+  and an app scope defaults to `OOMPolicy=stop`: when the kernel's OOM killer
+  takes any process in it, systemd stops the entire unit, so Giverny is handed
+  a `SIGTERM` and every other tab dies for the sake of the one process that
+  was picked. `install-desktop` now writes a drop-in that sets
+  `OOMPolicy=continue`, which leaves the rest of the scope alone. The one-line
+  installer already runs that command, so updating is enough; from a source
+  build, run `giverny install-desktop` once. `giverny doctor` prints the
+  policy actually in force, and a scope still set to `stop` says so in the log
+  at startup. Linux only: there is no scope to stop on macOS or Windows.
+
 ## v0.5.0 — 2026-08-12
 
 - Scrollback is saved while the app is running, not only as it closes. It was

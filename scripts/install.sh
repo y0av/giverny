@@ -65,7 +65,7 @@ mv -f "$BIN_DIR/giverny.new" "$BIN_DIR/giverny"
 say "installed $BIN_DIR/giverny"
 
 if [ "$os" = unknown-linux-gnu ]; then
-  "$BIN_DIR/giverny" install-desktop >/dev/null 2>&1 && say "registered the desktop entry and icons" || true
+  "$BIN_DIR/giverny" install-desktop >/dev/null 2>&1 && say "registered the desktop entry, icons and OOM policy" || true
 fi
 
 case ":$PATH:" in

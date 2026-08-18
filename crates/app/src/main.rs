@@ -6,6 +6,7 @@ mod claude_watch;
 mod desktop;
 mod icon;
 mod keymap;
+mod oom;
 mod overlays;
 mod rail;
 mod settings_ui;
@@ -223,6 +224,13 @@ fn main() -> eframe::Result {
                 .unwrap_or_else(|_| "giverny=info,warn".into()),
         )
         .init();
+
+    if oom::at_risk() {
+        tracing::warn!(
+            "this scope stops on an OOM kill: one tab's process being killed \
+             would close every tab — run `giverny install-desktop` to fix it"
+        );
+    }
 
     // Backend choice has to happen before the event loop exists. winit picks
     // Wayland whenever WAYLAND_DISPLAY is set, and has no drop support there,
@@ -1893,6 +1901,30 @@ fn doctor() {
                 (false, false) => "not installed (X11 uses the built-in window icon)".to_string(),
             }
         );
+        println!();
+    }
+
+    // What systemd does to the rest of the scope when one tab's process is
+    // OOM-killed. `stop` is the default, and it closes the whole terminal.
+    #[cfg(target_os = "linux")]
+    {
+        let oom = oom::status();
+        match oom.policy.as_deref() {
+            Some("continue") => {
+                println!("oom policy   continue ✓ (a killed child stays a killed child)")
+            }
+            Some(other) => println!(
+                "oom policy   {other} — one OOM-killed process in any tab stops every tab;\n             run `giverny install-desktop`, then restart Giverny"
+            ),
+            None => println!(
+                "oom policy   unknown (no systemd scope around this process)\n             drop-in {}",
+                if oom.installed {
+                    "installed ✓"
+                } else {
+                    "not installed"
+                }
+            ),
+        }
         println!();
     }
 

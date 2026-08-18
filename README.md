@@ -53,6 +53,8 @@ cargo install --path crates/app
 giverny install-desktop     # launcher entry + icons; on Wayland this is what puts the icon in the dock
 ```
 
+On Linux `install-desktop` also writes a systemd drop-in that sets `OOMPolicy=continue` on Giverny's scope. Without it a scope stops the moment the kernel OOM-kills anything inside it, so one tab's dev server eating the machine takes every tab with it. The one-line installer above runs the command for you; `giverny doctor` prints the policy in force.
+
 Giverny checks GitHub once a day for a newer release and offers a one-click update in the rail; clicking it opens a tab and runs the install command above, so you watch exactly what happens. `giverny update` does the same from a shell, and `[update] check = false` in `~/.config/giverny/config.toml` (or `GIVERNY_NO_UPDATE=1`) turns it off entirely. The config file is written with comments on first run and hot-reloads on save.
 
 Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.

@@ -110,6 +110,9 @@ pub fn install() {
     }
 
     refresh(&data);
+    // Same launcher, same fix: the scope it starts us in must not stop when
+    // one process inside it is OOM-killed. See `oom`.
+    crate::oom::install();
 
     println!("installed {}", entry_path.display());
     println!(
@@ -136,8 +139,9 @@ pub fn remove() {
     let entry = desktop_path(&data);
     let had_entry = fs::remove_file(&entry).is_ok();
     refresh(&data);
+    let oom_gone = crate::oom::remove();
 
-    if had_entry || gone > 0 {
+    if had_entry || gone > 0 || oom_gone > 0 {
         println!(
             "removed {} icon(s){}",
             gone,
@@ -147,6 +151,9 @@ pub fn remove() {
                 ""
             }
         );
+        if oom_gone > 0 {
+            println!("removed the OOM drop-in");
+        }
     } else {
         println!("nothing to remove — no Giverny desktop entry or icons were installed");
     }

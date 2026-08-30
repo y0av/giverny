@@ -277,7 +277,7 @@ fn decode_image(bytes: &[u8], format: u32, width: u32, height: u32) -> Option<Im
                     return None;
                 }
                 let mut out = Vec::with_capacity(px * 4);
-                for chunk in bytes[..px * 3].chunks_exact(3) {
+                for chunk in bytes[..px * 3].as_chunks::<3>().0 {
                     out.extend_from_slice(chunk);
                     out.push(255);
                 }
@@ -301,7 +301,7 @@ fn to_rgba(buf: &[u8], color: png::ColorType, depth: png::BitDepth) -> Option<Ve
         png::ColorType::Rgba => buf.to_vec(),
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity(buf.len() / 3 * 4);
-            for c in buf.chunks_exact(3) {
+            for c in buf.as_chunks::<3>().0 {
                 out.extend_from_slice(c);
                 out.push(255);
             }
@@ -316,7 +316,7 @@ fn to_rgba(buf: &[u8], color: png::ColorType, depth: png::BitDepth) -> Option<Ve
         }
         png::ColorType::GrayscaleAlpha => {
             let mut out = Vec::with_capacity(buf.len() * 2);
-            for c in buf.chunks_exact(2) {
+            for c in buf.as_chunks::<2>().0 {
                 out.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
             }
             out

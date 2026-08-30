@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.5.4 — 2026-08-30
+
+- Windows tabs open again. v0.5.3 opened them with `wsl.exe -d <distro> ~`,
+  and `~` is a shorthand rather than an argument: alone it means "start in the
+  Linux home", but with `-d` in front of it wsl.exe reads it as the command to
+  run, which bash expands and tries to execute — `/home/…: Is a directory`,
+  then a dead tab. The distribution is only named when it is not the default
+  one, and naming it now uses `--cd`, which is the documented flag for the
+  same thing. A distribution whose name has a space is quoted, since arguments
+  reach `CreateProcess` joined and unescaped.
+
+- A session is no longer told the path of its own default account. Setting
+  `CLAUDE_CONFIG_DIR` does more than point at a directory: it also moves where
+  Claude Code keeps its identity, from beside the directory to inside it. A
+  session handed the path of the account it would have picked anyway would
+  have come up logged out, staring at a fresh login. Giverny says nothing and
+  lets it find that account by itself; which account a tab is on now travels
+  as `GIVERNY_PROFILE_DIR`, which changes nothing for Claude Code and is what
+  hooks carry back out.
+
 ## v0.5.3 — 2026-08-30
 
 - A Claude Code that lives inside WSL is a Claude Code Giverny can see. On

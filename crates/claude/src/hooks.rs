@@ -70,10 +70,26 @@ pub fn run_relay(spool: &Path) {
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let msg = RelayMsg {
         tab_id: Some(tab_id),
-        config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        config_dir: account_dir(),
         event,
     };
     deliver(&msg, spool);
+}
+
+/// Which account this session runs under.
+///
+/// `CLAUDE_CONFIG_DIR` is the truth when it is set — the user may have named
+/// a different account inside the tab, and that is the one the hook belongs
+/// to. When it is unset the session is on its default account, which the
+/// session itself cannot name: `GIVERNY_PROFILE_DIR` is the tab telling us
+/// which one that is, and inside WSL it is the only way the answer crosses
+/// back at all.
+fn account_dir() -> Option<String> {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| std::env::var("GIVERNY_PROFILE_DIR").ok())
+        .filter(|dir| !dir.is_empty())
 }
 
 /// Send one message to the app: unix socket when available, else append to
@@ -282,7 +298,7 @@ pub fn run_statusline(spool: &Path) {
     }
     let msg = RelayMsg {
         tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
-        config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        config_dir: account_dir(),
         event: serde_json::Value::Object(event),
     };
     deliver(&msg, spool);

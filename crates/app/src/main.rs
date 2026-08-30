@@ -365,7 +365,9 @@ struct Switcher {
 /// way Giverny stores accounts), and the environment that reaches the shell.
 struct TabShape {
     shell: Option<(String, Vec<String>)>,
-    account: Option<PathBuf>,
+    /// What `SpawnCfg` should export as `CLAUDE_CONFIG_DIR`. `None` where the
+    /// environment below says it better — or deliberately says nothing.
+    config_dir: Option<PathBuf>,
     env: Vec<(String, String)>,
 }
 
@@ -556,6 +558,32 @@ fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     env
 }
 
+/// How to open a shell in one distribution.
+///
+/// `wsl.exe ~` is the documented shorthand for "start in the Linux home", and
+/// it is *only* a shorthand: put `-d` in front of it and wsl.exe stops reading
+/// the `~` as a place and starts reading it as the command to run, which bash
+/// dutifully expands and tries to execute — `/home/ita: Is a directory`. So
+/// the shorthand is used exactly where it works, which is also the common
+/// case, and naming a distribution switches to `--cd`, the documented flag for
+/// the same thing.
+///
+/// Arguments reach `CreateProcess` joined with spaces and no quoting added
+/// (`escape_args: false`, so that a shell command can carry its own), which
+/// makes quoting a distribution called "Ubuntu 22.04" this function's job.
+fn wsl_shell(distro: &str, default: Option<&str>) -> (String, Vec<String>) {
+    let program = "wsl.exe".to_string();
+    if default.is_some_and(|d| d == distro) {
+        return (program, vec!["~".to_string()]);
+    }
+    let named = if distro.contains(' ') {
+        format!("\"{distro}\"")
+    } else {
+        distro.to_string()
+    };
+    (program, vec!["-d".into(), named, "--cd".into(), "~".into()])
+}
+
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
 /// to survive the crossing, added to whatever the user already shares.
 ///
@@ -563,7 +591,12 @@ fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
 /// belong to a tab; coming back out, the hook runs this binary as a Windows
 /// process and needs the same variables to arrive with it.
 fn wslenv(inherited: Option<String>) -> String {
-    const OURS: [&str; 3] = ["GIVERNY_TAB_ID", "GIVERNY_NONCE", "CLAUDE_CONFIG_DIR"];
+    const OURS: [&str; 4] = [
+        "GIVERNY_TAB_ID",
+        "GIVERNY_NONCE",
+        "CLAUDE_CONFIG_DIR",
+        "GIVERNY_PROFILE_DIR",
+    ];
     let mut parts: Vec<String> = inherited
         .filter(|v| !v.is_empty())
         .map(|v| v.split(':').map(str::to_string).collect())
@@ -1138,7 +1171,7 @@ impl App {
             env_extra: shape.env,
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
-            claude_config_dir: shape.account,
+            claude_config_dir: shape.config_dir,
             size: GridSize {
                 cols: 120,
                 rows: 30,
@@ -1688,13 +1721,12 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>) -> TabShape {
         let mut env = self.claude_env();
-        let mut shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
-        let mut account = profile_dir;
+        let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
         // account inside a distribution is only reachable from that
         // distribution, so that is where the tab opens.
-        let distro = account
+        let distro = profile_dir
             .as_deref()
             .and_then(wsl::split_unc)
             .map(|(distro, _)| distro)
@@ -1706,28 +1738,38 @@ impl App {
         let Some(distro) = distro else {
             return TabShape {
                 shell,
-                account,
+                config_dir: profile_dir,
                 env,
             };
         };
 
-        shell = Some((
-            "wsl.exe".to_string(),
-            vec!["-d".to_string(), distro.clone(), "~".to_string()],
-        ));
-        // Name the account even when nothing asked for one: it is the same
-        // account Claude Code would pick on its own, and naming it is what
-        // lets a hook from that session be attributed to it.
-        if account.is_none() {
-            account = wsl::account_dir(&distro);
-        }
+        // Everything below names the account itself, because none of the
+        // values a session inside a distribution needs are the ones
+        // `SpawnCfg` would derive: the path has to be the unix one, and for
+        // the distribution's own default account the right value is no value.
+        let account = profile_dir.or_else(|| wsl::account_dir(&distro));
         if let Some((_, unix)) = account.as_deref().and_then(wsl::split_unc) {
-            env.push(("CLAUDE_CONFIG_DIR".into(), unix));
+            // Naming the account Claude Code would have picked anyway is not
+            // the harmless no-op it looks like: `CLAUDE_CONFIG_DIR` also
+            // moves where Claude Code keeps its identity — inside the
+            // directory instead of beside it — so a session handed the path
+            // of its own default account comes up logged out. Say nothing,
+            // and it finds that account by itself.
+            if !wsl::is_default_account(&distro, &unix) {
+                env.push(("CLAUDE_CONFIG_DIR".into(), unix));
+            }
+        }
+        if let Some(account) = &account {
+            // Which account the tab is on, in the terms Giverny stores
+            // accounts in. A hook fired inside the distribution carries it
+            // back out, which is the only way a session that was never told a
+            // config dir can be attributed to an account at all.
+            env.push(("GIVERNY_PROFILE_DIR".into(), account.display().to_string()));
         }
         env.push(("WSLENV".into(), wslenv(std::env::var("WSLENV").ok())));
         TabShape {
-            shell,
-            account,
+            shell: Some(wsl_shell(&distro, wsl::default_distro().as_deref())),
+            config_dir: None,
             env,
         }
     }
@@ -2330,13 +2372,43 @@ mod tests {
         assert!(value("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD") > 100_000);
     }
 
+    /// The regression that shipped in v0.5.3: every Windows tab opened
+    /// `wsl.exe -d <distro> ~`, and wsl.exe reads that `~` as a command.
+    #[test]
+    fn a_wsl_tab_opens_in_the_home_directory() {
+        assert_eq!(
+            wsl_shell("Ubuntu", Some("Ubuntu")),
+            ("wsl.exe".into(), vec!["~".to_string()]),
+            "the default distribution takes the shorthand that works"
+        );
+        assert_eq!(
+            wsl_shell("Debian", Some("Ubuntu")),
+            (
+                "wsl.exe".into(),
+                vec![
+                    "-d".to_string(),
+                    "Debian".to_string(),
+                    "--cd".to_string(),
+                    "~".to_string()
+                ]
+            ),
+            "naming one needs the flag, not the shorthand"
+        );
+        // Arguments are joined unquoted, so a name with a space is quoted here.
+        let (_, args) = wsl_shell("Ubuntu 22.04", Some("Ubuntu"));
+        assert_eq!(args[1], "\"Ubuntu 22.04\"");
+    }
+
     /// The variables a hook inside WSL needs, without dropping the ones the
     /// user already shares — `%WSLENV%` is a machine-wide setting, and
     /// replacing it would quietly break whatever else relies on it.
     #[test]
     fn wslenv_adds_ours_and_keeps_theirs() {
         let mine = wslenv(None);
-        assert_eq!(mine, "GIVERNY_TAB_ID:GIVERNY_NONCE:CLAUDE_CONFIG_DIR");
+        assert_eq!(
+            mine,
+            "GIVERNY_TAB_ID:GIVERNY_NONCE:CLAUDE_CONFIG_DIR:GIVERNY_PROFILE_DIR"
+        );
 
         let merged = wslenv(Some("EDITOR:PROJECT/p".into()));
         assert!(

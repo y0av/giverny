@@ -15,7 +15,7 @@ mod update;
 mod wayland_dnd;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -369,6 +369,10 @@ struct TabShape {
     /// environment below says it better — or deliberately says nothing.
     config_dir: Option<PathBuf>,
     env: Vec<(String, String)>,
+    /// The tab opens inside a distribution, where a Windows path means
+    /// nothing to the shell and the shell's directory means nothing to
+    /// Windows.
+    in_wsl: bool,
 }
 
 pub struct TabRuntime {
@@ -571,17 +575,56 @@ fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
 /// Arguments reach `CreateProcess` joined with spaces and no quoting added
 /// (`escape_args: false`, so that a shell command can carry its own), which
 /// makes quoting a distribution called "Ubuntu 22.04" this function's job.
-fn wsl_shell(distro: &str, default: Option<&str>) -> (String, Vec<String>) {
-    let program = "wsl.exe".to_string();
-    if default.is_some_and(|d| d == distro) {
-        return (program, vec!["~".to_string()]);
+fn wsl_shell(
+    distro: &str,
+    default: Option<&str>,
+    start_dir: Option<&str>,
+) -> (String, Vec<String>) {
+    let mut args: Vec<String> = Vec::new();
+    if default.is_none_or(|d| d != distro) {
+        args.push("-d".into());
+        args.push(wsl_arg(distro));
     }
-    let named = if distro.contains(' ') {
-        format!("\"{distro}\"")
+    match start_dir {
+        Some(dir) => {
+            args.push("--cd".into());
+            args.push(wsl_arg(dir));
+        }
+        // The shorthand, where it is the whole argument list and therefore
+        // means what it says.
+        None if args.is_empty() => args.push("~".into()),
+        None => {
+            args.push("--cd".into());
+            args.push("~".into());
+        }
+    }
+    ("wsl.exe".to_string(), args)
+}
+
+/// One argument for a command line that is joined without escaping.
+fn wsl_arg(value: &str) -> String {
+    if value.contains(' ') {
+        format!("\"{value}\"")
     } else {
-        distro.to_string()
-    };
-    (program, vec!["-d".into(), named, "--cd".into(), "~".into()])
+        value.to_string()
+    }
+}
+
+/// The directory a tab inside a distribution reopens in.
+///
+/// A WSL shell reports its directory over OSC 7 as the unix path it is, which
+/// Windows cannot open and every spawn until now therefore threw away — the
+/// tab went home instead of back where it was. It can be checked over the
+/// share, and it has to be: `--cd` on a directory that is gone is a tab that
+/// does not open at all, rather than one that opens somewhere else.
+fn wsl_start_dir(distro: &str, was_in: Option<&Path>) -> Option<String> {
+    let text = was_in?.to_str()?;
+    if !text.starts_with('/') {
+        return None;
+    }
+    wsl::unc_path(distro, text)
+        .is_dir()
+        .then(|| text.to_string())
 }
 
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
@@ -1164,7 +1207,9 @@ impl App {
             .tab(id)
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
-        let shape = self.tab_shape(profile_dir);
+        let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
+        let shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let in_wsl = shape.in_wsl;
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),
@@ -1193,12 +1238,18 @@ impl App {
                 });
                 entry.session = Some(session);
                 // Startup rc files may `cd` away from the spawn dir; verify
-                // and correct once the shell has settled.
-                self.pending_inject.push((
-                    Instant::now() + Duration::from_millis(900),
-                    id,
-                    Inject::CwdFix(cwd),
-                ));
+                // and correct once the shell has settled. Not across the WSL
+                // boundary: what Windows can see of `wsl.exe` is its own
+                // working directory, which says nothing about where the shell
+                // inside it is, and typing a Windows path at a bash prompt
+                // would be the only outcome of comparing them.
+                if !in_wsl {
+                    self.pending_inject.push((
+                        Instant::now() + Duration::from_millis(900),
+                        id,
+                        Inject::CwdFix(cwd),
+                    ));
+                }
             }
             Err(err) => {
                 tracing::error!("spawn failed for tab {id:?}: {err:#}");
@@ -1719,7 +1770,7 @@ impl App {
     /// environment does not reach a process in a distribution at all unless
     /// `%WSLENV%` lists it, which is how the tab identity the hooks report
     /// gets there.
-    fn tab_shape(&self, profile_dir: Option<PathBuf>) -> TabShape {
+    fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
@@ -1740,6 +1791,7 @@ impl App {
                 shell,
                 config_dir: profile_dir,
                 env,
+                in_wsl: false,
             };
         };
 
@@ -1768,9 +1820,14 @@ impl App {
         }
         env.push(("WSLENV".into(), wslenv(std::env::var("WSLENV").ok())));
         TabShape {
-            shell: Some(wsl_shell(&distro, wsl::default_distro().as_deref())),
+            shell: Some(wsl_shell(
+                &distro,
+                wsl::default_distro().as_deref(),
+                wsl_start_dir(&distro, was_in).as_deref(),
+            )),
             config_dir: None,
             env,
+            in_wsl: true,
         }
     }
 
@@ -2377,12 +2434,12 @@ mod tests {
     #[test]
     fn a_wsl_tab_opens_in_the_home_directory() {
         assert_eq!(
-            wsl_shell("Ubuntu", Some("Ubuntu")),
+            wsl_shell("Ubuntu", Some("Ubuntu"), None),
             ("wsl.exe".into(), vec!["~".to_string()]),
             "the default distribution takes the shorthand that works"
         );
         assert_eq!(
-            wsl_shell("Debian", Some("Ubuntu")),
+            wsl_shell("Debian", Some("Ubuntu"), None),
             (
                 "wsl.exe".into(),
                 vec![
@@ -2395,8 +2452,30 @@ mod tests {
             "naming one needs the flag, not the shorthand"
         );
         // Arguments are joined unquoted, so a name with a space is quoted here.
-        let (_, args) = wsl_shell("Ubuntu 22.04", Some("Ubuntu"));
+        let (_, args) = wsl_shell("Ubuntu 22.04", Some("Ubuntu"), None);
         assert_eq!(args[1], "\"Ubuntu 22.04\"");
+    }
+
+    /// Reopening where the tab was, which is the whole point of remembering.
+    #[test]
+    fn a_wsl_tab_reopens_where_it_was() {
+        assert_eq!(
+            wsl_shell("Ubuntu", Some("Ubuntu"), Some("/home/ita/proj")),
+            (
+                "wsl.exe".into(),
+                vec!["--cd".to_string(), "/home/ita/proj".to_string()]
+            )
+        );
+        let (_, args) = wsl_shell("Ubuntu", Some("Ubuntu"), Some("/home/ita/my proj"));
+        assert_eq!(args[1], "\"/home/ita/my proj\"");
+
+        // A Windows path is not somewhere a distribution can be sent, and a
+        // tab with nowhere remembered goes home.
+        assert_eq!(
+            wsl_start_dir("Ubuntu", Some(Path::new(r"C:\Users\ita"))),
+            None
+        );
+        assert_eq!(wsl_start_dir("Ubuntu", None), None);
     }
 
     /// The variables a hook inside WSL needs, without dropping the ones the

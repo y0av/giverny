@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5.5 — 2026-08-30
+
+- A tab inside WSL reopens where it was, instead of going home every time. A
+  WSL shell reports its directory over OSC 7 as the unix path it is, and every
+  spawn threw that away: Windows cannot open `/home/x/proj`, so the tab fell
+  back to the Windows home and the `~` on the command line sent it to the
+  Linux home anyway. The remembered directory is now checked over the share
+  and passed as `--cd` — checked because `--cd` on a directory that has since
+  been deleted is a tab that does not open at all. A new tab opened from a WSL
+  tab lands in the same directory, which is what it does everywhere else.
+
+- The startup directory check no longer runs for a tab inside a distribution.
+  It compared the shell's directory against the one it was spawned with, and
+  across the boundary those are two different machines' answers: all it could
+  ever do is type a Windows path at a bash prompt.
+
 ## v0.5.4 — 2026-08-30
 
 - Windows tabs open again. v0.5.3 opened them with `wsl.exe -d <distro> ~`,

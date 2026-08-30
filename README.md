@@ -70,6 +70,7 @@ Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI 
 | `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
 | `Ctrl+Shift+E` | label every path/URL on screen — letter opens, Shift+letter types it |
 | `Ctrl`+hover / click | underline and open a path or URL |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | back / forward through recently used tabs (hold `Ctrl` to keep going) |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |
 | `F2` or double-click | rename tab |
 | `Ctrl` `+` / `−` / `0` | font size (persists) |

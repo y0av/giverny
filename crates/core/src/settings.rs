@@ -305,6 +305,25 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "behavior.windows_shell",
+        label: "shell on Windows",
+        section: Section::Terminal,
+        doc: "Which shell a new tab opens on Windows.",
+        note: &[
+            "`auto` opens WSL when a distribution is installed, because that",
+            "is where Claude Code and unix tooling usually live, and falls",
+            "back to PowerShell when there is none. Set it explicitly to get",
+            "a Windows shell on a machine that has both.",
+            "Applies to tabs opened from here on; existing ones keep theirs.",
+            "Ignored off Windows, where $SHELL answers this.",
+        ],
+        needs_restart: false,
+        kind: Kind::Choice {
+            default: "auto",
+            options: &["auto", "wsl", "powershell", "cmd"],
+        },
+    },
+    SettingDef {
         key: "behavior.restore_apps",
         label: "programs to restart",
         section: Section::Restore,

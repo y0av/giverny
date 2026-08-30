@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.5.2 — 2026-08-30
+
+- The shell a tab opens on Windows is a setting, `behavior.windows_shell`:
+  `auto`, `wsl`, `powershell` or `cmd`. `auto` still prefers a WSL login
+  shell, which is where Claude Code and unix tooling usually live — but only
+  when a distribution is actually installed. `wsl.exe` ships with Windows
+  whether or not there is anything behind it, so the old check ("is wsl.exe on
+  %PATH%?") was true on machines with no distribution at all, and those tabs
+  opened onto "no installed distributions" instead of a shell. It now asks WSL
+  what it has, once per run, and falls back to PowerShell when the answer is
+  nothing. A machine with both can be told which one it wants.
+
+- `Ctrl+Tab` switches between tabs by when you last used them, not where they
+  sit in the rail: one press is "back to the tab I came from", and holding
+  `Ctrl` down while pressing it again keeps walking back through the ones
+  before that, `Ctrl+Shift+Tab` forward again. The walk commits when `Ctrl`
+  comes up, and only the tab it lands on moves to the front of the order —
+  stepping past a tab is not using it, so pressing twice always means two
+  back. The order is kept with the tabs, so it survives a restart, and every
+  way of changing tabs feeds it. `Ctrl+PageUp`/`PageDown` still walk the rail
+  in order.
+
+- Usage numbers refresh on Windows. Giverny asks Claude Code to update them by
+  running `claude -p /usage`, and Rust resolves a bare program name on Windows
+  by appending `.exe` and nothing else — no `%PATHEXT%` — so an npm-installed
+  `claude.cmd` was never found and every refresh ended in "usage refresh
+  skipped: program not found", leaving the meters on whatever the cache last
+  held. The executable is now resolved here: `%PATH%` first, then `~\.local\bin`
+  and `%APPDATA%\npm` for the window after an install, and a `.cmd` or `.bat`
+  shim is run through `cmd /c`, which is the only way `CreateProcess` will run
+  one. When there is genuinely no `claude` to run, the log now says so instead
+  of naming a program it never names.
+
 ## v0.5.1 — 2026-08-18
 
 - An out-of-memory kill in one tab no longer closes the whole terminal.

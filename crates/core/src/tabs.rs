@@ -85,6 +85,11 @@ pub struct Workspace {
     /// Rail order within each category (filter by `category`).
     pub tabs: Vec<Tab>,
     pub active: Option<TabId>,
+    /// Tabs used before the active one, most recent first — what Ctrl+Tab
+    /// walks. Kept here rather than in the app so that every way of changing
+    /// tabs feeds it, and so it survives a restart with the tabs themselves.
+    #[serde(default)]
+    recent: Vec<TabId>,
 }
 
 impl Default for Workspace {
@@ -94,6 +99,7 @@ impl Default for Workspace {
             categories: Vec::new(),
             tabs: Vec::new(),
             active: None,
+            recent: Vec::new(),
         };
         ws.add_category("main");
         ws
@@ -171,7 +177,7 @@ impl Workspace {
                 exited: false,
             },
         );
-        self.active = Some(id);
+        self.switch_to(id);
         // A new tab is the active one, and a collapsed category would hide it:
         // the rail would show no selection anywhere while you typed into it.
         // Opening the category is what asking for a tab in it means.
@@ -195,6 +201,9 @@ impl Workspace {
                 .or_else(|| self.tabs.get(pos.wrapping_sub(1)))
                 .map(|t| t.id);
         }
+        // A closed tab is nobody's "previous", and the tab that replaced it
+        // is the current one rather than a step back from it.
+        self.recent.retain(|&x| x != id && Some(x) != self.active);
     }
 
     pub fn tab(&self, id: TabId) -> Option<&Tab> {
@@ -215,8 +224,60 @@ impl Workspace {
 
     pub fn set_active(&mut self, id: TabId) {
         if self.tab(id).is_some() {
+            self.switch_to(id);
+        }
+    }
+
+    /// Make `id` active and push the tab it replaces onto the recency stack.
+    fn switch_to(&mut self, id: TabId) {
+        if self.active == Some(id) {
+            return;
+        }
+        if let Some(prev) = self.active {
+            self.recent.retain(|&x| x != prev);
+            self.recent.insert(0, prev);
+        }
+        self.recent.retain(|&x| x != id);
+        self.active = Some(id);
+    }
+
+    /// Select without disturbing the recency stack, for a Ctrl+Tab walk:
+    /// stepping past a tab is not using it, so the order has to hold still
+    /// until the walk ends. Pair with `commit_switch`.
+    pub fn preview_active(&mut self, id: TabId) {
+        if self.tab(id).is_some() {
             self.active = Some(id);
         }
+    }
+
+    /// End a walk that began on `from`: whatever it landed on is now the
+    /// current tab, and `from` is the one step back from it.
+    pub fn commit_switch(&mut self, from: TabId) {
+        let Some(landed) = self.active else { return };
+        // A tab closed mid-walk is not a step back from anywhere.
+        self.active = self.tab(from).map(|t| t.id);
+        self.switch_to(landed);
+    }
+
+    /// Tabs in most-recently-used order, the active one first, with tabs
+    /// never activated (a restored workspace, before anything is clicked)
+    /// last in rail order.
+    pub fn recent_order(&self) -> Vec<TabId> {
+        let mut out: Vec<TabId> = Vec::with_capacity(self.tabs.len());
+        if let Some(active) = self.active.filter(|&id| self.tab(id).is_some()) {
+            out.push(active);
+        }
+        for &id in &self.recent {
+            if self.tab(id).is_some() && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for tab in &self.tabs {
+            if !out.contains(&tab.id) {
+                out.push(tab.id);
+            }
+        }
+        out
     }
 
     /// Move active selection by `delta` in rail order (wraps).
@@ -230,7 +291,7 @@ impl Workspace {
             .and_then(|id| self.tabs.iter().position(|t| t.id == id))
             .unwrap_or(0) as i32;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.active = Some(self.tabs[next].id);
+        self.switch_to(self.tabs[next].id);
     }
 
     /// Move `id` into `category` at `index` counted among that category's
@@ -325,6 +386,63 @@ mod tests {
 
         ws.close_tab(a);
         assert_eq!(ws.active, None);
+    }
+
+    /// The Ctrl+Tab order: where you were, not where the tab sits in the rail.
+    #[test]
+    fn recency_order_follows_use() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let c = ws.add_tab(cat);
+        // Opening three tabs already ranks them: c is current, then b, then a.
+        assert_eq!(ws.recent_order(), vec![c, b, a]);
+
+        ws.set_active(a);
+        assert_eq!(ws.recent_order(), vec![a, c, b]);
+        ws.set_active(c);
+        assert_eq!(ws.recent_order(), vec![c, a, b], "one press goes back to a");
+    }
+
+    /// A walk shows each tab it passes without counting it as used: only
+    /// where it lands moves to the front, so pressing twice again goes two
+    /// back rather than bouncing between the last two.
+    #[test]
+    fn a_walk_only_records_where_it_lands() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let c = ws.add_tab(cat);
+        let d = ws.add_tab(cat);
+        assert_eq!(ws.recent_order(), vec![d, c, b, a]);
+
+        let from = ws.active.unwrap();
+        let order = ws.recent_order();
+        ws.preview_active(order[1]);
+        ws.preview_active(order[2]);
+        assert_eq!(ws.active, Some(b), "stepped two back");
+        assert_eq!(ws.recent_order()[1], c, "the order held still mid-walk");
+        ws.commit_switch(from);
+        assert_eq!(ws.recent_order(), vec![b, d, c, a]);
+    }
+
+    /// A tab closed during a walk is not somewhere to go back to.
+    #[test]
+    fn closing_clears_the_recency_stack() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        ws.close_tab(a);
+        assert_eq!(ws.recent_order(), vec![b]);
+
+        let c = ws.add_tab(cat);
+        ws.preview_active(b);
+        ws.close_tab(c);
+        ws.commit_switch(c);
+        assert_eq!(ws.recent_order(), vec![b]);
     }
 
     #[test]

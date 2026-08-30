@@ -180,6 +180,34 @@ pub struct BehaviorConfig {
     /// listed is remembered but never re-run — replaying an arbitrary last
     /// command could deploy, delete or push something.
     pub restore_apps: Vec<String>,
+    /// Which shell a new tab opens on Windows. Ignored everywhere else,
+    /// where `$SHELL` answers the question.
+    pub windows_shell: WindowsShell,
+}
+
+/// The shell a Windows tab opens. `Auto` prefers WSL — where Claude Code and
+/// unix tooling usually live — but only when a distribution is installed;
+/// `wsl.exe` exists on every Windows whether or not there is anything behind
+/// it, and a tab spawned into an empty one dies on an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowsShell {
+    #[default]
+    Auto,
+    Wsl,
+    Powershell,
+    Cmd,
+}
+
+impl WindowsShell {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowsShell::Auto => "auto",
+            WindowsShell::Wsl => "wsl",
+            WindowsShell::Powershell => "powershell",
+            WindowsShell::Cmd => "cmd",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +247,7 @@ impl Default for BehaviorConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            windows_shell: WindowsShell::Auto,
         }
     }
 }

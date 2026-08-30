@@ -16,6 +16,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `behavior.notifications` | `true` | Notify when Claude needs you in a background tab. |
 | `behavior.prefer_x11` | `false` | Run under X11/XWayland instead of Wayland. Takes effect on restart. |
 | `behavior.restore_claude` | `"auto"` | Re-run `claude --resume` in restored tabs. One of: auto, prompt, off. |
+| `behavior.windows_shell` | `"auto"` | Which shell a new tab opens on Windows. One of: auto, wsl, powershell, cmd. |
 | `behavior.restore_apps` | 26 programs | Full-screen programs a restored tab may start again by itself. |
 | `behavior.extra_profile_dirs` | `[]` | Account directories kept somewhere Giverny would not find on its own. Takes effect on restart. |
 | `claude.auto_mode` | `false` | Every new Claude session starts in auto mode instead of asking for each permission. |

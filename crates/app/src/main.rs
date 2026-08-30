@@ -25,7 +25,7 @@ use giverny_core::config;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
-use giverny_term::pty::{GridSize, SpawnCfg};
+use giverny_term::pty::{self, GridSize, SpawnCfg};
 use giverny_term::render::theme::Theme;
 use giverny_term::session::TermSession;
 use giverny_term::tee::TeeEvent;
@@ -315,6 +315,8 @@ pub enum Action {
     CloseTab(TabId),
     Select(TabId),
     Cycle(i32),
+    /// Step through recently used tabs (Ctrl+Tab), committing on release.
+    SwitchRecent(i32),
     ToggleCollapse(CategoryId),
     StartRename(RenameTarget),
     CommitRename(RenameTarget, Option<String>),
@@ -347,6 +349,15 @@ pub enum Action {
     /// Attach a tab to a background agent: its directory, its account, its
     /// conversation.
     AttachJob(Box<giverny_claude::jobs::Job>),
+}
+
+/// One Ctrl+Tab walk. The order is snapshotted at the first press so that
+/// stepping through it cannot reshuffle the ground underneath — the walk
+/// ends where Windows ends it, when Ctrl comes up.
+struct Switcher {
+    from: TabId,
+    order: Vec<TabId>,
+    index: usize,
 }
 
 pub struct TabRuntime {
@@ -450,6 +461,9 @@ pub struct App {
     input_seen: HashMap<TabId, u64>,
     /// Tab currently being dragged in the rail.
     pub dragging: Option<TabId>,
+    /// A Ctrl+Tab walk in progress: where it started, the recency order it
+    /// snapshotted, and how far into it the user has stepped.
+    switcher: Option<Switcher>,
     /// Wayland file drops, which winit 0.30 cannot deliver.
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     dnd: Option<wayland_dnd::DragDrop>,
@@ -648,6 +662,7 @@ impl App {
             session_picker: None,
             input_seen: HashMap::new(),
             dragging: None,
+            switcher: None,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
@@ -799,12 +814,15 @@ impl App {
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
+                self.end_switch();
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
                 self.claude.mark_viewed(id);
                 self.focus_terminal = true;
             }
+            Action::SwitchRecent(delta) => self.switch_recent(delta),
             Action::Cycle(delta) => {
+                self.end_switch();
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
@@ -1081,7 +1099,7 @@ impl App {
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
         let cfg = SpawnCfg {
-            shell: None,
+            shell: pty::windows_shell(self.cfg.behavior.windows_shell.as_str()),
             cwd: cwd.clone(),
             env_extra: self.claude_env(),
             tab_id: format!("giverny-{}", id.0),
@@ -1582,6 +1600,47 @@ impl App {
         }
     }
 
+    /// One Ctrl+Tab press: start a walk through the recency order, or step
+    /// further into the one already running. The tab is shown as it is
+    /// stepped past, but nothing is recorded — `end_switch` does that when
+    /// Ctrl comes up, so walking past a tab does not count as using it.
+    fn switch_recent(&mut self, delta: i32) {
+        if self.switcher.is_none() {
+            let Some(from) = self.ws.active else { return };
+            let order = self.ws.recent_order();
+            if order.len() < 2 {
+                return;
+            }
+            self.switcher = Some(Switcher {
+                from,
+                order,
+                index: 0,
+            });
+        }
+        let Some(sw) = self.switcher.as_mut() else {
+            return;
+        };
+        let len = sw.order.len() as i32;
+        sw.index = (sw.index as i32 + delta).rem_euclid(len) as usize;
+        let target = sw.order[sw.index];
+        self.ws.preview_active(target);
+        self.focus_terminal = true;
+        self.state_dirty = true;
+    }
+
+    /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
+    /// and only now does it count as seen.
+    fn end_switch(&mut self) {
+        let Some(sw) = self.switcher.take() else {
+            return;
+        };
+        self.ws.commit_switch(sw.from);
+        if let Some(id) = self.ws.active {
+            self.refresh_tab_info(id);
+            self.claude.mark_viewed(id);
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
@@ -1615,6 +1674,14 @@ impl App {
             // F1 anywhere, and Ctrl+Shift+/ for muscle memory from editors.
             if i.consume_key(Modifiers::NONE, Key::F1) || i.consume_key(cs, Key::Slash) {
                 actions.push(Action::ToggleKeys);
+            }
+            // Ctrl+Tab walks recency, not rail order: one press is "back to
+            // the tab I came from", and holding Ctrl keeps going back.
+            if i.consume_key(cs, Key::Tab) {
+                actions.push(Action::SwitchRecent(-1));
+            }
+            if i.consume_key(Modifiers::CTRL, Key::Tab) {
+                actions.push(Action::SwitchRecent(1));
             }
             if i.consume_key(Modifiers::CTRL, Key::PageDown) {
                 actions.push(Action::Cycle(1));
@@ -1840,6 +1907,19 @@ impl eframe::App for App {
         for action in actions {
             self.apply(&ctx, action);
         }
+
+        // A Ctrl+Tab walk ends the way Alt+Tab does: when Ctrl comes up, or
+        // when the window stops being the one receiving keys at all.
+        if self.switcher.is_some() {
+            let holding = ctx.input(|i| i.modifiers.ctrl && i.focused);
+            if holding {
+                // Modifier releases arrive as events on every platform we
+                // support, but a missed one would strand the walk open.
+                ctx.request_repaint_after(Duration::from_millis(250));
+            } else {
+                self.end_switch();
+            }
+        }
     }
 }
 
@@ -1948,6 +2028,20 @@ fn doctor() {
     }
     if !cfg.behavior.extra_profile_dirs.is_empty() {
         sources.push("config");
+    }
+    // Usage numbers are refreshed by running `claude -p /usage`, so a
+    // Giverny that cannot find claude shows whatever the cache last held and
+    // says nothing about why.
+    match usage::cli_path() {
+        Some(path) => println!("claude       {}\n", path.display()),
+        None => {
+            println!("claude       NOT FOUND on PATH — usage cannot refresh");
+            #[cfg(windows)]
+            println!(
+                "             (a Claude Code installed inside WSL is invisible to a\n                               Windows Giverny — it reads the Windows-side account)"
+            );
+            println!();
+        }
     }
     println!(
         "profiles ({} found via {}):",

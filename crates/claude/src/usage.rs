@@ -136,6 +136,97 @@ pub fn read(config_dir: &Path) -> Option<AccountUsage> {
     })
 }
 
+/// Executable names to try, in the order Windows itself would prefer them.
+/// `.ps1` is deliberately absent: the npm shim by that name needs PowerShell
+/// to run, and the `.cmd` beside it does the same job through `cmd`.
+#[cfg(any(windows, test))]
+const CLAUDE_EXE_NAMES: &[&str] = &["claude.exe", "claude.com", "claude.cmd", "claude.bat"];
+
+/// First of `names` that exists in `dirs`, directories in order and names in
+/// order within each. Kept off `#[cfg(windows)]` so it stays testable here.
+#[cfg(any(windows, test))]
+fn first_program_in(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<std::path::PathBuf> {
+    dirs.iter().find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+/// How to invoke Claude Code as a child process.
+///
+/// Unix needs nothing: `execvp` searches `$PATH` and runs whatever it finds.
+/// Windows resolves far less than it looks like it does — `Command` appends
+/// `.exe` and consults no `%PATHEXT%` — so an npm-installed `claude.cmd`
+/// fails with a bare "program not found", which is what a Windows user gets
+/// instead of usage numbers. Resolve it here instead: `%PATH%` first, then
+/// the two directories the installers actually write to, and run a batch
+/// shim through `cmd /c` because `CreateProcess` cannot execute one.
+#[cfg(not(windows))]
+fn claude_command() -> anyhow::Result<std::process::Command> {
+    Ok(std::process::Command::new("claude"))
+}
+
+/// Where Windows would find `claude`: `%PATH%`, then the directories Claude
+/// Code's own installers write to — for the window between installing it and
+/// whatever started Giverny picking up the new `%PATH%`.
+#[cfg(windows)]
+fn search_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("npm"));
+    }
+    dirs
+}
+
+/// The `claude` Giverny would run, for `giverny doctor` to name. On unix the
+/// spawn leaves the search to `execvp`, so this walks `$PATH` itself purely
+/// to have something to print.
+pub fn cli_path() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        first_program_in(&search_dirs(), CLAUDE_EXE_NAMES)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("claude"))
+                .find(|path| path.is_file())
+        })
+    }
+}
+
+#[cfg(windows)]
+fn claude_command() -> anyhow::Result<std::process::Command> {
+    use std::process::Command;
+
+    let Some(exe) = first_program_in(&search_dirs(), CLAUDE_EXE_NAMES) else {
+        anyhow::bail!(
+            "claude is not on %PATH% (looked for {})",
+            CLAUDE_EXE_NAMES.join(", ")
+        );
+    };
+    let batch = exe
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if batch {
+        // A batch file is not an executable; its interpreter has to run it.
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/c").arg(exe);
+        Ok(cmd)
+    } else {
+        Ok(Command::new(exe))
+    }
+}
+
 /// Ask Claude Code to refresh its own usage cache for one account.
 ///
 /// `claude -p /usage` performs the fetch Claude would do interactively and
@@ -144,10 +235,10 @@ pub fn read(config_dir: &Path) -> Option<AccountUsage> {
 /// own: the first-party client does it, we just ask.
 ///
 /// Blocking (seconds); call from a background thread. Failure is normal —
-/// a logged-out account, no `claude` on PATH — and is not worth surfacing.
+/// a logged-out account, no `claude` installed — and is not worth surfacing.
 pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("claude")
+    use std::process::Stdio;
+    let mut child = claude_command()?
         .arg("-p")
         .arg("/usage")
         .env("CLAUDE_CONFIG_DIR", config_dir)
@@ -157,7 +248,8 @@ pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("cannot run claude: {e}"))?;
 
     // Bounded wait: a hung refresh must not leak a process forever.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -244,5 +336,36 @@ mod tests {
     fn tolerates_missing_cache() {
         let parsed: CacheFile = serde_json::from_str(r#"{"oauthAccount":{}}"#).unwrap();
         assert!(parsed.cached.is_none());
+    }
+
+    /// The Windows lookup Rust's own `Command` does not do: an npm shim is
+    /// found, and a directory earlier on `%PATH%` wins over a later one.
+    #[test]
+    fn finds_a_shim_and_respects_path_order() {
+        let root = std::env::temp_dir().join(format!("giverny-exe-{}", std::process::id()));
+        let (first, second) = (root.join("first"), root.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let dirs = vec![first.clone(), second.clone()];
+
+        assert!(
+            first_program_in(&dirs, CLAUDE_EXE_NAMES).is_none(),
+            "nothing installed"
+        );
+
+        std::fs::write(second.join("claude.cmd"), "").unwrap();
+        assert_eq!(
+            first_program_in(&dirs, CLAUDE_EXE_NAMES),
+            Some(second.join("claude.cmd")),
+            "an npm .cmd shim counts as claude"
+        );
+
+        std::fs::write(first.join("claude.exe"), "").unwrap();
+        assert_eq!(
+            first_program_in(&dirs, CLAUDE_EXE_NAMES),
+            Some(first.join("claude.exe")),
+            "the earlier directory wins"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

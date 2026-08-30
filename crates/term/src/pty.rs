@@ -108,11 +108,43 @@ pub fn resolve_shell(cfg: &SpawnCfg) -> Shell {
             ("pwsh.exe", vec![]),
             ("powershell.exe", vec![]),
         ] {
+            if prog == "wsl.exe" && !wsl_ready() {
+                continue;
+            }
             if which_windows(prog) {
                 return Shell::new(prog.to_string(), args);
             }
         }
         Shell::new("powershell.exe".into(), vec![])
+    }
+}
+
+/// A named Windows shell as `(program, args)`, for `SpawnCfg::shell`.
+/// `None` for `auto` — and for every value off Windows, where the shell is
+/// `$SHELL` and this is not a question anyone is asked.
+pub fn windows_shell(pref: &str) -> Option<(String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        match pref {
+            "wsl" => Some(("wsl.exe".to_string(), vec!["~".to_string()])),
+            // PowerShell 7 where it is installed, the one in the box where
+            // it is not; both answer to "powershell".
+            "powershell" => Some((
+                if which_windows("pwsh.exe") {
+                    "pwsh.exe".to_string()
+                } else {
+                    "powershell.exe".to_string()
+                },
+                vec![],
+            )),
+            "cmd" => Some(("cmd.exe".to_string(), vec![])),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pref;
+        None
     }
 }
 
@@ -122,6 +154,33 @@ fn which_windows(prog: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(prog).is_file()))
         .unwrap_or(false)
+}
+
+/// Does WSL have anything to run?
+///
+/// `wsl.exe` ships with Windows whether or not a distribution is installed,
+/// so finding it on `%PATH%` proves nothing: a tab spawned into an empty WSL
+/// prints "no installed distributions" and exits, which is not a terminal.
+/// Asked once per run — the answer only changes when someone installs one.
+#[cfg(windows)]
+fn wsl_ready() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::sync::OnceLock;
+    /// CREATE_NO_WINDOW: no console flashes up in front of the app.
+    const NO_WINDOW: u32 = 0x0800_0000;
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| {
+        // `wsl -l -q` lists installed distributions, in UTF-16, and fails
+        // outright when there are none.
+        let Ok(out) = std::process::Command::new("wsl.exe")
+            .args(["-l", "-q"])
+            .creation_flags(NO_WINDOW)
+            .output()
+        else {
+            return false;
+        };
+        out.status.success() && out.stdout.iter().any(|b| !matches!(b, 0 | b'\r' | b'\n'))
+    })
 }
 
 /// Spawn the PTY for a tab. `window_id` feeds `WINDOWID`/utmp bookkeeping.

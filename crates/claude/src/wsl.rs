@@ -99,6 +99,92 @@ pub fn canonical_config_dir(reported: &Path, known: &[PathBuf]) -> Option<PathBu
         .cloned()
 }
 
+/// Where each Giverny tab's shell is, inside every distribution:
+/// `(tab id, unix path)`.
+///
+/// A tab inside WSL had no source for this at all. Windows can see `wsl.exe`'s
+/// own working directory and nothing about the shell it started; `/proc` is on
+/// the other side; and a WSL bash emits no OSC 7 unless something configured
+/// it to. The distribution can answer for itself: every process Giverny
+/// started carries `GIVERNY_TAB_ID` in its environment, and `/proc` has the
+/// rest. One `wsl.exe` per distribution answers for every tab at once.
+pub fn tab_cwds() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for distro in distros() {
+            if let Some(text) = imp::capture_sh(&distro, TAB_CWD_SCRIPT) {
+                out.extend(parse_tab_cwds(&text));
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Every process that belongs to a tab, with its parent and its directory.
+/// `sh`, not `bash`: this runs in whatever the distribution has.
+#[cfg(any(windows, test))]
+const TAB_CWD_SCRIPT: &str = r#"for d in /proc/[0-9]*; do
+id=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^GIVERNY_TAB_ID=//p' | head -n1)
+[ -n "$id" ] || continue
+cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
+[ -n "$cwd" ] || continue
+ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "$d/status" 2>/dev/null)
+printf '%s\t%s\t%s\t%s\n' "$id" "${d#/proc/}" "$ppid" "$cwd"
+done"#;
+
+/// One directory per tab, from the script's per-process lines.
+///
+/// A tab holds a tree — the login shell, claude, whatever claude ran — and
+/// they are in different directories. The shell is the one to report: it is
+/// the root of the tree, the process whose parent is not also in it.
+#[cfg(any(windows, test))]
+fn parse_tab_cwds(text: &str) -> Vec<(String, String)> {
+    struct Row<'a> {
+        tab: &'a str,
+        pid: &'a str,
+        ppid: &'a str,
+        cwd: &'a str,
+    }
+    let rows: Vec<Row> = text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            Some(Row {
+                tab: parts.next()?,
+                pid: parts.next()?,
+                ppid: parts.next()?,
+                // A directory may contain anything but a tab, which is why it
+                // is last and why the split is bounded.
+                cwd: parts.next()?,
+            })
+        })
+        .filter(|r| !r.tab.is_empty() && r.cwd.starts_with('/'))
+        .collect();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for row in &rows {
+        if out.iter().any(|(tab, _)| tab == row.tab) {
+            continue;
+        }
+        let root = rows
+            .iter()
+            .filter(|r| r.tab == row.tab)
+            .find(|r| {
+                !rows
+                    .iter()
+                    .any(|other| other.tab == r.tab && other.pid == r.ppid)
+            })
+            .unwrap_or(row);
+        out.push((root.tab.to_string(), root.cwd.to_string()));
+    }
+    out
+}
+
 /// Installed distributions. Empty off Windows.
 pub fn distros() -> Vec<String> {
     #[cfg(windows)]
@@ -180,6 +266,11 @@ mod imp {
             .creation_flags(NO_WINDOW)
             .stdin(Stdio::null());
         cmd
+    }
+
+    /// Run a shell script inside `distro` and return its stdout.
+    pub fn capture_sh(distro: &str, script: &str) -> Option<String> {
+        capture(distro, &["sh", "-c", script])
     }
 
     /// Run something inside `distro` and return its stdout, trimmed.
@@ -371,6 +462,59 @@ mod tests {
             canonical_config_dir(Path::new("/home/itay/.claude-work"), &known),
             None
         );
+    }
+
+    /// A tab is a tree of processes in different directories; the shell at
+    /// the root of it is the tab's place.
+    #[test]
+    fn a_tabs_directory_is_its_shells() {
+        let text = "giverny-3\t900\t1\t/home/ita/proj\n\
+                    giverny-3\t901\t900\t/home/ita/proj/src\n\
+                    giverny-3\t902\t901\t/tmp\n\
+                    giverny-7\t950\t1\t/home/ita\n";
+        let mut found = parse_tab_cwds(text);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("giverny-3".to_string(), "/home/ita/proj".to_string()),
+                ("giverny-7".to_string(), "/home/ita".to_string()),
+            ]
+        );
+    }
+
+    /// The script is only ever run by a distribution, which means a syntax
+    /// error in it is invisible until someone with WSL hits it. Any unix can
+    /// run it: what it finds here does not matter, that it runs does.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_script_runs() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(TAB_CWD_SCRIPT)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        for (tab, cwd) in parse_tab_cwds(&text) {
+            assert!(!tab.is_empty());
+            assert!(cwd.starts_with('/'), "{cwd}");
+        }
+    }
+
+    /// A directory with a space in it is still one field.
+    #[test]
+    fn directories_with_spaces_survive_parsing() {
+        let found = parse_tab_cwds("giverny-1\t5\t1\t/home/ita/my proj\n");
+        assert_eq!(
+            found,
+            vec![("giverny-1".into(), "/home/ita/my proj".into())]
+        );
+        assert!(parse_tab_cwds("nonsense\n").is_empty());
     }
 
     #[test]

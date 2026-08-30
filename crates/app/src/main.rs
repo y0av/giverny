@@ -491,6 +491,10 @@ pub struct App {
     /// Every live claude session started before hooks/statusline were
     /// installed, so none of them report anything (recomputed periodically).
     pub stale_sessions: bool,
+    /// Directories for tabs inside WSL, asked of the distribution itself
+    /// because nothing on this side of the boundary knows them.
+    wsl_cwd_rx: Option<crossbeam_channel::Receiver<Vec<(String, String)>>>,
+    last_wsl_probe: Instant,
     /// A newer release, once the background check finds one.
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
@@ -777,6 +781,8 @@ impl App {
             drag_hover: None,
             row_rects: Vec::new(),
             stale_sessions: false,
+            wsl_cwd_rx: None,
+            last_wsl_probe: Instant::now() - Duration::from_secs(60),
             update: None,
             update_rx,
             update_dismissed: false,
@@ -1304,6 +1310,53 @@ impl App {
         }
     }
 
+    /// Ask each distribution where its tabs are, and apply the last answer.
+    ///
+    /// The equivalent of the `/proc` read below, for tabs whose `/proc` is on
+    /// the other side of the boundary. It costs a `wsl.exe` launch, so it runs
+    /// on its own slower clock and off the UI thread; the tab that moved a
+    /// second ago is not urgent, the tab that reopens tomorrow in the right
+    /// place is the point.
+    fn probe_wsl_cwds(&mut self) {
+        if let Some(rx) = &self.wsl_cwd_rx
+            && let Ok(found) = rx.try_recv()
+        {
+            self.wsl_cwd_rx = None;
+            for (tab, cwd) in found {
+                let Some(id) = tab
+                    .strip_prefix("giverny-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .map(TabId)
+                else {
+                    continue;
+                };
+                if let Some(tab) = self.ws.tab_mut(id)
+                    && tab.cwd.as_deref() != Some(Path::new(&cwd))
+                {
+                    tab.cwd = Some(PathBuf::from(cwd));
+                    self.state_dirty = true;
+                }
+            }
+        }
+        if self.wsl_cwd_rx.is_some() || self.last_wsl_probe.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_wsl_probe = Instant::now();
+        if wsl::distros().is_empty() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if std::thread::Builder::new()
+            .name("giverny wsl cwd".into())
+            .spawn(move || {
+                let _ = tx.send(wsl::tab_cwds());
+            })
+            .is_ok()
+        {
+            self.wsl_cwd_rx = Some(rx);
+        }
+    }
+
     /// Refresh cwd (via /proc) and git branch for one tab.
     fn refresh_tab_info(&mut self, id: TabId) {
         let pid = self
@@ -1565,6 +1618,7 @@ impl App {
         self.persist_font_size();
         self.track_foreground();
         self.stale_sessions = self.claude.sessions_predate_settings();
+        self.probe_wsl_cwds();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
         self.claude
             .refresh_stale_usage(self.cfg.usage.refresh_minutes, false);

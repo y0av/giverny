@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.6 — 2026-08-30
+
+- A tab inside WSL now has a directory to remember. v0.5.5 taught tabs to
+  reopen where they were, which did nothing, because nothing on the Windows
+  side ever learned where that was: `/proc` is on the other side of the
+  boundary, `wsl.exe`'s own working directory is not the shell's, and a WSL
+  bash emits no OSC 7 unless something configured it to. The distribution is
+  asked instead — every process Giverny starts carries `GIVERNY_TAB_ID` in its
+  environment, so one `sh` per distribution reports where each tab's shell is.
+  It runs every five seconds, off the UI thread, and costs nothing on a
+  machine with no distributions.
+
 ## v0.5.5 — 2026-08-30
 
 - A tab inside WSL reopens where it was, instead of going home every time. A

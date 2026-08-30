@@ -154,18 +154,17 @@ fn first_program_in(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<std::
     })
 }
 
-/// How to invoke Claude Code as a child process.
+/// The command that asks Claude Code to refresh one account's cache, with
+/// the account already named.
 ///
-/// Unix needs nothing: `execvp` searches `$PATH` and runs whatever it finds.
-/// Windows resolves far less than it looks like it does — `Command` appends
-/// `.exe` and consults no `%PATHEXT%` — so an npm-installed `claude.cmd`
-/// fails with a bare "program not found", which is what a Windows user gets
-/// instead of usage numbers. Resolve it here instead: `%PATH%` first, then
-/// the two directories the installers actually write to, and run a batch
-/// shim through `cmd /c` because `CreateProcess` cannot execute one.
+/// Unix needs nothing: `execvp` searches `$PATH` and the environment carries
+/// the config dir. Windows needs both halves spelled out — see the Windows
+/// implementation below.
 #[cfg(not(windows))]
-fn claude_command() -> anyhow::Result<std::process::Command> {
-    Ok(std::process::Command::new("claude"))
+fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    Ok(cmd)
 }
 
 /// Where Windows would find `claude`: `%PATH%`, then the directories Claude
@@ -204,9 +203,31 @@ pub fn cli_path() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Windows resolves far less than it looks like it does: `Command` appends
+/// `.exe` and consults no `%PATHEXT%`, so an npm-installed `claude.cmd` fails
+/// with a bare "program not found", and `CreateProcess` will not execute a
+/// batch file even when handed its full path. And on most Windows machines
+/// the account being refreshed is not a Windows account at all — it lives in
+/// a WSL distribution, where the program to run, the path to the config dir
+/// and the environment that names it are all on the other side of a boundary
+/// that nothing crosses by itself.
 #[cfg(windows)]
-fn claude_command() -> anyhow::Result<std::process::Command> {
+fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
     use std::process::Command;
+
+    if let Some((distro, unix_dir)) = crate::wsl::split_unc(config_dir) {
+        let Some(bin) = crate::wsl::claude_bin(&distro) else {
+            anyhow::bail!("claude is not installed in WSL ({distro})");
+        };
+        let mut cmd = crate::wsl::command(&distro);
+        // `env` rather than `Command::env`: a Windows environment does not
+        // reach a process inside the distribution.
+        cmd.arg("--")
+            .arg("env")
+            .arg(format!("CLAUDE_CONFIG_DIR={unix_dir}"))
+            .arg(bin);
+        return Ok(cmd);
+    }
 
     let Some(exe) = first_program_in(&search_dirs(), CLAUDE_EXE_NAMES) else {
         anyhow::bail!(
@@ -217,14 +238,16 @@ fn claude_command() -> anyhow::Result<std::process::Command> {
     let batch = exe
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-    if batch {
+    let mut cmd = if batch {
         // A batch file is not an executable; its interpreter has to run it.
         let mut cmd = Command::new("cmd.exe");
         cmd.arg("/c").arg(exe);
-        Ok(cmd)
+        cmd
     } else {
-        Ok(Command::new(exe))
-    }
+        Command::new(exe)
+    };
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    Ok(cmd)
 }
 
 /// Ask Claude Code to refresh its own usage cache for one account.
@@ -236,12 +259,12 @@ fn claude_command() -> anyhow::Result<std::process::Command> {
 ///
 /// Blocking (seconds); call from a background thread. Failure is normal —
 /// a logged-out account, no `claude` installed — and is not worth surfacing.
+/// An account inside WSL is refreshed inside WSL; see `refresh_command`.
 pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
     use std::process::Stdio;
-    let mut child = claude_command()?
+    let mut child = refresh_command(config_dir)?
         .arg("-p")
         .arg("/usage")
-        .env("CLAUDE_CONFIG_DIR", config_dir)
         // Never let it inherit a tab's identity: this is not a tab session.
         .env_remove("GIVERNY_TAB_ID")
         .env_remove("GIVERNY_NONCE")

@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.5.3 — 2026-08-30
+
+- A Claude Code that lives inside WSL is a Claude Code Giverny can see. On
+  Windows it is the normal setup — Giverny opens tabs in a WSL login shell,
+  and everything the agent writes lands in that distribution's `~/.claude`,
+  which is a different directory from the `~/.claude` on the Windows side that
+  Giverny was reading. The account looked empty, the meters had nothing to
+  show, and `claude -p /usage` had no program to run: "usage refresh skipped:
+  claude is not on %PATH%".
+
+  Accounts inside distributions are now found by asking `wsl.exe` what it has
+  and each distribution where its home is, and read straight off
+  `\\wsl.localhost\<distro>\home\<user>\.claude`. Refreshing runs `claude`
+  inside the distribution. Hooks and the statusline install a command the
+  distribution can execute — this binary, through `/mnt/c/…`, asked of
+  `wslpath` rather than assumed — and the tab identity crosses both ways
+  through `%WSLENV%`, so a hook fired in WSL reaches the Windows app and lands
+  on the right tab. A tab whose category names such an account opens in that
+  account's distribution, and sessions are named the unix path they can open
+  while Giverny keeps storing the Windows one. Nothing to configure: update
+  and the account appears.
+
+  Still not the API. Usage comes from Claude Code's own cache, refreshed by
+  asking Claude Code — no credential is read and no request is made, which
+  stays true whichever side of the boundary the account is on.
+
+- The identity file is found by layout rather than by whose home it is. A
+  directory named `.claude` keeps it beside itself (`~/.claude.json`); a named
+  `CLAUDE_CONFIG_DIR` keeps it inside. The rule was "is this exactly my own
+  `~/.claude`", which no account inside WSL can ever be. The order is deliberate
+  where both files exist: a home that once ran with `CLAUDE_CONFIG_DIR` pointed
+  at its own `~/.claude` has an inner file left over and months stale.
+
+- Session liveness for an account inside WSL is the registry file's own
+  freshness, not its pid. The pids in it are another machine's, and a
+  collision with a Windows pid is enough to refuse to restore a tab.
+
+- Picking a tab leaves the settings screen and the key list. They take the
+  terminal's place, so clicking a tab in the rail with either open looked like
+  a click that did nothing, and the only way out was the button that opened it.
+
+- `giverny doctor` reports the WSL side: every distribution, the `claude` it
+  found there, and the account directory.
+
 ## v0.5.2 — 2026-08-30
 
 - The shell a tab opens on Windows is a setting, `behavior.windows_shell`:

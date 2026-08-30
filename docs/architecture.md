@@ -59,13 +59,13 @@ Window size, maximized state and rail width live in the same file under `layout`
 Two independent state sources, merged per tab:
 
 1. **Hooks** (rich, crisp): `giverny relay` registered for `SessionStart / UserPromptSubmit / Stop / Notification / SessionEnd`. The relay forwards stdin JSON + `$GIVERNY_TAB_ID` + `$CLAUDE_CONFIG_DIR` to a unix socket, spooling to disk when the app is closed. `notification_type` taxonomy: `permission_prompt`/`elicitation_dialog`/`agent_needs_input` ⇒ **needs-you**; `idle_prompt`/`agent_completed`/`task_completed` ⇒ done.
-2. **Registry** (zero-config baseline): `$CONFIG_DIR/sessions/<pid>.json`, written by Claude Code itself (`status: busy|idle`), PID-liveness-gated, mapped to tabs by walking `/proc` parent chains to the tab's shell.
+2. **Registry** (zero-config baseline): `$CONFIG_DIR/sessions/<pid>.json`, written by Claude Code itself (`status: busy|idle`), PID-liveness-gated, mapped to tabs by walking `/proc` parent chains to the tab's shell. For an account inside WSL the pids are another machine's, so liveness there is the entry file's own freshness instead.
 
 Hook-set attention states are stickier than registry state; done-markers clear when the user views the tab.
 
 **Resume**: tabs persist `(claude_session, claude_config_dir)`. Restore injects `CLAUDE_CONFIG_DIR=… command claude --resume <uuid>` after a settle delay (`command` bypasses shell wrapper functions), guarded by a registry check so a session live in another terminal is never double-resumed (double-resume interleaves one transcript — documented Claude Code behavior).
 
-**Usage**: parsed from `.claude.json → cachedUsageUtilization.limits[]` only (kind `session`/`weekly_all`/`weekly_scoped`, scoped model names like *Fable*, server-side `severity`). Windows whose `resets_at` has passed render 0% (verified server quirk: lapsed windows keep stale percentages). No network, no tokens — and deliberately no `/api/oauth/usage` polling (unsupported endpoint, ToS-exposed) and **never** an OAuth refresh (refresh tokens are single-use; a third-party refresh force-logs-out Claude Code).
+**Usage**: parsed from `.claude.json → cachedUsageUtilization.limits[]` only (kind `session`/`weekly_all`/`weekly_scoped`, scoped model names like *Fable*, server-side `severity`). Windows whose `resets_at` has passed render 0% (verified server quirk: lapsed windows keep stale percentages). No network, no tokens — and deliberately no `/api/oauth/usage` polling (unsupported endpoint, ToS-exposed) and **never** an OAuth refresh (refresh tokens are single-use; a third-party refresh force-logs-out Claude Code). Refreshing means asking Claude Code to do it: `claude -p /usage`, run wherever that account's Claude Code lives — inside the distribution, for an account in WSL.
 
 ## Threading
 

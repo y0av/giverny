@@ -59,6 +59,8 @@ Giverny checks GitHub once a day for a newer release and offers a one-click upda
 
 Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
 
+On Windows, an account that lives inside WSL is treated as an account: it is discovered there, its usage is refreshed by running `claude` inside the distribution, and its hooks call back out to Giverny. Tabs for it open in the distribution it belongs to. `behavior.windows_shell` decides what everything else opens, and `giverny doctor` prints what was found in each distribution.
+
 ## Keys
 
 | Chord | Action |

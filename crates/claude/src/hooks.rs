@@ -205,10 +205,55 @@ pub fn relay_command() -> String {
     format!("{} relay", exe_path())
 }
 
+/// The hook command to write into one account's `settings.json`.
+///
+/// A settings file inside a WSL distribution is read by a Claude Code running
+/// inside it, so the command has to name something that distribution can
+/// execute. It can execute this very binary — Windows programs run from WSL
+/// through interop — and a relay running as a Windows process then writes to
+/// the same spool the app already watches, with no second transport to build.
+/// What does not cross by itself is the environment: `GIVERNY_TAB_ID` reaches
+/// it through `WSLENV`, which the tab sets when it spawns.
+pub fn relay_command_for(settings_path: &Path) -> String {
+    format!("{} relay", exe_for(settings_path))
+}
+
+/// The statusline command for one account's `settings.json`.
+pub fn statusline_command_for(settings_path: &Path) -> String {
+    format!("{} statusline", exe_for(settings_path))
+}
+
 fn exe_path() -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "giverny".into())
+}
+
+/// How this binary is named to whoever will run the hook.
+fn exe_for(settings_path: &Path) -> String {
+    #[cfg(windows)]
+    if let Some((distro, _)) = crate::wsl::split_unc(settings_path)
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(inside) = crate::wsl::to_wsl_path(&distro, &exe)
+    {
+        return shell_quote(&inside);
+    }
+    let _ = settings_path;
+    exe_path()
+}
+
+/// A path as one word for the shell Claude Code runs hook commands with.
+/// Windows paths under `/mnt/c` land in `Program Files` often enough that
+/// this is not hypothetical.
+#[cfg(windows)]
+fn shell_quote(path: &str) -> String {
+    if path
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | '~'))
+    {
+        return path.to_string();
+    }
+    format!("'{}'", path.replace('\'', r"'\''"))
 }
 
 /// Synthetic event name for statusline pushes (not a Claude hook event).
@@ -305,7 +350,7 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
             "statusLine".into(),
             serde_json::json!({
                 "type": "command",
-                "command": format!("{} statusline", exe_path()),
+                "command": statusline_command_for(settings_path),
                 "padding": 0,
             }),
         );
@@ -438,7 +483,7 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
     let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    let want_relay = relay_command();
+    let want_relay = relay_command_for(settings_path);
     let hooks_stale = root
         .get("hooks")
         .and_then(|h| h.as_object())
@@ -457,7 +502,7 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
                 })
             })
         });
-    let want_statusline = format!("{} statusline", exe_path());
+    let want_statusline = statusline_command_for(settings_path);
     let statusline_stale = root
         .get("statusLine")
         .and_then(|s| s.get("command"))
@@ -484,7 +529,7 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
         let _ = std::fs::copy(settings_path, &backup);
     }
 
-    let command = relay_command();
+    let command = relay_command_for(settings_path);
     let mut changed = false;
     let hooks = root
         .as_object_mut()
@@ -549,6 +594,20 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off Windows — and for a Windows account that is not inside a
+    /// distribution — the command is this binary, named as it always was.
+    #[test]
+    fn the_hook_command_names_this_binary() {
+        let settings = std::env::temp_dir().join("giverny-hookcmd/settings.json");
+        assert_eq!(relay_command_for(&settings), relay_command());
+        assert!(relay_command_for(&settings).trim_end().ends_with("relay"));
+        assert!(
+            statusline_command_for(&settings)
+                .trim_end()
+                .ends_with("statusline")
+        );
+    }
 
     #[test]
     fn auto_mode_is_written_and_taken_back() {

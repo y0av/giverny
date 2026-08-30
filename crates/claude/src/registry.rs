@@ -61,6 +61,25 @@ pub struct LiveSession {
     pub config_dir: PathBuf,
 }
 
+/// Is the session behind this entry still running?
+///
+/// A pid only means something on the machine that issued it. An account
+/// inside WSL, read from Windows, hands us Linux pids: checking those against
+/// the Windows process table is not a weaker answer, it is an unrelated one —
+/// and a collision would claim a long-dead session is live, which is enough
+/// to refuse to restore a tab. The file's own freshness is the signal that
+/// survives the crossing: Claude Code rewrites it on every state change, so
+/// anything anyone is actually using stays warm.
+fn entry_is_live(config_dir: &Path, path: &Path, entry: &SessionEntry) -> bool {
+    if crate::wsl::is_wsl_path(config_dir) {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(120);
+        return std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < FRESH));
+    }
+    pid_alive(entry.pid)
+}
+
 fn pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -103,7 +122,7 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
             let Ok(entry) = serde_json::from_slice::<SessionEntry>(&bytes) else {
                 continue;
             };
-            if pid_alive(entry.pid) {
+            if entry_is_live(&dir, &path, &entry) {
                 out.push(LiveSession {
                     entry,
                     config_dir: dir.clone(),

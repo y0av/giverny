@@ -148,6 +148,27 @@ pub fn windows_shell(pref: &str) -> Option<(String, Vec<String>)> {
     }
 }
 
+/// Will a tab with this shell preference open a WSL shell?
+///
+/// The app has to know *before* spawning: an account inside a distribution
+/// has to be named in that distribution's terms, and the tab identity has to
+/// be listed in `%WSLENV%` to cross with it.
+pub fn opens_wsl(pref: &str) -> bool {
+    #[cfg(windows)]
+    {
+        match pref {
+            "wsl" => true,
+            "auto" => wsl_ready() && which_windows("wsl.exe"),
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pref;
+        false
+    }
+}
+
 /// Is `prog` resolvable on `%PATH%`?
 #[cfg(windows)]
 fn which_windows(prog: &str) -> bool {

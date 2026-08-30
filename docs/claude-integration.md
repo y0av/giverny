@@ -23,6 +23,18 @@ Authority is **per tab**: the registry drives a tab's state until that tab's ses
 
 **Hooks load when a session starts.** After installing, restart `claude` in a tab for hook-driven states.
 
+## Accounts inside WSL (Windows)
+
+On Windows, Claude Code usually lives in a WSL distribution, and `~/.claude` there is a different directory from `~/.claude` on the Windows side. Giverny treats the WSL one as the account it is:
+
+- **Found** by asking `wsl.exe` for its distributions and each one for its home, then reading `\\wsl.localhost\<distro>\home\<user>\.claude` — everything Giverny reads (identity, usage cache, session registry, `settings.json`) is ordinary file IO over that share.
+- **Refreshed** by running `claude` *inside* the distribution (`wsl.exe -d <distro> -- env CLAUDE_CONFIG_DIR=… claude -p /usage`), since a Windows `claude` either does not exist or is a different installation.
+- **Hooked** by writing a command the distribution can run: this binary, named as `/mnt/c/…/giverny.exe` (asked of `wslpath`, never assumed). Windows programs run from WSL, so the relay executes as a Windows process and writes to the spool the app already watches — no second transport.
+- **Identified** across the boundary by `%WSLENV%`, which is what carries `GIVERNY_TAB_ID` into the session and back out with the hook. Without it the relay would see no tab and drop the event.
+- **Named** twice on purpose: sessions are told the unix path (`/home/x/.claude`), everything Giverny stores uses the Windows path, and each reported `CLAUDE_CONFIG_DIR` is translated back at the boundary.
+
+A tab whose category names a WSL account opens in that account's distribution. `giverny doctor` prints, per distribution, the `claude` it found and the account directory.
+
 ## Resume
 
 Tabs remember `(session id, config dir)`. On restore Giverny finds the transcript on disk (searching every profile, so a lost account association self-heals), reads the conversation's own recorded `cwd` from it, and injects:

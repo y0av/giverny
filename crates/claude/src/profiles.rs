@@ -34,14 +34,31 @@ struct OauthAccount {
 }
 
 /// Where a config dir keeps its identity file.
+///
+/// Claude Code puts it *beside* a default `~/.claude` and *inside* a
+/// `CLAUDE_CONFIG_DIR`. Which layout applies is a property of the directory
+/// rather than of whose home it is — an account in a WSL distribution, named
+/// from Windows as `\\wsl.localhost\Ubuntu\home\x\.claude`, is the default
+/// layout in that distribution and no `home_dir()` comparison here will ever
+/// say so. A directory named `.claude` is the default layout, wherever it is.
+///
+/// The order matters, not just the existence: a home that once ran with
+/// `CLAUDE_CONFIG_DIR` pointed at its own `~/.claude` has *both* files, the
+/// inner one months stale. Preferring it would show usage from whenever that
+/// experiment ended.
 pub fn identity_path(config_dir: &Path) -> PathBuf {
-    let is_default = dirs::home_dir().is_some_and(|h| h.join(".claude") == config_dir);
-    if is_default {
-        // Sibling: ~/.claude.json
-        config_dir.with_extension("json")
+    let inside = config_dir.join(".claude.json");
+    let beside = config_dir.with_extension("json");
+    let default_layout = config_dir.file_name().is_some_and(|n| n == ".claude");
+    let (first, second) = if default_layout {
+        (beside, inside)
     } else {
-        config_dir.join(".claude.json")
+        (inside, beside)
+    };
+    if !first.is_file() && second.is_file() {
+        return second;
     }
+    first
 }
 
 fn read_identity(config_dir: &Path) -> (Option<String>, Option<String>) {
@@ -133,6 +150,13 @@ pub fn ambient_dirs() -> Vec<PathBuf> {
     }
     out.extend(
         scan_candidates()
+            .into_iter()
+            .filter(|d| looks_like_account(d)),
+    );
+    // Accounts inside WSL: a Windows home directory cannot see them, and on
+    // most Windows machines they are the only place Claude Code runs.
+    out.extend(
+        crate::wsl::account_dirs()
             .into_iter()
             .filter(|d| looks_like_account(d)),
     );
@@ -264,6 +288,41 @@ mod tests {
         assert_eq!(identity_path(&default), home.join(".claude.json"));
         let custom = home.join("envs/x/claude");
         assert_eq!(identity_path(&custom), custom.join(".claude.json"));
+    }
+
+    /// A `.claude` anywhere is the default layout — which is how an account
+    /// inside WSL, addressed from Windows, is found at all.
+    #[test]
+    fn a_dot_claude_anywhere_keeps_its_identity_beside_it() {
+        let root = scratch("layouts");
+        let dir = root.join("home").join("itay").join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let beside = dir.with_extension("json");
+        std::fs::write(
+            &beside,
+            r#"{"oauthAccount":{"emailAddress":"itay@example.com","accountUuid":"u-9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(identity_path(&dir), beside);
+        assert_eq!(profile_for(dir.clone()).name, "itay");
+
+        // Both present: the sibling still wins, because the inner file is
+        // the leftover of a CLAUDE_CONFIG_DIR that pointed here once.
+        std::fs::write(dir.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        assert_eq!(identity_path(&dir), beside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A named config dir keeps it inside, even when something happens to
+    /// sit beside it.
+    #[test]
+    fn a_named_config_dir_keeps_its_identity_inside() {
+        let root = scratch("inside");
+        let dir = root.join("work");
+        account(&dir, "sam@example.com");
+        std::fs::write(root.join("work.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        assert_eq!(identity_path(&dir), dir.join(".claude.json"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

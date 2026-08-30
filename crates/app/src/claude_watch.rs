@@ -14,6 +14,7 @@ use giverny_claude::jobs::{self, Job};
 use giverny_claude::profiles::{self, Profile};
 use giverny_claude::registry;
 use giverny_claude::usage::{self, AccountUsage};
+use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -276,6 +277,16 @@ impl ClaudeWatch {
         profiles::find(&self.profiles, dir).map(|p| p.name.clone())
     }
 
+    /// The profile directory a session means by the `CLAUDE_CONFIG_DIR` it
+    /// reports. A session inside WSL reports the path it can open
+    /// (`/home/x/.claude`); profiles here are keyed by the path Windows can
+    /// open. Anything else passes through unchanged.
+    fn canonical_dir(&self, reported: Option<&str>) -> Option<PathBuf> {
+        let reported = PathBuf::from(reported?);
+        let known: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+        Some(wsl::canonical_config_dir(&reported, &known).unwrap_or(reported))
+    }
+
     /// Apply one hook message. `active` = the currently focused tab.
     pub fn handle_msg(
         &mut self,
@@ -292,7 +303,8 @@ impl ClaudeWatch {
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
-        let account = self.account_of(msg.config_dir.as_deref().map(Path::new));
+        let config_dir = self.canonical_dir(msg.config_dir.as_deref());
+        let account = self.account_of(config_dir.as_deref());
         let entry = self.tabs.entry(tab_id).or_default();
         entry.last_hook = Some(Instant::now());
         if account.is_some() {
@@ -304,11 +316,9 @@ impl ClaudeWatch {
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
                 entry.session_id = msg.session_id().map(str::to_string);
-                effects.captured.push((
-                    tab_id,
-                    msg.session_id().map(str::to_string),
-                    msg.config_dir.as_deref().map(PathBuf::from),
-                ));
+                effects
+                    .captured
+                    .push((tab_id, msg.session_id().map(str::to_string), config_dir));
             }
             Some("UserPromptSubmit") => entry.state = ClaudeState::Busy,
             Some("Stop") => {
@@ -484,10 +494,8 @@ impl ClaudeWatch {
             return;
         }
         // Attribute to the account: explicit config dir, else the default profile.
-        let dir = msg
-            .config_dir
-            .as_deref()
-            .map(PathBuf::from)
+        let dir = self
+            .canonical_dir(msg.config_dir.as_deref())
             .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
         let Some(dir) = dir else { return };
         if let Some(acc) = self

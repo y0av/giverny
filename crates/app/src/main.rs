@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
+use giverny_claude::wsl;
 use giverny_core::config;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
@@ -360,6 +361,14 @@ struct Switcher {
     index: usize,
 }
 
+/// What one tab needs to open: the shell, the account it is on (named the
+/// way Giverny stores accounts), and the environment that reaches the shell.
+struct TabShape {
+    shell: Option<(String, Vec<String>)>,
+    account: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
@@ -545,6 +554,30 @@ fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
         ));
     }
     env
+}
+
+/// `%WSLENV%` for a tab that opens in a distribution: the variables that have
+/// to survive the crossing, added to whatever the user already shares.
+///
+/// Both directions matter. Going in, `GIVERNY_TAB_ID` is what makes a hook
+/// belong to a tab; coming back out, the hook runs this binary as a Windows
+/// process and needs the same variables to arrive with it.
+fn wslenv(inherited: Option<String>) -> String {
+    const OURS: [&str; 3] = ["GIVERNY_TAB_ID", "GIVERNY_NONCE", "CLAUDE_CONFIG_DIR"];
+    let mut parts: Vec<String> = inherited
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split(':').map(str::to_string).collect())
+        .unwrap_or_default();
+    for name in OURS {
+        // An entry may carry a flag (`VAR/p`); the name before it is the key.
+        if !parts
+            .iter()
+            .any(|p| p.split('/').next().is_some_and(|n| n == name))
+        {
+            parts.push(name.to_string());
+        }
+    }
+    parts.join(":")
 }
 
 impl App {
@@ -793,7 +826,7 @@ impl App {
                 let id = self.ws.add_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
-                self.focus_terminal = true;
+                self.reveal_terminal();
             }
             Action::NewCategory => {
                 let n = self.ws.categories.len() + 1;
@@ -818,7 +851,7 @@ impl App {
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
                 self.claude.mark_viewed(id);
-                self.focus_terminal = true;
+                self.reveal_terminal();
             }
             Action::SwitchRecent(delta) => self.switch_recent(delta),
             Action::Cycle(delta) => {
@@ -828,7 +861,7 @@ impl App {
                     self.refresh_tab_info(id);
                     self.claude.mark_viewed(id);
                 }
-                self.focus_terminal = true;
+                self.reveal_terminal();
             }
             Action::ToggleCollapse(id) => {
                 if let Some(cat) = self.ws.category_mut(id) {
@@ -1098,13 +1131,14 @@ impl App {
             .tab(id)
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
+        let shape = self.tab_shape(profile_dir);
         let cfg = SpawnCfg {
-            shell: pty::windows_shell(self.cfg.behavior.windows_shell.as_str()),
+            shell: shape.shell,
             cwd: cwd.clone(),
-            env_extra: self.claude_env(),
+            env_extra: shape.env,
             tab_id: format!("giverny-{}", id.0),
             nonce: fresh_nonce(id.0),
-            claude_config_dir: profile_dir,
+            claude_config_dir: shape.account,
             size: GridSize {
                 cols: 120,
                 rows: 30,
@@ -1560,9 +1594,23 @@ impl App {
         if let Some(dir) = &resume_dir {
             cmd.push_str(&format!("cd \"{}\" && ", dir.display()));
         }
-        let is_default_profile = dirs::home_dir().is_some_and(|h| h.join(".claude") == config_dir);
+        // The command is typed into the tab's own shell, so the account has
+        // to be named the way that shell can open it: a session inside WSL
+        // knows `/home/x/.claude`, never the Windows share it is stored under
+        // here. Naming the distribution's own default account would be
+        // harmless but noisy, so it is left out the same way `~/.claude` is.
+        let (config_dir, is_default_profile) = match wsl::split_unc(&config_dir) {
+            Some((distro, unix)) => {
+                let default = wsl::is_default_account(&distro, &unix);
+                (unix, default)
+            }
+            None => (
+                config_dir.display().to_string(),
+                dirs::home_dir().is_some_and(|h| h.join(".claude") == config_dir),
+            ),
+        };
         if !is_default_profile {
-            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{}\" ", config_dir.display()));
+            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{config_dir}\" "));
         }
         // `command` bypasses shell wrapper functions named `claude`.
         cmd.push_str(&format!("command claude --resume {sid}\r"));
@@ -1624,8 +1672,74 @@ impl App {
         sw.index = (sw.index as i32 + delta).rem_euclid(len) as usize;
         let target = sw.order[sw.index];
         self.ws.preview_active(target);
-        self.focus_terminal = true;
+        self.reveal_terminal();
         self.state_dirty = true;
+    }
+
+    /// How a tab reaches Claude Code: which shell opens, which account the
+    /// tab is on, and the environment that carries both.
+    ///
+    /// On Windows this is where the WSL boundary is crossed. A tab that opens
+    /// in a distribution runs a Claude Code that can only see the account
+    /// *inside* it, so the account is named in unix terms for the session and
+    /// in Windows terms for everything Giverny stores; and a Windows
+    /// environment does not reach a process in a distribution at all unless
+    /// `%WSLENV%` lists it, which is how the tab identity the hooks report
+    /// gets there.
+    fn tab_shape(&self, profile_dir: Option<PathBuf>) -> TabShape {
+        let mut env = self.claude_env();
+        let mut shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
+        let mut account = profile_dir;
+
+        // The account the category names wins over the shell preference: an
+        // account inside a distribution is only reachable from that
+        // distribution, so that is where the tab opens.
+        let distro = account
+            .as_deref()
+            .and_then(wsl::split_unc)
+            .map(|(distro, _)| distro)
+            .or_else(|| {
+                pty::opens_wsl(self.cfg.behavior.windows_shell.as_str())
+                    .then(wsl::default_distro)
+                    .flatten()
+            });
+        let Some(distro) = distro else {
+            return TabShape {
+                shell,
+                account,
+                env,
+            };
+        };
+
+        shell = Some((
+            "wsl.exe".to_string(),
+            vec!["-d".to_string(), distro.clone(), "~".to_string()],
+        ));
+        // Name the account even when nothing asked for one: it is the same
+        // account Claude Code would pick on its own, and naming it is what
+        // lets a hook from that session be attributed to it.
+        if account.is_none() {
+            account = wsl::account_dir(&distro);
+        }
+        if let Some((_, unix)) = account.as_deref().and_then(wsl::split_unc) {
+            env.push(("CLAUDE_CONFIG_DIR".into(), unix));
+        }
+        env.push(("WSLENV".into(), wslenv(std::env::var("WSLENV").ok())));
+        TabShape {
+            shell,
+            account,
+            env,
+        }
+    }
+
+    /// Picking a tab means "show me that tab": the settings screen and the
+    /// key list take the terminal's place, so a tab clicked in the rail while
+    /// one of them is open used to look like a click that did nothing — the
+    /// only way back was the button that opened it.
+    fn reveal_terminal(&mut self) {
+        self.settings = None;
+        self.keys_overlay = None;
+        self.focus_terminal = true;
     }
 
     /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
@@ -2033,16 +2147,34 @@ fn doctor() {
     // Giverny that cannot find claude shows whatever the cache last held and
     // says nothing about why.
     match usage::cli_path() {
-        Some(path) => println!("claude       {}\n", path.display()),
-        None => {
-            println!("claude       NOT FOUND on PATH — usage cannot refresh");
-            #[cfg(windows)]
-            println!(
-                "             (a Claude Code installed inside WSL is invisible to a\n                               Windows Giverny — it reads the Windows-side account)"
-            );
-            println!();
+        Some(path) => println!("claude       {}", path.display()),
+        None => println!("claude       not found on PATH (on Windows, see wsl below)"),
+    }
+    // Where most Windows machines actually keep Claude Code.
+    let distros = wsl::distros();
+    if !distros.is_empty() {
+        let default = wsl::default_distro();
+        for distro in &distros {
+            let mark = if Some(distro) == default.as_ref() {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("wsl          {distro}{mark}");
+            match wsl::claude_bin(distro) {
+                Some(bin) => println!("             claude  {bin}"),
+                None => {
+                    println!("             claude  NOT FOUND — usage cannot refresh for this one")
+                }
+            }
+            match wsl::account_dir(distro) {
+                Some(dir) if dir.is_dir() => println!("             account {}", dir.display()),
+                Some(dir) => println!("             account none yet ({})", dir.display()),
+                None => println!("             account unknown (no home reported)"),
+            }
         }
     }
+    println!();
     println!(
         "profiles ({} found via {}):",
         profs.len(),
@@ -2196,5 +2328,29 @@ mod tests {
         // prompt appears only above both, so both have to be out of reach.
         assert!(value("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES") > 70);
         assert!(value("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD") > 100_000);
+    }
+
+    /// The variables a hook inside WSL needs, without dropping the ones the
+    /// user already shares — `%WSLENV%` is a machine-wide setting, and
+    /// replacing it would quietly break whatever else relies on it.
+    #[test]
+    fn wslenv_adds_ours_and_keeps_theirs() {
+        let mine = wslenv(None);
+        assert_eq!(mine, "GIVERNY_TAB_ID:GIVERNY_NONCE:CLAUDE_CONFIG_DIR");
+
+        let merged = wslenv(Some("EDITOR:PROJECT/p".into()));
+        assert!(
+            merged.starts_with("EDITOR:PROJECT/p:"),
+            "theirs first: {merged}"
+        );
+        assert!(merged.contains("GIVERNY_TAB_ID"));
+
+        // A variable they already share is not listed twice, flag and all.
+        let dedup = wslenv(Some("CLAUDE_CONFIG_DIR/p".into()));
+        assert_eq!(dedup.matches("CLAUDE_CONFIG_DIR").count(), 1, "{dedup}");
+        assert!(
+            dedup.contains("CLAUDE_CONFIG_DIR/p"),
+            "their flag survives: {dedup}"
+        );
     }
 }

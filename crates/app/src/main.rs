@@ -2467,6 +2467,22 @@ fn doctor() {
                 Some(dir) => println!("             account none yet ({})", dir.display()),
                 None => println!("             account unknown (no home reported)"),
             }
+            // What the rail knows about where tabs are. Zero while Giverny
+            // is closed is expected; zero while it is open and has tabs in
+            // this distribution is the sweep failing.
+            let found = wsl::tab_cwds_in(distro);
+            println!(
+                "             tabs    {} reported by the distribution{}",
+                found.len(),
+                if found.is_empty() {
+                    " (none open, or the sweep is not working)"
+                } else {
+                    ""
+                }
+            );
+            for (tab, cwd) in found {
+                println!("                     {tab} {cwd}");
+            }
         }
     }
     println!();

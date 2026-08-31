@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.6.1 — 2026-08-31
+
+- A tab inside WSL reopens where it was — actually, this time. The sweep that
+  asks a distribution where its tabs are passed its script as an argument to
+  `wsl.exe`, and a command line crossing that boundary is rebuilt on the way
+  through: this one is quotes, newlines and `$` from end to end, and it came
+  back empty every time on a machine where running the same script by hand
+  worked. The script now travels as a file over the same share the account is
+  read through, and is run by path. Nothing on the Windows side had ever
+  learned a WSL tab's directory, so every tab reopened at `~`.
+
+- A sweep whose thread died no longer stops every later one. It held the
+  receiver until an answer came, and a thread that never answered left it held
+  forever.
+
+- `giverny doctor` prints what the sweep sees per distribution: the tabs it
+  reports and where they are. Zero while Giverny is open, with tabs in that
+  distribution, is the sweep failing.
+
 ## v0.6.0 — 2026-08-31
 
 - The rail groups tabs by repository, as well as by category. Two segments at

@@ -113,13 +113,11 @@ pub fn tab_cwds() -> Vec<(String, String, String)> {
     {
         let mut out = Vec::new();
         for distro in distros() {
-            if let Some(text) = imp::capture_sh(&distro, TAB_CWD_SCRIPT) {
-                out.extend(
-                    parse_tab_cwds(&text)
-                        .into_iter()
-                        .map(|(tab, cwd)| (tab, distro.clone(), cwd)),
-                );
-            }
+            out.extend(
+                tab_cwds_in(&distro)
+                    .into_iter()
+                    .map(|(tab, cwd)| (tab, distro.clone(), cwd)),
+            );
         }
         out
     }
@@ -127,6 +125,32 @@ pub fn tab_cwds() -> Vec<(String, String, String)> {
     {
         Vec::new()
     }
+}
+
+/// One distribution's answer, or nothing.
+///
+/// The script travels as a *file* over the share rather than as an argument
+/// to `wsl.exe`. A command line crossing that boundary is rebuilt on the way
+/// through, and this one is quotes, newlines and `$` from end to end — the
+/// version that passed it as an argument came back empty every time, on a
+/// machine where running the same script by hand worked. Rewritten each
+/// sweep, since a distribution that restarted took `/tmp` with it.
+#[cfg(windows)]
+pub fn tab_cwds_in(distro: &str) -> Vec<(String, String)> {
+    const AT: &str = "/tmp/.giverny-probe.sh";
+    if std::fs::write(unc_path(distro, AT), TAB_CWD_SCRIPT).is_err() {
+        return Vec::new();
+    }
+    imp::capture(distro, &["sh", AT])
+        .map(|text| parse_tab_cwds(&text))
+        .unwrap_or_default()
+}
+
+/// Nothing to probe where there is no distribution.
+#[cfg(not(windows))]
+pub fn tab_cwds_in(distro: &str) -> Vec<(String, String)> {
+    let _ = distro;
+    Vec::new()
 }
 
 /// Every process that belongs to a tab, with its parent and its directory.
@@ -272,14 +296,9 @@ mod imp {
         cmd
     }
 
-    /// Run a shell script inside `distro` and return its stdout.
-    pub fn capture_sh(distro: &str, script: &str) -> Option<String> {
-        capture(distro, &["sh", "-c", script])
-    }
-
     /// Run something inside `distro` and return its stdout, trimmed.
     /// `None` when the distribution, or the command, is not there.
-    fn capture(distro: &str, args: &[&str]) -> Option<String> {
+    pub fn capture(distro: &str, args: &[&str]) -> Option<String> {
         let out = command(distro).arg("--").args(args).output().ok()?;
         if !out.status.success() {
             return None;

@@ -73,7 +73,7 @@ mod tests {
 
         // A worktree keeps its git dir elsewhere and a `.git` file here; the
         // place is still this directory.
-        let wt = scratch("worktree");
+        let wt = scratch("worktree-root");
         std::fs::write(wt.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         assert_eq!(repo_root(&wt).as_deref(), Some(wt.as_path()));
         let _ = std::fs::remove_dir_all(&root);

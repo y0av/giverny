@@ -3,6 +3,9 @@
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, TextEdit, Ui, Vec2,
 };
+use std::path::{Path, PathBuf};
+
+use giverny_core::state::RailView;
 use giverny_core::tabs::{CategoryId, TabId};
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
@@ -26,8 +29,23 @@ struct RowData {
     background: bool,
 }
 
-struct CatData {
-    id: CategoryId,
+/// What a group of rows is: a category you made, or a repository the tabs
+/// turned out to be in.
+#[derive(Clone, PartialEq)]
+enum GroupKey {
+    Category(CategoryId),
+    /// `None` is the group for tabs in no repository at all.
+    Repo(Option<PathBuf>),
+}
+
+struct GroupData {
+    key: GroupKey,
+    /// The category a new tab from this header lands in. A repository is a
+    /// place tabs *are*, not one they can be put in, so a repository group
+    /// borrows the category of the tabs already there.
+    category: CategoryId,
+    /// Where a new tab from this header starts.
+    cwd: Option<PathBuf>,
     name: String,
     color: Color32,
     collapsed: bool,
@@ -37,73 +55,186 @@ struct CatData {
     rows: Vec<RowData>,
 }
 
+/// One tab's row.
+///
+/// `under` is the repository the row is being shown inside, whose name is
+/// already on the header above it: the path then only has to say what the
+/// header does not, which is where in the repository this tab is.
+fn row_data(
+    app: &App,
+    t: &giverny_core::tabs::Tab,
+    color: Color32,
+    under: Option<&Path>,
+) -> RowData {
+    let relative = under.zip(t.cwd.as_deref()).and_then(|(repo, cwd)| {
+        let rest = cwd.strip_prefix(repo).ok()?;
+        Some(if rest.as_os_str().is_empty() {
+            String::new()
+        } else {
+            format!("{}", rest.display())
+        })
+    });
+    let mut sub = match relative {
+        Some(rest) => rest,
+        None => t
+            .cwd
+            .as_deref()
+            .map(|p| giverny_core::short_path(p, 24))
+            .unwrap_or_default(),
+    };
+    if let Some(branch) = &t.git_branch {
+        sub = if sub.is_empty() {
+            format!(" {branch}")
+        } else {
+            format!("{sub} ·  {branch}")
+        };
+    }
+    let ct = app.claude.tabs.get(&t.id);
+    if let Some(account) = ct.and_then(|c| c.account.as_deref()) {
+        sub = if sub.is_empty() {
+            format!("@{account}")
+        } else {
+            format!("{sub} · @{account}")
+        };
+    }
+    RowData {
+        id: t.id,
+        title: t.display_title(&app.cfg.titles),
+        sub,
+        active: app.ws.active == Some(t.id),
+        exited: t.exited,
+        color,
+        claude: ct.map(|c| c.state).unwrap_or_default(),
+        background: ct.is_some_and(|c| c.background),
+    }
+}
+
+/// Counts a header carries: how many, how many working, how many want you.
+fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
+    (
+        rows.len(),
+        rows.iter()
+            .filter(|r| r.claude == ClaudeState::Busy)
+            .count(),
+        rows.iter()
+            .filter(|r| r.claude == ClaudeState::NeedsYou)
+            .count(),
+    )
+}
+
+/// A repository always gets the same colour, whichever order the groups come
+/// out in and whichever machine it is on.
+fn repo_color(path: Option<&Path>) -> Color32 {
+    let Some(path) = path else {
+        return Color32::GRAY;
+    };
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in path.as_os_str().as_encoded_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    category_color(hash as usize)
+}
+
+/// The rail's rows, grouped the way the user asked for.
+fn groups(app: &App) -> Vec<GroupData> {
+    match app.rail_view() {
+        RailView::Categories => app
+            .ws
+            .categories
+            .iter()
+            .map(|c| {
+                let color = category_color(c.color_index);
+                let rows: Vec<RowData> = app
+                    .ws
+                    .tabs_in(c.id)
+                    .map(|t| row_data(app, t, color, None))
+                    .collect();
+                let (count, busy, needs) = tallies(&rows);
+                GroupData {
+                    key: GroupKey::Category(c.id),
+                    category: c.id,
+                    cwd: None,
+                    name: c.name.clone(),
+                    color,
+                    collapsed: c.collapsed,
+                    count,
+                    busy,
+                    needs,
+                    rows,
+                }
+            })
+            .collect(),
+        RailView::Repos => {
+            // Rail order within a repository, repositories in their own
+            // order: by name, with the tabs that are in no repository last —
+            // they are the leftovers, not a place.
+            let mut keys: Vec<Option<PathBuf>> = Vec::new();
+            for t in &app.ws.tabs {
+                if !keys.contains(&t.git_repo) {
+                    keys.push(t.git_repo.clone());
+                }
+            }
+            keys.sort_by_key(|k| {
+                (
+                    k.is_none(),
+                    k.as_deref()
+                        .and_then(repo_name)
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                )
+            });
+            keys.into_iter()
+                .map(|key| {
+                    let color = repo_color(key.as_deref());
+                    let rows: Vec<RowData> = app
+                        .ws
+                        .tabs
+                        .iter()
+                        .filter(|t| t.git_repo == key)
+                        .map(|t| row_data(app, t, color, key.as_deref()))
+                        .collect();
+                    let (count, busy, needs) = tallies(&rows);
+                    let category = rows
+                        .first()
+                        .and_then(|r| app.ws.tab(r.id))
+                        .map(|t| t.category)
+                        .or_else(|| app.ws.categories.first().map(|c| c.id))
+                        .unwrap_or(CategoryId(0));
+                    GroupData {
+                        name: key
+                            .as_deref()
+                            .and_then(repo_name)
+                            .unwrap_or_else(|| "no repo".to_string()),
+                        collapsed: app.repo_collapsed(key.as_deref()),
+                        cwd: key.clone(),
+                        key: GroupKey::Repo(key),
+                        category,
+                        color,
+                        count,
+                        busy,
+                        needs,
+                        rows,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// A repository's display name: the directory it lives in.
+fn repo_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     app.row_rects.clear();
 
     // Precollect display data so rendering never borrows the workspace.
-    let cats: Vec<CatData> = app
-        .ws
-        .categories
-        .iter()
-        .map(|c| {
-            let color = category_color(c.color_index);
-            let rows = app
-                .ws
-                .tabs_in(c.id)
-                .map(|t| {
-                    let mut sub = t
-                        .cwd
-                        .as_deref()
-                        .map(|p| giverny_core::short_path(p, 24))
-                        .unwrap_or_default();
-                    if let Some(branch) = &t.git_branch {
-                        sub = if sub.is_empty() {
-                            format!(" {branch}")
-                        } else {
-                            format!("{sub} ·  {branch}")
-                        };
-                    }
-                    let ct = app.claude.tabs.get(&t.id);
-                    if let Some(account) = ct.and_then(|c| c.account.as_deref()) {
-                        sub = if sub.is_empty() {
-                            format!("@{account}")
-                        } else {
-                            format!("{sub} · @{account}")
-                        };
-                    }
-                    RowData {
-                        id: t.id,
-                        title: t.display_title(&app.cfg.titles),
-                        sub,
-                        active: app.ws.active == Some(t.id),
-                        exited: t.exited,
-                        color,
-                        claude: ct.map(|c| c.state).unwrap_or_default(),
-                        background: ct.is_some_and(|c| c.background),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let busy = rows
-                .iter()
-                .filter(|r| r.claude == ClaudeState::Busy)
-                .count();
-            let needs = rows
-                .iter()
-                .filter(|r| r.claude == ClaudeState::NeedsYou)
-                .count();
-            CatData {
-                id: c.id,
-                name: c.name.clone(),
-                color,
-                collapsed: c.collapsed,
-                count: rows.len(),
-                busy,
-                needs,
-                rows,
-            }
-        })
-        .collect();
+    let cats = groups(app);
 
     let dim = app.chrome.dim;
     let fg = app.chrome.fg;
@@ -118,12 +249,19 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             usage_panel(app, ui, dim, fg, &mut actions);
         });
 
+    view_switch(app, ui, &mut actions);
+
     // Background agents sit above the categories: they have no tab, which is
     // exactly why they are easy to forget.
     jobs_section(app, ui, dim, fg, &mut actions);
 
     // Drag-and-drop bookkeeping: where would a drop land right now?
-    let pointer = ui.input(|i| i.pointer.interact_pos());
+    // Only in the categories view — dragging a tab into a repository would be
+    // asking the rail to move a directory.
+    let arrangeable = app.rail_view() == RailView::Categories;
+    let pointer = ui
+        .input(|i| i.pointer.interact_pos())
+        .filter(|_| arrangeable);
     let mut drop_target: Option<(CategoryId, usize, f32)> = None;
 
     egui::ScrollArea::vertical()
@@ -138,7 +276,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                     && app.dragging.is_some()
                     && header.contains(p)
                 {
-                    drop_target = Some((cat.id, cat.rows.len(), header.max.y));
+                    drop_target = Some((cat.category, cat.rows.len(), header.max.y));
                 }
                 if !cat.collapsed {
                     for (index, row) in cat.rows.iter().enumerate() {
@@ -153,23 +291,25 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                         {
                             let after = p.y > rect.center().y;
                             let y = if after { rect.max.y } else { rect.min.y };
-                            drop_target = Some((cat.id, index + usize::from(after), y));
+                            drop_target = Some((cat.category, index + usize::from(after), y));
                         }
                     }
                 }
                 ui.add_space(6.0);
             }
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                if ui
-                    .small_button("+ category")
-                    .on_hover_text("add a category")
-                    .clicked()
-                {
-                    actions.push(Action::NewCategory);
-                }
-            });
+            if arrangeable {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    if ui
+                        .small_button("+ category")
+                        .on_hover_text("add a category")
+                        .clicked()
+                    {
+                        actions.push(Action::NewCategory);
+                    }
+                });
+            }
             ui.add_space(8.0);
         });
 
@@ -191,6 +331,77 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     }
 
     actions
+}
+
+/// The two ways to read the rail, at the top of it.
+///
+/// A segmented pair rather than a menu: which one you are in is the thing you
+/// need to know at a glance, and switching is a click, not a decision. The
+/// selected half is filled in its own accent; the other is quiet until the
+/// pointer is on it.
+fn view_switch(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    const H: f32 = 24.0;
+    let c = app.chrome;
+    let current = app.rail_view();
+
+    ui.add_space(8.0);
+    let width = ui.available_width() - 16.0;
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(width + 16.0, H), Sense::hover());
+    let track = Rect::from_min_size(
+        Pos2::new(outer.min.x + 8.0, outer.min.y),
+        Vec2::new(width, H),
+    );
+    let p = ui.painter_at(outer);
+    p.rect_filled(
+        track,
+        6.0,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+    );
+
+    let half = width / 2.0;
+    for (index, (view, label)) in [
+        (RailView::Categories, "categories"),
+        (RailView::Repos, "repos"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seg = Rect::from_min_size(
+            Pos2::new(track.min.x + half * index as f32, track.min.y),
+            Vec2::new(half, H),
+        );
+        let resp = ui.interact(seg, ui.id().with(("rail-view", index)), Sense::click());
+        let selected = current == view;
+        if selected {
+            p.rect_filled(seg.shrink(2.0), 5.0, c.accent.gamma_multiply(0.20));
+        } else if resp.hovered() {
+            p.rect_filled(
+                seg.shrink(2.0),
+                5.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+            );
+        }
+        p.text(
+            seg.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::monospace(11.0),
+            if selected {
+                c.accent
+            } else if resp.hovered() {
+                c.fg
+            } else {
+                c.dim
+            },
+        );
+        if resp.hovered() {
+            ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+        }
+        if resp.clicked() && !selected {
+            actions.push(Action::SetRailView(view));
+        }
+    }
+    ui.add_space(2.0);
 }
 
 /// Background agents, above the categories. Same grammar as tabs — spinner
@@ -314,7 +525,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
 fn category_header(
     app: &mut App,
     ui: &mut Ui,
-    cat: &CatData,
+    cat: &GroupData,
     dim: Color32,
     actions: &mut Vec<Action>,
 ) -> Rect {
@@ -323,10 +534,22 @@ fn category_header(
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_H), Sense::click());
     let p = ui.painter_at(rect);
 
+    let as_category = match &cat.key {
+        GroupKey::Category(id) => Some(*id),
+        GroupKey::Repo(_) => None,
+    };
+    // Only a repository's name fits in the rail, and two checkouts of the
+    // same project have the same name.
+    let resp = match &cat.key {
+        GroupKey::Repo(Some(path)) => resp.on_hover_text(giverny_core::short_path(path, 60)),
+        _ => resp,
+    };
+
     // Inline rename?
     if let Some((RenameTarget::Category(id), buf)) = &mut app.rename
-        && *id == cat.id
+        && as_category == Some(*id)
     {
+        let id = *id;
         let edit_rect = Rect::from_min_size(
             Pos2::new(rect.min.x + 22.0, rect.min.y + 2.0),
             Vec2::new(width - 30.0, HEADER_H - 4.0),
@@ -342,41 +565,42 @@ fn category_header(
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
         if escape {
-            actions.push(Action::CommitRename(RenameTarget::Category(cat.id), None));
+            actions.push(Action::CommitRename(RenameTarget::Category(id), None));
         } else if enter || te.lost_focus() {
             let value = buf.clone();
             actions.push(Action::CommitRename(
-                RenameTarget::Category(cat.id),
+                RenameTarget::Category(id),
                 Some(value),
             ));
         }
         return rect;
     }
 
-    // Right-click: category management.
+    // Right-click: what there is to manage. A repository group has nothing
+    // to rename, recolour or delete — it exists because tabs are there.
     resp.context_menu(|ui| {
-        if ui.button("rename").clicked() {
-            actions.push(Action::StartRename(RenameTarget::Category(cat.id)));
+        if let Some(id) = as_category
+            && ui.button("rename").clicked()
+        {
+            actions.push(Action::StartRename(RenameTarget::Category(id)));
             ui.close();
         }
         if ui.button("new tab here").clicked() {
             actions.push(Action::NewTab {
-                category: cat.id,
-                cwd: None,
+                category: cat.category,
+                cwd: cat.cwd.clone(),
             });
             ui.close();
         }
+        let Some(id) = as_category else { return };
         ui.menu_button("account", |ui| {
             if ui.button("(inherit)").clicked() {
-                actions.push(Action::SetCategoryProfile(cat.id, None));
+                actions.push(Action::SetCategoryProfile(id, None));
                 ui.close();
             }
             for p in &app.claude.profiles {
                 if ui.button(format!("@{}", p.name)).clicked() {
-                    actions.push(Action::SetCategoryProfile(
-                        cat.id,
-                        Some(p.config_dir.clone()),
-                    ));
+                    actions.push(Action::SetCategoryProfile(id, Some(p.config_dir.clone())));
                     ui.close();
                 }
             }
@@ -386,7 +610,7 @@ fn category_header(
                 for (i, c) in crate::CATEGORY_PALETTE.iter().enumerate() {
                     let btn = egui::Button::new("  ").fill(*c).corner_radius(3.0);
                     if ui.add_sized(Vec2::splat(18.0), btn).clicked() {
-                        actions.push(Action::SetCategoryColor(cat.id, i));
+                        actions.push(Action::SetCategoryColor(id, i));
                         ui.close();
                     }
                 }
@@ -394,7 +618,7 @@ fn category_header(
         });
         ui.separator();
         if ui.button("delete category").clicked() {
-            actions.push(Action::DeleteCategory(cat.id));
+            actions.push(Action::DeleteCategory(id));
             ui.close();
         }
     });
@@ -458,7 +682,7 @@ fn category_header(
     );
     let plus = ui.interact(
         plus_rect,
-        ui.id().with(("cat-plus", cat.id.0)),
+        ui.id().with(("cat-plus", &cat.name, cat.category.0)),
         Sense::click(),
     );
     p.text(
@@ -470,11 +694,16 @@ fn category_header(
     );
     if plus.clicked() {
         actions.push(Action::NewTab {
-            category: cat.id,
-            cwd: None,
+            category: cat.category,
+            cwd: cat.cwd.clone(),
         });
     } else if resp.clicked() {
-        actions.push(Action::ToggleCollapse(cat.id));
+        actions.push(match &cat.key {
+            GroupKey::Category(id) => Action::ToggleCollapse(*id),
+            // The group for tabs in no repository is keyed by the empty path,
+            // which is not a path anything else can be.
+            GroupKey::Repo(repo) => Action::ToggleRepoCollapse(repo.clone().unwrap_or_default()),
+        });
     }
     if resp.hovered() {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
@@ -1040,4 +1269,30 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repository_is_named_by_its_directory() {
+        assert_eq!(
+            repo_name(Path::new("/home/ita/work/orbital-api")).as_deref(),
+            Some("orbital-api")
+        );
+        assert_eq!(repo_name(Path::new("/")), None);
+    }
+
+    /// The colour is the group's identity in the rail; it has to be the same
+    /// one every launch, and two repositories should rarely share it.
+    #[test]
+    fn a_repository_keeps_its_colour() {
+        let a = Path::new("/home/ita/work/orbital-api");
+        let b = Path::new("/home/ita/work/atlas-web");
+        assert_eq!(repo_color(Some(a)), repo_color(Some(a)));
+        assert_ne!(repo_color(Some(a)), repo_color(Some(b)));
+        // Tabs in no repository are grouped, not coloured.
+        assert_eq!(repo_color(None), Color32::GRAY);
+    }
 }

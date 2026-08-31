@@ -61,6 +61,17 @@ Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI 
 
 On Windows, an account that lives inside WSL is treated as an account: it is discovered there, its usage is refreshed by running `claude` inside the distribution, and its hooks call back out to Giverny. Tabs for it open in the distribution it belongs to. `behavior.windows_shell` decides what everything else opens, and `giverny doctor` prints what was found in each distribution.
 
+## The rail
+
+Two ways to read it, switched at the top and remembered between launches:
+
+- **categories** — the ones you made, in the order you put them in. Drag to
+  rearrange, right-click to rename, recolour, or pin an account to one.
+- **repos** — wherever the tabs actually are, grouped by git repository and
+  named after it. A repository keeps the same colour every launch; tabs in no
+  repository are gathered at the end. The path under each tab shows where in
+  the repository it is, since the repository is already on the header.
+
 ## Keys
 
 | Chord | Action |

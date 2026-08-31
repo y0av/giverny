@@ -100,7 +100,7 @@ pub fn canonical_config_dir(reported: &Path, known: &[PathBuf]) -> Option<PathBu
 }
 
 /// Where each Giverny tab's shell is, inside every distribution:
-/// `(tab id, unix path)`.
+/// `(tab id, distribution, unix path)`.
 ///
 /// A tab inside WSL had no source for this at all. Windows can see `wsl.exe`'s
 /// own working directory and nothing about the shell it started; `/proc` is on
@@ -108,13 +108,17 @@ pub fn canonical_config_dir(reported: &Path, known: &[PathBuf]) -> Option<PathBu
 /// it to. The distribution can answer for itself: every process Giverny
 /// started carries `GIVERNY_TAB_ID` in its environment, and `/proc` has the
 /// rest. One `wsl.exe` per distribution answers for every tab at once.
-pub fn tab_cwds() -> Vec<(String, String)> {
+pub fn tab_cwds() -> Vec<(String, String, String)> {
     #[cfg(windows)]
     {
         let mut out = Vec::new();
         for distro in distros() {
             if let Some(text) = imp::capture_sh(&distro, TAB_CWD_SCRIPT) {
-                out.extend(parse_tab_cwds(&text));
+                out.extend(
+                    parse_tab_cwds(&text)
+                        .into_iter()
+                        .map(|(tab, cwd)| (tab, distro.clone(), cwd)),
+                );
             }
         }
         out

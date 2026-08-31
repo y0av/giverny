@@ -50,6 +50,16 @@ pub struct Tab {
     pub foreground: Option<String>,
     #[serde(skip)]
     pub git_branch: Option<String>,
+    /// The repository this tab is in, for the rail's by-repository view.
+    /// Persisted rather than derived on load: a restored tab groups correctly
+    /// before anything has looked at the filesystem for it.
+    #[serde(default)]
+    pub git_repo: Option<PathBuf>,
+    /// The WSL distribution the tab opened in, when it did. What makes a unix
+    /// `cwd` reachable from Windows — as `\\wsl.localhost\<distro>\…` — for
+    /// the git lookups that would otherwise silently find nothing.
+    #[serde(default)]
+    pub wsl_distro: Option<String>,
     #[serde(skip)]
     pub exited: bool,
 }
@@ -174,6 +184,8 @@ impl Workspace {
                 claude_session: None,
                 claude_config_dir: None,
                 git_branch: None,
+                git_repo: None,
+                wsl_distro: None,
                 exited: false,
             },
         );

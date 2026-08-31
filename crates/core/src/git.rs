@@ -22,6 +22,17 @@ pub fn branch_of(dir: &Path) -> Option<String> {
     None
 }
 
+/// The working tree `dir` belongs to: the nearest ancestor holding a `.git`.
+///
+/// The repository as a *place*, which is what grouping tabs by repository
+/// needs — `find_git` answers with the git dir, and for a worktree or a
+/// submodule that is somewhere else entirely.
+pub fn repo_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// Resolve the git dir for `dir`, walking up ancestors; follows a `.git`
 /// *file*'s `gitdir:` pointer (worktrees, submodules).
 fn find_git(dir: &Path) -> Option<PathBuf> {
@@ -48,6 +59,26 @@ fn find_git(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_root_is_the_working_tree() {
+        let root = scratch("root");
+        let deep = root.join("crates/app/src");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(repo_root(&deep), None, "no repository yet");
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(repo_root(&deep).as_deref(), Some(root.as_path()));
+        assert_eq!(repo_root(&root).as_deref(), Some(root.as_path()));
+
+        // A worktree keeps its git dir elsewhere and a `.git` file here; the
+        // place is still this directory.
+        let wt = scratch("worktree");
+        std::fs::write(wt.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        assert_eq!(repo_root(&wt).as_deref(), Some(wt.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("giverny-git-{}-{}", name, std::process::id()));

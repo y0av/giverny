@@ -350,6 +350,10 @@ pub enum Action {
     /// Attach a tab to a background agent: its directory, its account, its
     /// conversation.
     AttachJob(Box<giverny_claude::jobs::Job>),
+    /// Group the rail by categories, or by repository.
+    SetRailView(giverny_core::state::RailView),
+    /// Fold a repository's group away. The empty path is the "no repo" group.
+    ToggleRepoCollapse(PathBuf),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -491,9 +495,12 @@ pub struct App {
     /// Every live claude session started before hooks/statusline were
     /// installed, so none of them report anything (recomputed periodically).
     pub stale_sessions: bool,
+    /// Repository root per directory, so the sweep over every tab is one
+    /// filesystem walk per distinct directory rather than per tab.
+    repo_cache: HashMap<PathBuf, Option<PathBuf>>,
     /// Directories for tabs inside WSL, asked of the distribution itself
     /// because nothing on this side of the boundary knows them.
-    wsl_cwd_rx: Option<crossbeam_channel::Receiver<Vec<(String, String)>>>,
+    wsl_cwd_rx: Option<crossbeam_channel::Receiver<Vec<(String, String, String)>>>,
     last_wsl_probe: Instant,
     /// A newer release, once the background check finds one.
     pub update: Option<update::Available>,
@@ -711,7 +718,10 @@ impl App {
                 }
             }
         }
-        let layout = restored.as_ref().map(|st| st.layout).unwrap_or_default();
+        let layout = restored
+            .as_ref()
+            .map(|st| st.layout.clone())
+            .unwrap_or_default();
         let mut ws = restored
             .map(|st| st.workspace)
             .filter(|ws| !ws.tabs.is_empty())
@@ -788,6 +798,7 @@ impl App {
             drag_hover: None,
             row_rects: Vec::new(),
             stale_sessions: false,
+            repo_cache: HashMap::new(),
             wsl_cwd_rx: None,
             last_wsl_probe: Instant::now() - Duration::from_secs(60),
             update: None,
@@ -895,7 +906,7 @@ impl App {
             clean_shutdown: self.closing,
             workspace: self.ws.clone(),
             font_size: self.shared.font_size,
-            layout: self.layout,
+            layout: self.layout.clone(),
         };
         if let Err(err) = state::save(&self.paths, &st) {
             tracing::error!("state save failed: {err:#}");
@@ -951,6 +962,20 @@ impl App {
                     self.claude.mark_viewed(id);
                 }
                 self.reveal_terminal();
+            }
+            Action::SetRailView(view) => {
+                self.layout.rail_view = view;
+                self.state_dirty = true;
+            }
+            Action::ToggleRepoCollapse(repo) => {
+                let folded = &mut self.layout.collapsed_repos;
+                match folded.iter().position(|p| *p == repo) {
+                    Some(at) => {
+                        folded.remove(at);
+                    }
+                    None => folded.push(repo),
+                }
+                self.state_dirty = true;
             }
             Action::ToggleCollapse(id) => {
                 if let Some(cat) = self.ws.category_mut(id) {
@@ -1310,9 +1335,14 @@ impl App {
         }
         for (id, cwd) in cwd_updates {
             if let Some(tab) = self.ws.tab_mut(id) {
-                tab.git_branch = giverny_core::git::branch_of(&cwd);
                 tab.cwd = Some(cwd);
                 self.state_dirty = true;
+            }
+            if let Some(local) = self.ws.tab(id).and_then(|t| self.local_path(t)) {
+                let branch = giverny_core::git::branch_of(&local);
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    tab.git_branch = branch;
+                }
             }
         }
     }
@@ -1329,7 +1359,7 @@ impl App {
             && let Ok(found) = rx.try_recv()
         {
             self.wsl_cwd_rx = None;
-            for (tab, cwd) in found {
+            for (tab, distro, cwd) in found {
                 let Some(id) = tab
                     .strip_prefix("giverny-")
                     .and_then(|n| n.parse::<u64>().ok())
@@ -1337,11 +1367,13 @@ impl App {
                 else {
                     continue;
                 };
-                if let Some(tab) = self.ws.tab_mut(id)
-                    && tab.cwd.as_deref() != Some(Path::new(&cwd))
-                {
-                    tab.cwd = Some(PathBuf::from(cwd));
-                    self.state_dirty = true;
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    let moved = tab.cwd.as_deref() != Some(Path::new(&cwd));
+                    if moved || tab.wsl_distro.as_deref() != Some(distro.as_str()) {
+                        tab.cwd = Some(PathBuf::from(cwd));
+                        tab.wsl_distro = Some(distro);
+                        self.state_dirty = true;
+                    }
                 }
             }
         }
@@ -1364,6 +1396,85 @@ impl App {
         }
     }
 
+    /// How the rail groups tabs right now.
+    pub fn rail_view(&self) -> giverny_core::state::RailView {
+        self.layout.rail_view
+    }
+
+    /// Is this repository's group folded away? `None` is the group for tabs
+    /// in no repository, which is a group like any other.
+    pub fn repo_collapsed(&self, repo: Option<&Path>) -> bool {
+        match repo {
+            Some(path) => self.layout.collapsed_repos.iter().any(|p| p == path),
+            None => self
+                .layout
+                .collapsed_repos
+                .iter()
+                .any(|p| p.as_os_str().is_empty()),
+        }
+    }
+
+    /// Which repository each tab is in, for the rail's by-repository view.
+    ///
+    /// Cached by directory: tabs share them, the answer only changes when a
+    /// tab moves, and over the WSL share every one of these is a round trip
+    /// rather than a `stat`.
+    fn refresh_repos(&mut self) {
+        let dirs: Vec<(TabId, PathBuf)> = self
+            .ws
+            .tabs
+            .iter()
+            .filter_map(|t| Some((t.id, self.local_path(t)?)))
+            .collect();
+        // One HEAD read per repository rather than per tab: every tab in a
+        // checkout is on the same branch, and over the WSL share each read is
+        // a round trip. Not cached across sweeps — a branch is the thing that
+        // changes.
+        let mut branches: HashMap<PathBuf, Option<String>> = HashMap::new();
+        for (id, dir) in dirs {
+            let repo = match self.repo_cache.get(&dir) {
+                Some(hit) => hit.clone(),
+                None => {
+                    let found = giverny_core::git::repo_root(&dir);
+                    self.repo_cache.insert(dir, found.clone());
+                    found
+                }
+            };
+            let branch = match &repo {
+                Some(root) => branches
+                    .entry(root.clone())
+                    .or_insert_with(|| giverny_core::git::branch_of(root))
+                    .clone(),
+                None => None,
+            };
+            if let Some(tab) = self.ws.tab_mut(id) {
+                if tab.git_repo != repo {
+                    tab.git_repo = repo;
+                    self.state_dirty = true;
+                }
+                // Only ever had a branch once a tab had been focused, because
+                // the /proc refresh that set it runs for the active tab alone.
+                tab.git_branch = branch;
+            }
+        }
+    }
+
+    /// A tab's directory as *this* machine can open it.
+    ///
+    /// For a tab inside WSL the two differ: the shell reports `/home/x/proj`,
+    /// which Windows reaches as `\\wsl.localhost\<distro>\home\x\proj` and
+    /// otherwise cannot see at all — which is why a WSL tab has never shown a
+    /// git branch.
+    fn local_path(&self, tab: &giverny_core::tabs::Tab) -> Option<PathBuf> {
+        let cwd = tab.cwd.clone()?;
+        match &tab.wsl_distro {
+            Some(distro) if cwd.to_str().is_some_and(|c| c.starts_with('/')) => {
+                Some(wsl::unc_path(distro, cwd.to_str()?))
+            }
+            _ => Some(cwd),
+        }
+    }
+
     /// Refresh cwd (via /proc) and git branch for one tab.
     fn refresh_tab_info(&mut self, id: TabId) {
         let pid = self
@@ -1382,7 +1493,11 @@ impl App {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
-        tab.git_branch = tab.cwd.as_deref().and_then(giverny_core::git::branch_of);
+        let local = self.ws.tab(id).and_then(|t| self.local_path(t));
+        let branch = local.as_deref().and_then(giverny_core::git::branch_of);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.git_branch = branch;
+        }
     }
 
     /// Hot-reload `config.toml` when it changes on disk.
@@ -1521,7 +1636,7 @@ impl App {
     /// window manager has the last word: a tiled or snapped window ends up a
     /// size nobody asked for, and that is still the size to reopen at.
     fn track_layout(&mut self, ctx: &egui::Context) {
-        let before = self.layout;
+        let before = self.layout.clone();
         let (maximized, viewport_rect) = ctx.input(|i| {
             let vp = i.viewport();
             (
@@ -1626,6 +1741,7 @@ impl App {
         self.track_foreground();
         self.stale_sessions = self.claude.sessions_predate_settings();
         self.probe_wsl_cwds();
+        self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
         self.claude
             .refresh_stale_usage(self.cfg.usage.refresh_minutes, false);

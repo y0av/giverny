@@ -34,7 +34,7 @@ fn default_font_size() -> f32 {
 /// Window *position* is deliberately absent: Wayland gives clients no way to
 /// place their own windows, so a saved position would restore on X11 and
 /// silently do nothing on the user's actual session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     /// Inner size of the window when it was last *not* maximized.
     #[serde(default)]
@@ -43,6 +43,34 @@ pub struct Layout {
     pub maximized: bool,
     #[serde(default)]
     pub rail_width: Option<f32>,
+    /// How the rail groups tabs.
+    #[serde(default)]
+    pub rail_view: RailView,
+    /// Repository groups the user has folded away, by path. Categories keep
+    /// their own collapsed flag; a repository group is not a thing that
+    /// exists to hold one.
+    #[serde(default)]
+    pub collapsed_repos: Vec<PathBuf>,
+}
+
+/// What the rail groups tabs by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RailView {
+    /// Categories: the ones you made, in the order you put them in.
+    #[default]
+    Categories,
+    /// Repositories: wherever the tabs actually are.
+    Repos,
+}
+
+impl RailView {
+    pub fn other(self) -> Self {
+        match self {
+            RailView::Categories => RailView::Repos,
+            RailView::Repos => RailView::Categories,
+        }
+    }
 }
 
 impl Layout {
@@ -230,6 +258,8 @@ mod tests {
                 window: Some([1000.0, 700.0]),
                 maximized: false,
                 rail_width: Some(300.0),
+                rail_view: RailView::Repos,
+                collapsed_repos: vec![PathBuf::from("/home/x/proj")],
             },
         };
         save(&paths, &state).unwrap();
@@ -238,6 +268,9 @@ mod tests {
         assert!(back.clean_shutdown);
         assert_eq!(back.workspace.tab(tab).unwrap().title(), "api");
         assert_eq!(back.layout.window_size(), Some([1000.0, 700.0]));
+        // How the rail was arranged is part of where you left off.
+        assert_eq!(back.layout.rail_view, RailView::Repos);
+        assert_eq!(back.layout.collapsed_repos.len(), 1);
         // The pre-window read sees the same thing without a full load.
         assert_eq!(load_layout(&paths), back.layout);
     }

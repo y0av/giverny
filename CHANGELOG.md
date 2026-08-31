@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.0 — 2026-08-31
+
+- The rail groups tabs by repository, as well as by category. Two segments at
+  the top switch between them, and which one you left it in is remembered with
+  the window size and the rail width. Repository groups are built from where
+  the tabs are: named after the checkout, sorted by name, each keeping the same
+  colour every launch, with tabs in no repository gathered at the end. Under a
+  repository, a tab's path says where *in* the repository it is rather than
+  repeating the name already on the header, and the full path is on the header's
+  hover. Dragging tabs and adding categories stay in the categories view, where
+  they mean something — a repository is a place tabs are, not one they can be
+  put in. A "new tab" from a repository header opens in that repository.
+
+- Every tab shows its git branch, not only the one you last looked at. The
+  branch came from the same refresh that reads the active tab's directory out
+  of `/proc`, so a tab that had never been focused had none. It is now read
+  once per repository on the same sweep, which also gives a tab inside WSL a
+  branch for the first time: its directory is a unix path, which Windows can
+  only reach through the distribution's share.
+
 ## v0.5.7 — 2026-08-31
 
 - Logging in inside a WSL tab works again. Giverny listed `CLAUDE_CONFIG_DIR`

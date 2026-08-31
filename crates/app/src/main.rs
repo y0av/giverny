@@ -1355,24 +1355,30 @@ impl App {
     /// second ago is not urgent, the tab that reopens tomorrow in the right
     /// place is the point.
     fn probe_wsl_cwds(&mut self) {
-        if let Some(rx) = &self.wsl_cwd_rx
-            && let Ok(found) = rx.try_recv()
-        {
-            self.wsl_cwd_rx = None;
-            for (tab, distro, cwd) in found {
-                let Some(id) = tab
-                    .strip_prefix("giverny-")
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .map(TabId)
-                else {
-                    continue;
-                };
-                if let Some(tab) = self.ws.tab_mut(id) {
-                    let moved = tab.cwd.as_deref() != Some(Path::new(&cwd));
-                    if moved || tab.wsl_distro.as_deref() != Some(distro.as_str()) {
-                        tab.cwd = Some(PathBuf::from(cwd));
-                        tab.wsl_distro = Some(distro);
-                        self.state_dirty = true;
+        // One take, three outcomes: an answer, a thread that died without
+        // one (which must not wedge every later sweep by leaving the
+        // receiver in place), or nothing yet.
+        let answer = self.wsl_cwd_rx.as_ref().map(|rx| rx.try_recv());
+        match answer {
+            Some(Err(crossbeam_channel::TryRecvError::Empty)) | None => {}
+            Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => self.wsl_cwd_rx = None,
+            Some(Ok(found)) => {
+                self.wsl_cwd_rx = None;
+                for (tab, distro, cwd) in found {
+                    let Some(id) = tab
+                        .strip_prefix("giverny-")
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .map(TabId)
+                    else {
+                        continue;
+                    };
+                    if let Some(tab) = self.ws.tab_mut(id) {
+                        let moved = tab.cwd.as_deref() != Some(Path::new(&cwd));
+                        if moved || tab.wsl_distro.as_deref() != Some(distro.as_str()) {
+                            tab.cwd = Some(PathBuf::from(cwd));
+                            tab.wsl_distro = Some(distro);
+                            self.state_dirty = true;
+                        }
                     }
                 }
             }

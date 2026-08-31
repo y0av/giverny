@@ -790,12 +790,15 @@ fn tab_row(
             );
         }
         ClaudeState::DoneUnseen => {
+            // Green and still: finished, nothing owed. The amber flag above
+            // is the one that wants something, and the two are told apart by
+            // colour and by movement, not by shape alone.
             p.text(
                 dot,
                 Align2::CENTER_CENTER,
                 "✓",
                 FontId::monospace(12.0),
-                c.accent,
+                c.green,
             );
         }
         ClaudeState::Idle => {
@@ -1162,11 +1165,18 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                     )
                     .on_hover_text("pushed by claude's statusline");
                 }
-                Freshness::Cache(m) if m > 30 => {
+                Freshness::Cache(m) => {
+                    // Always, not only once it is stale: "how old is this"
+                    // was unanswerable for the first half hour, which is
+                    // exactly when the number is being watched.
                     let resp = ui.label(
-                        egui::RichText::new(format!("{} old", human(m)))
-                            .font(FontId::monospace(9.0))
-                            .color(dim),
+                        egui::RichText::new(if m < 1 {
+                            "· just now".to_string()
+                        } else {
+                            format!("· {} old", human(m))
+                        })
+                        .font(FontId::monospace(9.0))
+                        .color(if m > 30 { c.amber } else { dim }),
                     );
                     if acc.statusline_on {
                         resp.on_hover_text(

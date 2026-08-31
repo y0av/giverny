@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.2 — 2026-08-31
+
+- Usage numbers follow the cache instead of a timer. Claude Code rewrites the
+  cache every time a session fetches usage; Giverny re-read it once a minute,
+  so a number could sit a minute behind a file that already had the new one.
+  The files are now checked for having been rewritten every couple of seconds —
+  one `stat` per account — and re-read the moment they are.
+
+- The panel always says how old the numbers are. It only said so past half an
+  hour, which left the first half hour — the part anyone actually watches —
+  with nothing to read. Amber once they are properly old.
+
+- A finished tab is green, not cyan. Done and needs-you were a tick and a flag
+  in two colours from the same family; they are now told apart by colour and
+  by movement as well as by shape.
+
 ## v0.6.1 — 2026-08-31
 
 - A tab inside WSL reopens where it was — actually, this time. The sweep that

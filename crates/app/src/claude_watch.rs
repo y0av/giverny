@@ -105,6 +105,10 @@ pub struct ClaudeWatch {
     last_scan: Instant,
     last_jobs: Instant,
     last_usage: Instant,
+    /// When each account's cache file was last seen changing, so a rewrite is
+    /// noticed rather than waited out.
+    cache_mtimes: HashMap<PathBuf, std::time::SystemTime>,
+    last_cache_stat: Instant,
 }
 
 /// How often the on-disk usage caches are re-read. The numbers inside them
@@ -112,6 +116,8 @@ pub struct ClaudeWatch {
 /// a statusline push, a finished refresh — updates the panel directly, so
 /// polling harder buys nothing.
 const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the cache files are checked for having been rewritten.
+const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
 
 fn needs_you(notification_type: &str) -> bool {
     matches!(
@@ -203,6 +209,8 @@ impl ClaudeWatch {
             last_scan: Instant::now() - Duration::from_secs(10),
             last_jobs: Instant::now() - Duration::from_secs(10),
             last_usage: Instant::now() - USAGE_READ_INTERVAL,
+            cache_mtimes: HashMap::new(),
+            last_cache_stat: Instant::now() - CACHE_STAT_INTERVAL,
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -457,10 +465,16 @@ impl ClaudeWatch {
             self.jobs = jobs::scan(dirs);
         }
 
-        // Re-read the caches on a slow timer, or straight away when a refresh
-        // we asked for has just rewritten one.
+        // Re-read the caches when the file says so, when a refresh we asked
+        // for has just rewritten one, or on the slow timer as a backstop.
+        //
+        // The timer alone meant a number could be a minute out of date with a
+        // file that had already been rewritten — Claude Code updates the cache
+        // itself every time a session fetches usage, which is the freshest
+        // source there is short of the statusline push.
         if self.cache_dirty.swap(false, Ordering::Relaxed)
             || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
+            || self.caches_changed()
         {
             self.refresh_usage();
         }
@@ -505,6 +519,33 @@ impl ClaudeWatch {
         {
             acc.live = Some(live);
         }
+    }
+
+    /// Has any account's cache file been rewritten since the last read?
+    ///
+    /// One `stat` per account, on the scan clock. Cheap next to re-parsing
+    /// them, and the only way to notice a session that fetched usage a
+    /// second ago.
+    fn caches_changed(&mut self) -> bool {
+        if self.last_cache_stat.elapsed() < CACHE_STAT_INTERVAL {
+            return false;
+        }
+        self.last_cache_stat = Instant::now();
+        let mut changed = false;
+        for p in &self.profiles {
+            let at = std::fs::metadata(profiles::identity_path(&p.config_dir))
+                .and_then(|m| m.modified())
+                .ok();
+            let Some(at) = at else { continue };
+            match self.cache_mtimes.get(&p.config_dir) {
+                Some(seen) if *seen == at => {}
+                _ => {
+                    self.cache_mtimes.insert(p.config_dir.clone(), at);
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn refresh_usage(&mut self) {
@@ -784,6 +825,8 @@ impl ClaudeWatch {
             last_scan: Instant::now(),
             last_jobs: Instant::now(),
             last_usage: Instant::now(),
+            cache_mtimes: HashMap::new(),
+            last_cache_stat: Instant::now(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),

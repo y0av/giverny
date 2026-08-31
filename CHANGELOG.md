@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.7 — 2026-08-31
+
+- Logging in inside a WSL tab works again. Giverny listed `CLAUDE_CONFIG_DIR`
+  in `%WSLENV%` whether or not it was setting one, and a name listed there
+  with nothing behind it does not arrive absent — it arrives empty. Claude
+  Code saw `CLAUDE_CONFIG_DIR=` and took it at its word, so `/login` said
+  "Login successful", wrote the credentials, and the next thing to look for
+  them looked somewhere else: "Not logged in · Please run /login", forever.
+  Only variables actually being set are listed now.
+
+- An empty entry in an inherited `%WSLENV%` no longer becomes a variable.
+  Windows Terminal exports a trailing colon, which the merge turned into a
+  nameless entry.
+
 ## v0.5.6 — 2026-08-30
 
 - A tab inside WSL now has a directory to remember. v0.5.5 taught tabs to

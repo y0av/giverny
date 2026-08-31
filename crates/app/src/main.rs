@@ -637,18 +637,25 @@ fn wsl_start_dir(distro: &str, was_in: Option<&Path>) -> Option<String> {
 /// Both directions matter. Going in, `GIVERNY_TAB_ID` is what makes a hook
 /// belong to a tab; coming back out, the hook runs this binary as a Windows
 /// process and needs the same variables to arrive with it.
-fn wslenv(inherited: Option<String>) -> String {
-    const OURS: [&str; 4] = [
-        "GIVERNY_TAB_ID",
-        "GIVERNY_NONCE",
-        "CLAUDE_CONFIG_DIR",
-        "GIVERNY_PROFILE_DIR",
-    ];
+///
+/// Only variables actually being set may be listed. A name in `%WSLENV%` with
+/// nothing behind it does not arrive absent — it arrives *empty*, which is a
+/// different thing entirely to whoever reads it, and for `CLAUDE_CONFIG_DIR`
+/// it is the difference between "use the default account" and "the account at
+/// the empty path".
+fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
     let mut parts: Vec<String> = inherited
         .filter(|v| !v.is_empty())
-        .map(|v| v.split(':').map(str::to_string).collect())
+        .map(|v| {
+            v.split(':')
+                // A trailing colon is common (Windows Terminal writes one)
+                // and an empty entry is not a variable.
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
-    for name in OURS {
+    for name in ours.iter().copied() {
         // An entry may carry a flag (`VAR/p`); the name before it is the key.
         if !parts
             .iter()
@@ -1872,7 +1879,20 @@ impl App {
             // config dir can be attributed to an account at all.
             env.push(("GIVERNY_PROFILE_DIR".into(), account.display().to_string()));
         }
-        env.push(("WSLENV".into(), wslenv(std::env::var("WSLENV").ok())));
+        let shared: Vec<&str> = env
+            .iter()
+            .map(|(name, _)| name.as_str())
+            // Everything we actually set that the other side reads — and
+            // only what we set, since listing a name we did not set is what
+            // put an empty CLAUDE_CONFIG_DIR in front of Claude Code.
+            .filter(|name| name.starts_with("GIVERNY_") || name.starts_with("CLAUDE_"))
+            // These two come from the spawn itself rather than from here.
+            .chain(["GIVERNY_TAB_ID", "GIVERNY_NONCE"])
+            .collect();
+        env.push((
+            "WSLENV".into(),
+            wslenv(std::env::var("WSLENV").ok(), &shared),
+        ));
         TabShape {
             shell: Some(wsl_shell(
                 &distro,
@@ -2537,13 +2557,10 @@ mod tests {
     /// replacing it would quietly break whatever else relies on it.
     #[test]
     fn wslenv_adds_ours_and_keeps_theirs() {
-        let mine = wslenv(None);
-        assert_eq!(
-            mine,
-            "GIVERNY_TAB_ID:GIVERNY_NONCE:CLAUDE_CONFIG_DIR:GIVERNY_PROFILE_DIR"
-        );
+        let mine = wslenv(None, &["GIVERNY_TAB_ID", "GIVERNY_NONCE"]);
+        assert_eq!(mine, "GIVERNY_TAB_ID:GIVERNY_NONCE");
 
-        let merged = wslenv(Some("EDITOR:PROJECT/p".into()));
+        let merged = wslenv(Some("EDITOR:PROJECT/p".into()), &["GIVERNY_TAB_ID"]);
         assert!(
             merged.starts_with("EDITOR:PROJECT/p:"),
             "theirs first: {merged}"
@@ -2551,11 +2568,17 @@ mod tests {
         assert!(merged.contains("GIVERNY_TAB_ID"));
 
         // A variable they already share is not listed twice, flag and all.
-        let dedup = wslenv(Some("CLAUDE_CONFIG_DIR/p".into()));
+        let dedup = wslenv(Some("CLAUDE_CONFIG_DIR/p".into()), &["CLAUDE_CONFIG_DIR"]);
         assert_eq!(dedup.matches("CLAUDE_CONFIG_DIR").count(), 1, "{dedup}");
         assert!(
             dedup.contains("CLAUDE_CONFIG_DIR/p"),
             "their flag survives: {dedup}"
         );
+
+        // Windows Terminal exports a trailing colon; an empty entry there
+        // would list a variable with no name.
+        let theirs = wslenv(Some("WT_SESSION:WT_PROFILE_ID:".into()), &["GIVERNY_NONCE"]);
+        assert_eq!(theirs, "WT_SESSION:WT_PROFILE_ID:GIVERNY_NONCE");
+        assert!(!theirs.contains("::"), "{theirs}");
     }
 }

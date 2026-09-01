@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.8 — 2026-09-01
+
+- `giverny doctor` prints its version, and whether a Giverny is running. Half
+  of what it reports means the opposite depending on that: "0 tabs reported by
+  the distribution" is the plainest fact in the world with the app closed, and
+  the sweep failing with it open. It now says which, and says so loudly in the
+  case that is a fault.
+
 ## v0.6.7 — 2026-09-01
 
 - `giverny doctor` says what each saved tab would do when it is next opened:

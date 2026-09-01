@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1415,6 +1415,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "smithay-clipboard",
+ "sysinfo",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -1422,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-claude"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1439,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1456,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

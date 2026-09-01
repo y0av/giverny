@@ -2434,6 +2434,27 @@ impl Drop for App {
     }
 }
 
+/// Is a Giverny already running?
+///
+/// Half of what `doctor` reports means something different depending on the
+/// answer — "0 tabs reported by the distribution" is a broken sweep when the
+/// app is up and the plainest fact in the world when it is not — and every
+/// report so far has had to be read without knowing which.
+fn app_is_running() -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let me = std::process::id();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    sys.processes().iter().any(|(pid, proc)| {
+        pid.as_u32() != me
+            && proc
+                .name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("giverny")
+    })
+}
+
 /// What each saved tab would do when it is next opened.
 ///
 /// The same plan the app follows, run against the workspace on disk. "Why did
@@ -2498,21 +2519,30 @@ fn restore_report(profs: &[giverny_claude::profiles::Profile]) {
 fn doctor() {
     use giverny_claude::{hooks, profiles, registry, usage};
 
-    println!("giverny doctor\n");
+    println!("giverny doctor {}\n", update::CURRENT);
+    let running = app_is_running();
+    println!(
+        "app          {}\n",
+        if running {
+            "running (tabs and sessions below are live)"
+        } else {
+            "not running — nothing here has tabs, and \"0 tabs reported\" means only that"
+        }
+    );
 
     // Hook transport differs by platform: a unix socket where one exists,
     // otherwise the spool file the relay always falls back to.
     #[cfg(unix)]
     {
         let socket = hooks::socket_path();
-        let app_running = std::os::unix::net::UnixStream::connect(&socket).is_ok();
-        println!("relay        unix socket {}", socket.display());
+        let listening = std::os::unix::net::UnixStream::connect(&socket).is_ok();
         println!(
-            "app running  {}\n",
-            if app_running {
-                "yes (hooks deliver live)"
+            "relay        unix socket {} — {}\n",
+            socket.display(),
+            if listening {
+                "listening (hooks deliver live)"
             } else {
-                "no (events spool to disk until it starts)"
+                "nobody listening (events spool to disk)"
             }
         );
     }
@@ -2622,10 +2652,10 @@ fn doctor() {
             println!(
                 "             tabs    {} reported by the distribution{}",
                 found.len(),
-                if found.is_empty() {
-                    " (none open, or the sweep is not working)"
-                } else {
-                    ""
+                match (found.is_empty(), running) {
+                    (true, true) => " — GIVERNY TABS ARE OPEN, SO THIS IS THE SWEEP FAILING",
+                    (true, false) => " (expected: giverny is not running)",
+                    (false, _) => "",
                 }
             );
             for (tab, cwd) in found {

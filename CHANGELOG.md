@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.6 — 2026-09-01
+
+- A tab's conversation survives the app closing. Claude Code runs its
+  `SessionEnd` hook on the way down, and when Giverny is the thing going down
+  there is nothing listening: the relay spools the message instead. At the next
+  launch the spool is drained and replayed — and the replay cleared
+  `claude_session` on every tab that had one, seconds before those tabs were
+  restored and asked what to resume. Nothing resumed, and nothing was logged,
+  because a tab with no conversation is not an error. Spooled `SessionEnd`
+  messages are ignored now: what ended those sessions was the app closing. A
+  live one still clears, because that one means the user left.
+
+- Queuing a resume says so in the log, so "it did not resume" is one line to
+  read rather than four branches to reason about.
+
 ## v0.6.5 — 2026-09-01
 
 - A tab inside WSL resumes its conversation again. Before restoring one,

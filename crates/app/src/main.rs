@@ -768,11 +768,14 @@ impl App {
                             msg.config_dir.as_deref().map(std::path::PathBuf::from);
                     }
                 }
-                Some("SessionEnd") => {
-                    if let Some(tab) = ws.tab_mut(id) {
-                        tab.claude_session = None;
-                    }
-                }
+                // Deliberately not SessionEnd. These messages are the ones
+                // that arrived while the app was closed — and what ends every
+                // session in a tab is the app closing. Claude Code runs its
+                // SessionEnd hook on the way down, the relay spools it because
+                // there is nothing listening any more, and replaying that here
+                // erased the conversation of every tab that had one, seconds
+                // before the tab was restored and asked what to resume. A live
+                // SessionEnd still clears it: that one means the user left.
                 _ => {}
             }
         }
@@ -1820,6 +1823,7 @@ impl App {
             return;
         };
         if let Some(cmd) = self.resume_command(&sid, id) {
+            tracing::info!("tab {id:?}: resuming claude session {sid}");
             self.pending_inject.push((
                 Instant::now() + Duration::from_millis(1300),
                 id,
@@ -1840,6 +1844,7 @@ impl App {
         if let Some(sid) = tab.claude_session.clone() {
             return Some(sid);
         }
+        tracing::debug!("tab {id:?}: no conversation recorded; checking its last command");
         let mined = tab
             .foreground
             .as_deref()

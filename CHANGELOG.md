@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.3 — 2026-08-31
+
+- Installing hooks no longer conjures a second, empty account. `~/.claude` was
+  taken as an account for existing at all, and writing `settings.json` into it
+  is what makes it exist — so on a machine whose Claude Code lives in WSL,
+  setting the WSL account up created a Windows-side twin with no identity, no
+  usage and nothing in it but our own file, sitting in the rail forever. The
+  default directory now needs the same evidence as every other candidate,
+  except when it is the only thing there is.
+
+- Two sweeps moved off the UI thread: the one that finds each tab's repository
+  and branch, and the one that watches the usage caches for being rewritten.
+  Both walk directories that, for an account inside WSL, are on the far side of
+  the distribution's share — where a stopped distribution turns a `stat` into
+  a wait of seconds, twice a second, between two frames.
+
 ## v0.6.2 — 2026-08-31
 
 - Usage numbers follow the cache instead of a timer. Claude Code rewrites the

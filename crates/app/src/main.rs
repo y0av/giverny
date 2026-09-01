@@ -498,6 +498,9 @@ pub struct App {
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
+    #[allow(clippy::type_complexity)]
+    repo_rx:
+        Option<crossbeam_channel::Receiver<Vec<(TabId, PathBuf, Option<PathBuf>, Option<String>)>>>,
     /// Directories for tabs inside WSL, asked of the distribution itself
     /// because nothing on this side of the boundary knows them.
     wsl_cwd_rx: Option<crossbeam_channel::Receiver<Vec<(String, String, String)>>>,
@@ -799,6 +802,7 @@ impl App {
             row_rects: Vec::new(),
             stale_sessions: false,
             repo_cache: HashMap::new(),
+            repo_rx: None,
             wsl_cwd_rx: None,
             last_wsl_probe: Instant::now() - Duration::from_secs(60),
             update: None,
@@ -1422,46 +1426,76 @@ impl App {
 
     /// Which repository each tab is in, for the rail's by-repository view.
     ///
-    /// Cached by directory: tabs share them, the answer only changes when a
-    /// tab moves, and over the WSL share every one of these is a round trip
-    /// rather than a `stat`.
+    /// Off the UI thread, because for a tab inside WSL every one of these
+    /// lookups is a round trip over the distribution's share — walking a few
+    /// ancestors for each of a dozen tabs, twice a minute, is not something to
+    /// do between two frames. Cached by directory: tabs share them, and the
+    /// answer only changes when a tab moves.
     fn refresh_repos(&mut self) {
+        let answer = self.repo_rx.as_ref().map(|rx| rx.try_recv());
+        match answer {
+            Some(Err(crossbeam_channel::TryRecvError::Empty)) | None => {}
+            Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => self.repo_rx = None,
+            Some(Ok(found)) => {
+                self.repo_rx = None;
+                for (id, dir, repo, branch) in found {
+                    self.repo_cache.insert(dir, repo.clone());
+                    if let Some(tab) = self.ws.tab_mut(id) {
+                        if tab.git_repo != repo {
+                            tab.git_repo = repo;
+                            self.state_dirty = true;
+                        }
+                        // Only ever had a branch once a tab had been focused,
+                        // because the /proc refresh that set it runs for the
+                        // active tab alone.
+                        tab.git_branch = branch;
+                    }
+                }
+            }
+        }
+        if self.repo_rx.is_some() {
+            return;
+        }
         let dirs: Vec<(TabId, PathBuf)> = self
             .ws
             .tabs
             .iter()
             .filter_map(|t| Some((t.id, self.local_path(t)?)))
             .collect();
-        // One HEAD read per repository rather than per tab: every tab in a
-        // checkout is on the same branch, and over the WSL share each read is
-        // a round trip. Not cached across sweeps — a branch is the thing that
-        // changes.
-        let mut branches: HashMap<PathBuf, Option<String>> = HashMap::new();
-        for (id, dir) in dirs {
-            let repo = match self.repo_cache.get(&dir) {
-                Some(hit) => hit.clone(),
-                None => {
-                    let found = giverny_core::git::repo_root(&dir);
-                    self.repo_cache.insert(dir, found.clone());
-                    found
-                }
-            };
-            let branch = match &repo {
-                Some(root) => branches
-                    .entry(root.clone())
-                    .or_insert_with(|| giverny_core::git::branch_of(root))
-                    .clone(),
-                None => None,
-            };
-            if let Some(tab) = self.ws.tab_mut(id) {
-                if tab.git_repo != repo {
-                    tab.git_repo = repo;
-                    self.state_dirty = true;
-                }
-                // Only ever had a branch once a tab had been focused, because
-                // the /proc refresh that set it runs for the active tab alone.
-                tab.git_branch = branch;
-            }
+        if dirs.is_empty() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let known = self.repo_cache.clone();
+        if std::thread::Builder::new()
+            .name("giverny repo sweep".into())
+            .spawn(move || {
+                // One HEAD read per repository rather than per tab: every tab
+                // in a checkout is on the same branch. Repository roots are
+                // remembered between sweeps; a branch is the thing that
+                // changes, so it never is.
+                let mut branches: HashMap<PathBuf, Option<String>> = HashMap::new();
+                let found = dirs
+                    .into_iter()
+                    .map(|(id, dir)| {
+                        let repo = match known.get(&dir) {
+                            Some(hit) => hit.clone(),
+                            None => giverny_core::git::repo_root(&dir),
+                        };
+                        let branch = repo.as_ref().and_then(|root| {
+                            branches
+                                .entry(root.clone())
+                                .or_insert_with(|| giverny_core::git::branch_of(root))
+                                .clone()
+                        });
+                        (id, dir, repo, branch)
+                    })
+                    .collect();
+                let _ = tx.send(found);
+            })
+            .is_ok()
+        {
+            self.repo_rx = Some(rx);
         }
     }
 

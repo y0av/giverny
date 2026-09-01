@@ -190,7 +190,12 @@ pub fn discover(extra: &[PathBuf]) -> Vec<Profile> {
     };
 
     if let Some(home) = dirs::home_dir() {
-        push(home.join(".claude"), false);
+        // Evidence required, like everywhere else. Installing hooks *creates*
+        // this directory — `settings.json` needs a parent — so on a machine
+        // whose Claude Code lives in WSL, the act of setting the WSL account
+        // up conjured a second, empty account beside it, with no identity and
+        // no usage, permanently in the rail.
+        push(home.join(".claude"), true);
     }
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         push(PathBuf::from(dir), false);
@@ -205,6 +210,15 @@ pub fn discover(extra: &[PathBuf]) -> Vec<Profile> {
     }
     for dir in extra {
         push(dir.clone(), false);
+    }
+    // Unless nothing turned up at all: a first run, where `~/.claude` exists
+    // but nothing has happened in it yet, should still see its own account
+    // rather than be told there is none.
+    if out.is_empty()
+        && let Some(home) = dirs::home_dir()
+        && home.join(".claude").is_dir()
+    {
+        out.push(profile_for(home.join(".claude")));
     }
     out
 }
@@ -233,6 +247,20 @@ mod tests {
             format!(r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"u"}}}}"#),
         )
         .unwrap();
+    }
+
+    /// The directory installing hooks creates is not an account.
+    #[test]
+    fn a_bare_settings_json_does_not_make_an_account() {
+        let root = scratch("bare");
+        let dir = root.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        assert!(
+            !looks_like_account(&dir),
+            "hooks written into an empty directory are not an identity"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

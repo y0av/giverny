@@ -107,8 +107,11 @@ pub struct ClaudeWatch {
     last_usage: Instant,
     /// When each account's cache file was last seen changing, so a rewrite is
     /// noticed rather than waited out.
-    cache_mtimes: HashMap<PathBuf, std::time::SystemTime>,
+    cache_mtimes: Arc<Mutex<HashMap<PathBuf, std::time::SystemTime>>>,
     last_cache_stat: Instant,
+    /// One stat sweep at a time: a share that is slow to answer must not
+    /// stack up threads behind it.
+    stat_in_flight: Arc<AtomicFlag>,
 }
 
 /// How often the on-disk usage caches are re-read. The numbers inside them
@@ -118,6 +121,19 @@ pub struct ClaudeWatch {
 const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the cache files are checked for having been rewritten.
 const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A bool two threads share. `AtomicBool` in a name that says what it is for.
+#[derive(Default)]
+pub struct AtomicFlag(AtomicBool);
+
+impl AtomicFlag {
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}
 
 fn needs_you(notification_type: &str) -> bool {
     matches!(
@@ -209,8 +225,9 @@ impl ClaudeWatch {
             last_scan: Instant::now() - Duration::from_secs(10),
             last_jobs: Instant::now() - Duration::from_secs(10),
             last_usage: Instant::now() - USAGE_READ_INTERVAL,
-            cache_mtimes: HashMap::new(),
+            cache_mtimes: Arc::new(Mutex::new(HashMap::new())),
             last_cache_stat: Instant::now() - CACHE_STAT_INTERVAL,
+            stat_in_flight: Arc::new(AtomicFlag::default()),
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -472,9 +489,9 @@ impl ClaudeWatch {
         // file that had already been rewritten — Claude Code updates the cache
         // itself every time a session fetches usage, which is the freshest
         // source there is short of the statusline push.
+        self.watch_caches();
         if self.cache_dirty.swap(false, Ordering::Relaxed)
             || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
-            || self.caches_changed()
         {
             self.refresh_usage();
         }
@@ -521,31 +538,42 @@ impl ClaudeWatch {
         }
     }
 
-    /// Has any account's cache file been rewritten since the last read?
+    /// Watch the cache files for being rewritten, off the UI thread.
     ///
-    /// One `stat` per account, on the scan clock. Cheap next to re-parsing
-    /// them, and the only way to notice a session that fetched usage a
-    /// second ago.
-    fn caches_changed(&mut self) -> bool {
-        if self.last_cache_stat.elapsed() < CACHE_STAT_INTERVAL {
-            return false;
+    /// A `stat` is cheap until the file is inside a stopped WSL distribution,
+    /// where the first touch of the share starts it and takes seconds. Twice
+    /// a second on the UI thread, that is a frozen window. The thread sets the
+    /// same dirty flag a refresh we asked for sets, and the read happens on
+    /// the next tick either way.
+    fn watch_caches(&mut self) {
+        if self.last_cache_stat.elapsed() < CACHE_STAT_INTERVAL || self.stat_in_flight.get() {
+            return;
         }
         self.last_cache_stat = Instant::now();
-        let mut changed = false;
-        for p in &self.profiles {
-            let at = std::fs::metadata(profiles::identity_path(&p.config_dir))
-                .and_then(|m| m.modified())
-                .ok();
-            let Some(at) = at else { continue };
-            match self.cache_mtimes.get(&p.config_dir) {
-                Some(seen) if *seen == at => {}
-                _ => {
-                    self.cache_mtimes.insert(p.config_dir.clone(), at);
-                    changed = true;
+        let paths: Vec<PathBuf> = self
+            .profiles
+            .iter()
+            .map(|p| profiles::identity_path(&p.config_dir))
+            .collect();
+        let seen = Arc::clone(&self.cache_mtimes);
+        let dirty = Arc::clone(&self.cache_dirty);
+        let in_flight = Arc::clone(&self.stat_in_flight);
+        in_flight.set(true);
+        let _ = std::thread::Builder::new()
+            .name("giverny usage stat".into())
+            .spawn(move || {
+                for path in paths {
+                    let Ok(at) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                        continue;
+                    };
+                    let mut seen = seen.lock().unwrap();
+                    if seen.get(&path) != Some(&at) {
+                        seen.insert(path, at);
+                        dirty.store(true, Ordering::Relaxed);
+                    }
                 }
-            }
-        }
-        changed
+                in_flight.set(false);
+            });
     }
 
     fn refresh_usage(&mut self) {
@@ -825,8 +853,9 @@ impl ClaudeWatch {
             last_scan: Instant::now(),
             last_jobs: Instant::now(),
             last_usage: Instant::now(),
-            cache_mtimes: HashMap::new(),
+            cache_mtimes: Arc::new(Mutex::new(HashMap::new())),
             last_cache_stat: Instant::now(),
+            stat_in_flight: Arc::new(AtomicFlag::default()),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),

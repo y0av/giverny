@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.4 — 2026-08-31
+
+- Giverny starts on a machine with Docker Desktop installed. Account discovery
+  asks each WSL distribution where its home is, during startup, and Docker
+  Desktop installs two distributions of its own — asking one of those about
+  itself while Docker is not running never returns. The window never opened,
+  nothing was printed, and there was nothing to see: the hang was before the
+  first log line. Docker's distributions are skipped now (they hold no home and
+  no account), and every `wsl.exe` call has a six-second deadline and a kill
+  behind it, so no distribution can hold the app hostage again.
+
 ## v0.6.3 — 2026-08-31
 
 - Installing hooks no longer conjures a second, empty account. `~/.claude` was

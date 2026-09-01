@@ -283,9 +283,20 @@ mod imp {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::{LazyLock, Mutex, OnceLock};
+    use std::time::Duration;
 
     /// CREATE_NO_WINDOW: no console flashes up in front of the app.
     const NO_WINDOW: u32 = 0x0800_0000;
+
+    /// Distributions that belong to another program rather than to a person.
+    ///
+    /// Docker Desktop installs two, and they hold no home, no shell worth
+    /// speaking of and certainly no Claude account. Asking one of them about
+    /// itself while Docker is not running is where the startup hang came
+    /// from, and there was never a reason to ask.
+    fn is_infrastructure(name: &str) -> bool {
+        name.starts_with("docker-desktop")
+    }
 
     pub fn command(distro: &str) -> Command {
         let mut cmd = Command::new("wsl.exe");
@@ -296,15 +307,48 @@ mod imp {
         cmd
     }
 
+    /// How long any one `wsl.exe` may take before it is abandoned.
+    ///
+    /// Every call here can land on a distribution that has to be started
+    /// first, and some never answer at all. Discovery runs during startup, so
+    /// "never answers" means a window that never opens — which is exactly what
+    /// a machine with Docker Desktop's distributions installed saw: no output,
+    /// no crash, no window.
+    const CAP: Duration = Duration::from_secs(6);
+
     /// Run something inside `distro` and return its stdout, trimmed.
-    /// `None` when the distribution, or the command, is not there.
+    /// `None` when the distribution, or the command, is not there — or when it
+    /// takes longer than anyone can wait for a terminal to open.
     pub fn capture(distro: &str, args: &[&str]) -> Option<String> {
-        let out = command(distro).arg("--").args(args).output().ok()?;
+        let mut cmd = command(distro);
+        cmd.arg("--").args(args);
+        let out = run_capped(cmd)?;
         if !out.status.success() {
             return None;
         }
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!text.is_empty()).then_some(text)
+    }
+
+    /// `Command::output`, with a deadline and a kill behind it.
+    pub fn run_capped(mut cmd: Command) -> Option<std::process::Output> {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + CAP;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return None,
+            }
+        }
     }
 
     /// Installed distributions, asked once. `wsl.exe -l -q` answers in
@@ -313,12 +357,11 @@ mod imp {
     pub fn distros() -> &'static [String] {
         static DISTROS: OnceLock<Vec<String>> = OnceLock::new();
         DISTROS.get_or_init(|| {
-            let Ok(out) = Command::new("wsl.exe")
-                .args(["-l", "-q"])
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args(["-l", "-q"])
                 .creation_flags(NO_WINDOW)
-                .stdin(Stdio::null())
-                .output()
-            else {
+                .stdin(Stdio::null());
+            let Some(out) = run_capped(cmd) else {
                 return Vec::new();
             };
             if !out.status.success() {
@@ -335,6 +378,7 @@ mod imp {
                 .lines()
                 .map(|line| line.trim().trim_matches('\u{feff}').to_string())
                 .filter(|line| !line.is_empty())
+                .filter(|name| !is_infrastructure(name))
                 .collect()
         })
     }
@@ -370,12 +414,11 @@ mod imp {
         static DEFAULT: OnceLock<Option<String>> = OnceLock::new();
         DEFAULT
             .get_or_init(|| {
-                let out = Command::new("wsl.exe")
-                    .args(["--", "sh", "-c", "printf %s \"$WSL_DISTRO_NAME\""])
+                let mut cmd = Command::new("wsl.exe");
+                cmd.args(["--", "sh", "-c", "printf %s \"$WSL_DISTRO_NAME\""])
                     .creation_flags(NO_WINDOW)
-                    .stdin(Stdio::null())
-                    .output()
-                    .ok()?;
+                    .stdin(Stdio::null());
+                let out = run_capped(cmd)?;
                 out.status
                     .success()
                     .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())?

@@ -760,23 +760,19 @@ impl App {
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else {
                 continue;
             };
-            match msg.hook_event() {
-                Some("SessionStart") => {
-                    if let Some(tab) = ws.tab_mut(id) {
-                        tab.claude_session = msg.session_id().map(str::to_string);
-                        tab.claude_config_dir =
-                            msg.config_dir.as_deref().map(std::path::PathBuf::from);
-                    }
-                }
-                // Deliberately not SessionEnd. These messages are the ones
-                // that arrived while the app was closed — and what ends every
-                // session in a tab is the app closing. Claude Code runs its
-                // SessionEnd hook on the way down, the relay spools it because
-                // there is nothing listening any more, and replaying that here
-                // erased the conversation of every tab that had one, seconds
-                // before the tab was restored and asked what to resume. A live
-                // SessionEnd still clears it: that one means the user left.
-                _ => {}
+            // SessionStart only, deliberately. These are the messages that
+            // arrived while the app was closed — and what ends every session
+            // in a tab is the app closing. Claude Code runs its SessionEnd
+            // hook on the way down, the relay spools it because there is
+            // nothing listening any more, and replaying that here erased the
+            // conversation of every tab that had one, seconds before the tab
+            // was restored and asked what to resume. A live SessionEnd still
+            // clears it: that one means the user left.
+            if let Some("SessionStart") = msg.hook_event()
+                && let Some(tab) = ws.tab_mut(id)
+            {
+                tab.claude_session = msg.session_id().map(str::to_string);
+                tab.claude_config_dir = msg.config_dir.as_deref().map(std::path::PathBuf::from);
             }
         }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.12 — 2026-09-01
+
+- The OpenGL fallback actually fires. v0.6.11 wrapped the event loop in
+  `catch_unwind`, and there was nothing to catch: wgpu's surface failure panics
+  and then panics again unwinding, and a panic while panicking aborts the
+  process where it stands. The retry is decided in a panic hook now, which runs
+  first, on the panicking thread, while the process can still do something.
+
 ## v0.6.11 — 2026-09-01
 
 - Giverny opens on machines without a modern GPU. wgpu needs Vulkan, Metal or

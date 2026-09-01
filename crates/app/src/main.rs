@@ -155,11 +155,9 @@ fn pick_renderer() -> eframe::Renderer {
 
 /// Start again on OpenGL, once, after wgpu failed to put a window on screen.
 ///
-/// The adapter check above catches a machine with no GPU at all; it cannot
-/// catch a driver that enumerates an adapter and then fails to hand over a
-/// surface, which is what an old Intel driver does. That failure arrives as a
-/// panic from inside the event loop, so the only way to answer it is to run
-/// again having decided differently.
+/// Called from the panic hook, which is the last moment this process is still
+/// able to do anything: what follows it is an abort. The child inherits the
+/// arguments and is told which renderer to use, so it cannot arrive back here.
 fn restart_on_opengl() -> ! {
     let exe = std::env::current_exe().unwrap_or_else(|_| "giverny".into());
     let status = std::process::Command::new(exe)
@@ -307,23 +305,31 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    let on_wgpu = renderer == eframe::Renderer::Wgpu;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eframe::run_native(
-            "Giverny",
-            options,
-            Box::new(|cc| Ok(Box::new(App::new(cc)))),
-        )
-    }));
-    let result = match result {
-        Ok(result) => result,
-        // wgpu panics rather than returning when it cannot get a surface.
-        Err(_) if on_wgpu => {
-            tracing::warn!("the GPU renderer failed to start; retrying on OpenGL");
-            restart_on_opengl()
-        }
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
+    // A hook rather than `catch_unwind`: wgpu's failure panics, and then
+    // panics again on the way out, and a panic while panicking aborts the
+    // process on the spot — there is nothing left to catch. A hook runs
+    // first, on the panicking thread, before any of that.
+    if renderer == eframe::Renderer::Wgpu && std::env::var_os("GIVERNY_RENDERER").is_none() {
+        let inherited = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            if message.contains("wgpu") || message.contains("Surface") {
+                eprintln!("giverny: the GPU renderer failed; starting again on OpenGL");
+                restart_on_opengl();
+            }
+            inherited(info);
+        }));
+    }
+    let result = eframe::run_native(
+        "Giverny",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
     // drag-and-drop must not be able to leave the app unlaunchable, with the

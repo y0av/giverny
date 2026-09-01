@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.6.9 — 2026-09-01
+
+- The hook installed for an account inside WSL is a command that distribution
+  can run. It is this binary, named as WSL sees it, and the conversion asks
+  `wslpath` — through a command line carrying a Windows path, backslashes,
+  colon and all, which is the same rebuild that silently ate the directory
+  sweep's script. When it failed, the code fell back to writing `C:\Users\…\
+  giverny.exe relay` into a file only Linux reads: a hook that is installed,
+  looks right, and can never run. Claude Code fired it on every session start
+  and nothing ever reached Giverny — no session ids, no live states, nothing to
+  resume. The path now travels in a file like the sweep script does, and falls
+  back to the default mount point rather than to a drive letter. A stale
+  command is already rewritten at startup, so this repairs itself.
+
+- `giverny doctor` prints the command each account's hooks actually run, and
+  says plainly when an account inside WSL has been given a Windows path.
+
 ## v0.6.8 — 2026-09-01
 
 - `giverny doctor` prints its version, and whether a Giverny is running. Half

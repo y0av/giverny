@@ -469,6 +469,28 @@ fn is_our_entry(v: &serde_json::Value) -> bool {
         })
 }
 
+/// The relay command this settings file actually holds, whatever it is.
+///
+/// What a hook *says* it runs is the difference between a hook that works and
+/// one that fires into nothing, and "installed ✓" cannot tell them apart.
+pub fn installed_command(settings_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(settings_path).ok()?;
+    let root: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    root.get("hooks")?
+        .as_object()?
+        .values()
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter(|entry| is_our_entry(entry))
+        .find_map(|entry| {
+            entry
+                .get("hooks")?
+                .as_array()?
+                .iter()
+                .find_map(|h| h.get("command")?.as_str().map(str::to_string))
+        })
+}
+
 /// Is the relay present (for any exe path) in this settings file?
 pub fn installed_in(settings_path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(settings_path) else {

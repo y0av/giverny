@@ -99,6 +99,16 @@ pub fn canonical_config_dir(reported: &Path, known: &[PathBuf]) -> Option<PathBu
         .cloned()
 }
 
+/// Where a drive is mounted by default, for a distribution that answered
+/// nothing at all. Wrong only where someone has moved the automount root, and
+/// better than handing Linux a path with a drive letter in it.
+pub fn mnt_guess(windows_path: &Path) -> Option<String> {
+    let text = windows_path.to_str()?;
+    let (drive, rest) = text.split_once(":\\")?;
+    let drive = drive.chars().next()?.to_ascii_lowercase();
+    Some(format!("/mnt/{drive}/{}", rest.replace('\\', "/")))
+}
+
 /// Where each Giverny tab's shell is, inside every distribution:
 /// `(tab id, distribution, unix path)`.
 ///
@@ -502,25 +512,37 @@ mod imp {
         })
     }
 
-    /// `windows_path` as the distribution sees it. Asked of `wslpath`, which
-    /// knows where the drives are mounted; assuming `/mnt/c` is a guess that
-    /// is wrong on any machine with a custom automount root.
+    /// `windows_path` as the distribution sees it.
+    ///
+    /// Asked of `wslpath`, which knows where the drives are actually mounted —
+    /// but asked through a *file*, not through an argument. A Windows path is
+    /// backslashes and a colon, and a command line carrying one across this
+    /// boundary is rebuilt on the way through; when that mangles it, wslpath
+    /// answers nothing and the caller falls back to writing a `C:\` path into
+    /// a file only Linux will read. Which is a hook that can never run, and
+    /// says nothing when it doesn't.
     pub fn to_wsl_path(distro: &str, windows_path: &Path) -> Option<String> {
         let key = format!("{distro}\u{0}{}", windows_path.display());
-        let store: &'static LazyLock<Mutex<HashMap<String, Option<String>>>> = &EXES;
-        if let Some(hit) = store.lock().ok()?.get(&key) {
+        if let Some(hit) = EXES.lock().ok()?.get(&key) {
             return hit.clone();
         }
-        let answer = capture(
-            distro,
-            &["wslpath", "-a", "-u", &windows_path.to_string_lossy()],
-        )
-        .filter(|path| path.starts_with('/'));
-        if let Ok(mut map) = store.lock() {
+        let answer = ask_wslpath(distro, windows_path).or_else(|| mnt_guess(windows_path));
+        if let Ok(mut map) = EXES.lock() {
             map.insert(key, answer.clone());
         }
         answer
     }
+
+    /// Put the path in the script, where nothing rewrites it.
+    fn ask_wslpath(distro: &str, windows_path: &Path) -> Option<String> {
+        const AT: &str = "/tmp/.giverny-wslpath.sh";
+        let quoted = windows_path.to_string_lossy().replace('\'', r"'\''");
+        let script = format!("wslpath -a -u '{quoted}'\n");
+        std::fs::write(super::unc_path(distro, AT), script).ok()?;
+        capture(distro, &["sh", AT]).filter(|path| path.starts_with('/'))
+    }
+
+    pub use super::mnt_guess;
 }
 
 #[cfg(windows)]
@@ -645,6 +667,20 @@ mod tests {
             vec![("giverny-1".into(), "/home/ita/my proj".into())]
         );
         assert!(parse_tab_cwds("nonsense\n").is_empty());
+    }
+
+    /// The fallback when a distribution will not answer: a path Linux can at
+    /// least attempt, rather than one with a drive letter in it.
+    #[test]
+    fn a_windows_path_has_a_default_mount_point() {
+        assert_eq!(
+            mnt_guess(Path::new(
+                r"C:\Users\ita\AppData\Local\Giverny\bin\giverny.exe"
+            ))
+            .as_deref(),
+            Some("/mnt/c/Users/ita/AppData/Local/Giverny/bin/giverny.exe")
+        );
+        assert_eq!(mnt_guess(Path::new("/already/unix")), None);
     }
 
     #[test]

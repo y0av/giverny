@@ -2691,6 +2691,21 @@ fn doctor() {
                 "MISSING — click 'install' in the rail"
             }
         );
+        // The command itself, because a hook pointing at a path its own shell
+        // cannot run is installed, correct-looking, and completely inert.
+        if let Some(cmd) = hooks::installed_command(&settings) {
+            let runnable = !giverny_claude::wsl::is_wsl_path(&p.config_dir)
+                || cmd.starts_with('/')
+                || cmd.starts_with('\'');
+            println!(
+                "    runs       {cmd}{}",
+                if runnable {
+                    ""
+                } else {
+                    "  ← THIS IS A WINDOWS PATH; THE SHELL RUNNING IT IS NOT"
+                }
+            );
+        }
         println!(
             "    statusline {}",
             if sl_ok {

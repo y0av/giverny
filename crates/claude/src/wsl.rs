@@ -141,9 +141,11 @@ pub fn tab_cwds_in(distro: &str) -> Vec<(String, String)> {
     if std::fs::write(unc_path(distro, AT), TAB_CWD_SCRIPT).is_err() {
         return Vec::new();
     }
-    imp::capture(distro, &["sh", AT])
-        .map(|text| parse_tab_cwds(&text))
-        .unwrap_or_default()
+    let Some(text) = imp::capture(distro, &["sh", AT]) else {
+        return Vec::new();
+    };
+    publish_live_pids(distro, parse_live_pids(&text));
+    parse_tab_cwds(&text)
 }
 
 /// Nothing to probe where there is no distribution.
@@ -163,7 +165,56 @@ cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
 [ -n "$cwd" ] || continue
 ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "$d/status" 2>/dev/null)
 printf '%s\t%s\t%s\t%s\n' "$id" "${d#/proc/}" "$ppid" "$cwd"
-done"#;
+done
+printf 'pids'
+for d in /proc/[0-9]*; do printf ' %s' "${d#/proc/}"; done
+printf '\n'"#;
+
+/// The `pids` line: every process id the distribution had when asked.
+#[cfg(any(windows, test))]
+fn parse_live_pids(text: &str) -> Vec<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("pids "))
+        .map(|list| {
+            list.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What the last sweep saw running inside each distribution.
+///
+/// Read by the session registry, which cannot ask for itself: it is consulted
+/// from the UI thread, and a `wsl.exe` launch there is a frozen window. So the
+/// sweep — already off-thread, already walking `/proc` — leaves the answer
+/// here, and the registry only ever reads it.
+static LIVE_PIDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u32>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Publish one distribution's live pids. Called only by the sweep.
+pub fn publish_live_pids(distro: &str, pids: Vec<u32>) {
+    if pids.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = LIVE_PIDS.lock() {
+        map.insert(distro.to_string(), pids.into_iter().collect());
+    }
+}
+
+/// Is `pid` running inside the distribution holding `config_dir`?
+///
+/// `None` when no sweep has reported that distribution yet — at startup, or
+/// where Giverny has no tab in it. The caller decides what to do with not
+/// knowing; treating it as "still running" would refuse to restore a
+/// conversation on exactly the launch that wants to.
+pub fn pid_alive_in(config_dir: &Path, pid: u32) -> Option<bool> {
+    let (distro, _) = split_unc(config_dir)?;
+    let map = LIVE_PIDS.lock().ok()?;
+    let pids = map.get(&distro)?;
+    Some(pids.contains(&pid))
+}
 
 /// One directory per tab, from the script's per-process lines.
 ///
@@ -570,6 +621,19 @@ mod tests {
             assert!(!tab.is_empty());
             assert!(cwd.starts_with('/'), "{cwd}");
         }
+    }
+
+    /// The pid list rides along with the same sweep, and is not mistaken for
+    /// a tab.
+    #[test]
+    fn the_pid_line_is_read_and_not_confused_for_a_tab() {
+        let text = "giverny-3\t900\t1\t/home/ita/proj\npids 1 2 900 1043\n";
+        assert_eq!(parse_live_pids(text), vec![1, 2, 900, 1043]);
+        assert_eq!(
+            parse_tab_cwds(text),
+            vec![("giverny-3".to_string(), "/home/ita/proj".to_string())]
+        );
+        assert!(parse_live_pids("giverny-3\t900\t1\t/home/x\n").is_empty());
     }
 
     /// A directory with a space in it is still one field.

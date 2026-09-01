@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.5 — 2026-09-01
+
+- A tab inside WSL resumes its conversation again. Before restoring one,
+  Giverny checks that the session is not already open somewhere else, and for
+  an account inside a distribution that check had nothing real to go on: it
+  used the registry file's freshness, and a file written seconds before the app
+  closed reads as freshly written for two minutes afterwards — which is exactly
+  when someone restarts. Every tab was told its conversation was live
+  elsewhere, and none of them came back. The distribution is asked now instead:
+  the sweep that already walks its `/proc` reports which pids exist, and the
+  check reads that. Not knowing means "not running", because the alternative
+  refuses to restore a conversation on the launch that wants it most.
+
 ## v0.6.4 — 2026-08-31
 
 - Giverny starts on a machine with Docker Desktop installed. Account discovery

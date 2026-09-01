@@ -65,17 +65,17 @@ pub struct LiveSession {
 ///
 /// A pid only means something on the machine that issued it. An account
 /// inside WSL, read from Windows, hands us Linux pids: checking those against
-/// the Windows process table is not a weaker answer, it is an unrelated one —
-/// and a collision would claim a long-dead session is live, which is enough
-/// to refuse to restore a tab. The file's own freshness is the signal that
-/// survives the crossing: Claude Code rewrites it on every state change, so
-/// anything anyone is actually using stays warm.
-fn entry_is_live(config_dir: &Path, path: &Path, entry: &SessionEntry) -> bool {
+/// the Windows process table is not a weaker answer, it is an unrelated one.
+/// The distribution is asked instead, by the sweep that already walks its
+/// `/proc`, and this reads what that sweep left behind.
+fn entry_is_live(config_dir: &Path, entry: &SessionEntry) -> bool {
     if crate::wsl::is_wsl_path(config_dir) {
-        const FRESH: std::time::Duration = std::time::Duration::from_secs(120);
-        return std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < FRESH));
+        // The pids in there are the distribution's, and the last sweep asked
+        // it which ones exist. Not knowing means no: an unanswered question
+        // used to read as "still running", which is the answer that refuses
+        // to bring a conversation back — and it was wrong for the two minutes
+        // after a restart, which is precisely when the app restarts.
+        return crate::wsl::pid_alive_in(config_dir, entry.pid).unwrap_or(false);
     }
     pid_alive(entry.pid)
 }
@@ -122,7 +122,7 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
             let Ok(entry) = serde_json::from_slice::<SessionEntry>(&bytes) else {
                 continue;
             };
-            if entry_is_live(&dir, &path, &entry) {
+            if entry_is_live(&dir, &entry) {
                 out.push(LiveSession {
                     entry,
                     config_dir: dir.clone(),

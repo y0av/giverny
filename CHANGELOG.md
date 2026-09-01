@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.11 — 2026-09-01
+
+- Giverny opens on machines without a modern GPU. wgpu needs Vulkan, Metal or
+  DX12; a machine with none of them — an Intel GPU from before 2013, a driver
+  nobody has updated in a decade — got no window at all, just a panic about a
+  surface validation error, which tells whoever is reading it nothing. Both
+  renderers are compiled in now: wgpu as before, and when it fails to put a
+  window on screen, Giverny relaunches itself on OpenGL, which those drivers do
+  have. Nothing in the app knows the difference — every pixel is an egui mesh
+  or texture either way. `GIVERNY_RENDERER=glow` picks it deliberately.
+
+- `giverny doctor` describes the machine before the accounts on it. Run where
+  Claude Code is installed but never signed in, it said "NO CLAUDE PROFILES
+  FOUND — is Claude Code installed?" and stopped, having already found
+  `claude.exe` and asked WSL what distributions exist.
+
 ## v0.6.10 — 2026-09-01
 
 - Usage refreshes work when Giverny is started from a launcher, which is how

@@ -131,6 +131,47 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 /// environment). `CLAUDE_CONFIG_DIR` is deliberately kept — that is account
 /// selection, not session identity — as are `ANTHROPIC_*` credentials-ish
 /// and provider settings we have no business touching.
+/// Which renderer to open with.
+///
+/// wgpu wants Vulkan, Metal or DX12. A machine with none of them — an Intel
+/// GPU from before 2013, a driver nobody has updated since — gets no window at
+/// all: wgpu finds only a CPU adapter, fails to configure a surface, and
+/// panics with a validation error that means nothing to whoever is reading it.
+/// OpenGL is older than all of that and those drivers do have it, so it is the
+/// fallback, and nothing in this app knows the difference: every pixel is an
+/// egui mesh or texture either way.
+///
+/// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
+/// below re-launches itself.
+fn pick_renderer() -> eframe::Renderer {
+    match std::env::var("GIVERNY_RENDERER").as_deref() {
+        Ok("glow" | "gl" | "opengl") => {
+            tracing::info!("renderer: OpenGL");
+            eframe::Renderer::Glow
+        }
+        _ => eframe::Renderer::Wgpu,
+    }
+}
+
+/// Start again on OpenGL, once, after wgpu failed to put a window on screen.
+///
+/// The adapter check above catches a machine with no GPU at all; it cannot
+/// catch a driver that enumerates an adapter and then fails to hand over a
+/// surface, which is what an old Intel driver does. That failure arrives as a
+/// panic from inside the event loop, so the only way to answer it is to run
+/// again having decided differently.
+fn restart_on_opengl() -> ! {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "giverny".into());
+    let status = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("GIVERNY_RENDERER", "glow")
+        .status();
+    std::process::exit(match status {
+        Ok(s) => s.code().unwrap_or(0),
+        Err(_) => 1,
+    });
+}
+
 fn scrub_inherited_claude_markers() {
     const MARKERS: &[&str] = &[
         "CLAUDECODE",
@@ -253,8 +294,10 @@ fn main() -> eframe::Result {
 
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
+    let renderer = pick_renderer();
     let layout = state::load_layout(&paths);
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_app_id("giverny")
             .with_title("Giverny")
@@ -264,11 +307,23 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    let result = eframe::run_native(
-        "Giverny",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    );
+    let on_wgpu = renderer == eframe::Renderer::Wgpu;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "Giverny",
+            options,
+            Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        )
+    }));
+    let result = match result {
+        Ok(result) => result,
+        // wgpu panics rather than returning when it cannot get a surface.
+        Err(_) if on_wgpu => {
+            tracing::warn!("the GPU renderer failed to start; retrying on OpenGL");
+            restart_on_opengl()
+        }
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
     // drag-and-drop must not be able to leave the app unlaunchable, with the

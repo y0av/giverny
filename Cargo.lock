@@ -933,6 +933,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -1398,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1423,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-claude"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1440,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1457,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

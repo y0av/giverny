@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/app", "crates/term", "crates/core", "crates/claude"]
 
 [workspace.package]
-version = "0.6.10"
+version = "0.6.11"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -19,7 +19,9 @@ vte = "0.15"
 polling = "3"
 
 # ui
-eframe = { version = "0.35", features = ["wgpu", "x11", "wayland"] }
+# Both renderers are compiled in: wgpu for anything modern, OpenGL for the
+# machines it cannot serve (see `pick_renderer`).
+eframe = { version = "0.35", features = ["wgpu", "glow", "x11", "wayland"] }
 egui = "0.35"
 
 # text

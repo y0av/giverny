@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.10 — 2026-09-01
+
+- Usage refreshes work when Giverny is started from a launcher, which is how
+  it is started. `claude -p /usage` was run by name, so it was looked for on
+  the `$PATH` of the process — and a desktop entry's environment is not a login
+  shell's: `~/.local/bin`, where Claude Code's installer puts itself, is on
+  every terminal's `$PATH` and no launcher's. The refresh failed once a minute
+  with "No such file or directory" into a log nobody reads, and the meters sat
+  on whatever Claude Code last wrote by itself, which on this machine was six
+  days earlier. `claude` is now resolved by path — `$PATH` first, then the
+  places its installers use, including nvm's per-version directories.
+
+- A refresh that changes nothing is no longer reported as a success. A
+  signed-out account prints its header, says nothing about limits, leaves the
+  cache untouched and exits 0; that read as "usage refreshed" once a minute
+  while a sixteen-day-old number sat on screen. The log now says the cache was
+  untouched, and asks whether the account is signed in.
+
 ## v0.6.9 — 2026-09-01
 
 - The hook installed for an account inside WSL is a command that distribution

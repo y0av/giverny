@@ -5,7 +5,7 @@
 //! Bind only to `limits[]` (the canonical bucket list) — the legacy scalar
 //! keys beside it are placeholder-ridden and churn.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -136,6 +136,35 @@ pub fn read(config_dir: &Path) -> Option<AccountUsage> {
     })
 }
 
+/// Where `claude` might be, beyond `$PATH`.
+///
+/// A program started from a desktop entry does not have a login shell's
+/// environment: `~/.local/bin` — where Claude Code's own installer puts
+/// itself — is on the `$PATH` of every terminal and on the `$PATH` of no
+/// launcher. Giverny launched from a dock therefore could not run `claude` at
+/// all, and said so once a minute into a log nobody reads while the meters sat
+/// on numbers from last week.
+#[cfg(not(windows))]
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".claude/local"));
+        dirs.push(home.join(".npm-global/bin"));
+        dirs.push(home.join(".bun/bin"));
+        // nvm keeps one bin directory per node version, and an npm install of
+        // Claude Code lands in whichever was current that day.
+        if let Ok(versions) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            dirs.extend(versions.flatten().map(|v| v.path().join("bin")));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs
+}
+
 /// Executable names to try, in the order Windows itself would prefer them.
 /// `.ps1` is deliberately absent: the npm shim by that name needs PowerShell
 /// to run, and the `.cmd` beside it does the same job through `cmd`.
@@ -144,7 +173,6 @@ const CLAUDE_EXE_NAMES: &[&str] = &["claude.exe", "claude.com", "claude.cmd", "c
 
 /// First of `names` that exists in `dirs`, directories in order and names in
 /// order within each. Kept off `#[cfg(windows)]` so it stays testable here.
-#[cfg(any(windows, test))]
 fn first_program_in(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<std::path::PathBuf> {
     dirs.iter().find_map(|dir| {
         names
@@ -162,7 +190,12 @@ fn first_program_in(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<std::
 /// implementation below.
 #[cfg(not(windows))]
 fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
-    let mut cmd = std::process::Command::new("claude");
+    // By path, not by name: `execvp` searches the `$PATH` this process has,
+    // which is the launcher's, not the one that has claude in it.
+    let program = first_program_in(&search_dirs(), &["claude"]).ok_or_else(|| {
+        anyhow::anyhow!("claude is not on $PATH or in any known install location")
+    })?;
+    let mut cmd = std::process::Command::new(program);
     cmd.env("CLAUDE_CONFIG_DIR", config_dir);
     Ok(cmd)
 }
@@ -171,8 +204,7 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
 /// Code's own installers write to — for the window between installing it and
 /// whatever started Giverny picking up the new `%PATH%`.
 #[cfg(windows)]
-fn search_dirs() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
+fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).collect())
         .unwrap_or_default();
@@ -195,11 +227,7 @@ pub fn cli_path() -> Option<std::path::PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join("claude"))
-                .find(|path| path.is_file())
-        })
+        first_program_in(&search_dirs(), &["claude"])
     }
 }
 
@@ -262,6 +290,7 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
 /// An account inside WSL is refreshed inside WSL; see `refresh_command`.
 pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
     use std::process::Stdio;
+    let before = read(config_dir).map(|u| u.fetched_at_ms).unwrap_or(0);
     let mut child = refresh_command(config_dir)?
         .arg("-p")
         .arg("/usage")
@@ -278,7 +307,23 @@ pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         match child.try_wait()? {
-            Some(_) => return Ok(()),
+            Some(status) => {
+                if !status.success() {
+                    anyhow::bail!("claude -p /usage exited with {status}");
+                }
+                // Exiting cleanly is not the same as having refreshed
+                // anything. A logged-out account prints its header, says
+                // nothing about limits, leaves the cache untouched and exits
+                // 0 — which read as success, once a minute, for as long as
+                // the account stayed logged out.
+                let after = read(config_dir).map(|u| u.fetched_at_ms).unwrap_or(0);
+                if after <= before {
+                    anyhow::bail!(
+                        "claude -p /usage left the cache untouched — is this account signed in?"
+                    );
+                }
+                return Ok(());
+            }
             None if std::time::Instant::now() > deadline => {
                 let _ = child.kill();
                 anyhow::bail!("usage refresh timed out");

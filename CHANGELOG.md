@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.7 — 2026-09-01
+
+- `giverny doctor` says what each saved tab would do when it is next opened:
+  the conversation it has recorded, the account and directory it would resume
+  in, and the command it would type — or which guard stops it. It runs the same
+  plan the app follows rather than a second opinion about it, so "why did this
+  tab not come back" is answerable without the app running, and answerable by
+  the person it happened to.
+
 ## v0.6.6 — 2026-09-01
 
 - A tab's conversation survives the app closing. Claude Code runs its

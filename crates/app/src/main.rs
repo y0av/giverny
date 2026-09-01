@@ -641,6 +641,91 @@ fn wsl_start_dir(distro: &str, was_in: Option<&Path>) -> Option<String> {
         .then(|| text.to_string())
 }
 
+/// What restoring one conversation would do, or why it would not.
+///
+/// The app follows it and `giverny doctor` prints it, so what doctor says is
+/// what the app does rather than a second opinion about it.
+#[derive(Debug)]
+enum ResumePlan {
+    /// The recorded id is not a session id.
+    Malformed,
+    /// Something is already running this conversation. Two claudes resumed
+    /// onto one transcript interleave it.
+    LiveElsewhere,
+    /// No account holds a transcript for it — `claude --resume` would fail.
+    NoTranscript,
+    Ready {
+        account: PathBuf,
+        /// Where the conversation ran, which is the only place it can be
+        /// resumed from.
+        dir: Option<PathBuf>,
+        command: String,
+    },
+}
+
+/// Plan the resume of `sid` for a tab last seen in `tab_cwd`, on `preferred`
+/// account, given every account there is.
+fn resume_plan(
+    sid: &str,
+    tab_cwd: Option<&Path>,
+    preferred: Option<&Path>,
+    all_dirs: &[PathBuf],
+) -> ResumePlan {
+    use giverny_claude::registry;
+    if sid.len() != 36 || !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return ResumePlan::Malformed;
+    }
+    if registry::session_is_live(all_dirs.to_vec(), sid) {
+        return ResumePlan::LiveElsewhere;
+    }
+    // The account the tab was on first, then the others: a transcript found
+    // elsewhere self-heals a lost account association.
+    let mut search: Vec<PathBuf> = preferred.map(Path::to_path_buf).into_iter().collect();
+    search.extend(
+        all_dirs
+            .iter()
+            .filter(|d| Some(d.as_path()) != preferred)
+            .cloned(),
+    );
+    let Some((account, transcript)) = search
+        .iter()
+        .find_map(|d| registry::find_transcript(d, sid).map(|t| (d.clone(), t)))
+    else {
+        return ResumePlan::NoTranscript;
+    };
+
+    let dir = registry::transcript_cwd(&transcript).or_else(|| tab_cwd.map(Path::to_path_buf));
+    let mut command = String::new();
+    if let Some(dir) = &dir {
+        command.push_str(&format!("cd \"{}\" && ", dir.display()));
+    }
+    // The command is typed into the tab's own shell, so the account has to be
+    // named the way that shell can open it: a session inside WSL knows
+    // `/home/x/.claude`, never the Windows share it is stored under here.
+    // Naming the distribution's own default account would be harmless but
+    // noisy, so it is left out the same way `~/.claude` is.
+    let (named, is_default) = match wsl::split_unc(&account) {
+        Some((distro, unix)) => {
+            let default = wsl::is_default_account(&distro, &unix);
+            (unix, default)
+        }
+        None => (
+            account.display().to_string(),
+            dirs::home_dir().is_some_and(|h| h.join(".claude") == account),
+        ),
+    };
+    if !is_default {
+        command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
+    }
+    // `command` bypasses shell wrapper functions named `claude`.
+    command.push_str(&format!("command claude --resume {sid}\r"));
+    ResumePlan::Ready {
+        account,
+        dir,
+        command,
+    }
+}
+
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
 /// to survive the crossing, added to whatever the user already shares.
 ///
@@ -1858,65 +1943,33 @@ impl App {
     /// conversation's own recorded cwd (`claude --resume` only finds a
     /// session from the directory it ran in).
     fn resume_command(&self, sid: &str, id: TabId) -> Option<Vec<u8>> {
-        use giverny_claude::registry;
-        if sid.len() != 36 || !sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-            tracing::warn!("tab {id:?}: malformed session id {sid:?} — not resuming");
-            return None;
-        }
+        let tab = self.ws.tab(id)?;
         let all_dirs: Vec<PathBuf> = self
             .claude
             .profiles
             .iter()
             .map(|p| p.config_dir.clone())
             .collect();
-        if registry::session_is_live(all_dirs.clone(), sid) {
-            tracing::info!("claude session {sid} already live elsewhere — not resuming");
-            return None;
-        }
-
-        let tab = self.ws.tab(id)?;
-        let preferred = tab.claude_config_dir.clone();
-        let mut search: Vec<PathBuf> = preferred.iter().cloned().collect();
-        search.extend(
-            all_dirs
-                .into_iter()
-                .filter(|d| Some(d) != preferred.as_ref()),
-        );
-        let Some((config_dir, transcript)) = search
-            .iter()
-            .find_map(|d| registry::find_transcript(d, sid).map(|t| (d.clone(), t)))
-        else {
-            tracing::info!("tab {id:?}: no transcript for session {sid} — skipping resume");
-            return None;
-        };
-
-        let resume_dir = registry::transcript_cwd(&transcript).or_else(|| tab.cwd.clone());
-
-        let mut cmd = String::new();
-        if let Some(dir) = &resume_dir {
-            cmd.push_str(&format!("cd \"{}\" && ", dir.display()));
-        }
-        // The command is typed into the tab's own shell, so the account has
-        // to be named the way that shell can open it: a session inside WSL
-        // knows `/home/x/.claude`, never the Windows share it is stored under
-        // here. Naming the distribution's own default account would be
-        // harmless but noisy, so it is left out the same way `~/.claude` is.
-        let (config_dir, is_default_profile) = match wsl::split_unc(&config_dir) {
-            Some((distro, unix)) => {
-                let default = wsl::is_default_account(&distro, &unix);
-                (unix, default)
+        match resume_plan(
+            sid,
+            tab.cwd.as_deref(),
+            tab.claude_config_dir.as_deref(),
+            &all_dirs,
+        ) {
+            ResumePlan::Ready { command, .. } => Some(command.into_bytes()),
+            ResumePlan::Malformed => {
+                tracing::warn!("tab {id:?}: malformed session id {sid:?} — not resuming");
+                None
             }
-            None => (
-                config_dir.display().to_string(),
-                dirs::home_dir().is_some_and(|h| h.join(".claude") == config_dir),
-            ),
-        };
-        if !is_default_profile {
-            cmd.push_str(&format!("CLAUDE_CONFIG_DIR=\"{config_dir}\" "));
+            ResumePlan::LiveElsewhere => {
+                tracing::info!("claude session {sid} already live elsewhere — not resuming");
+                None
+            }
+            ResumePlan::NoTranscript => {
+                tracing::info!("tab {id:?}: no transcript for session {sid} — skipping resume");
+                None
+            }
         }
-        // `command` bypasses shell wrapper functions named `claude`.
-        cmd.push_str(&format!("command claude --resume {sid}\r"));
-        Some(cmd.into_bytes())
     }
 
     fn process_pending(&mut self, ctx: &egui::Context) {
@@ -2381,6 +2434,66 @@ impl Drop for App {
     }
 }
 
+/// What each saved tab would do when it is next opened.
+///
+/// The same plan the app follows, run against the workspace on disk. "Why did
+/// this tab not come back" is otherwise a question only the app can answer,
+/// and only while it is running.
+fn restore_report(profs: &[giverny_claude::profiles::Profile]) {
+    let paths = Paths::default_dirs();
+    let Some(saved) = state::load(&paths) else {
+        println!("\nrestore: no saved workspace yet");
+        return;
+    };
+    let all_dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
+    let tabs = &saved.workspace.tabs;
+    println!("\nrestore ({} tab(s) in the saved workspace):", tabs.len());
+    let mut resumable = 0;
+    for tab in tabs {
+        let title = tab.title();
+        let Some(sid) = &tab.claude_session else {
+            println!("  {title}\n    conversation  none recorded");
+            continue;
+        };
+        println!("  {title}\n    conversation  {sid}");
+        match resume_plan(
+            sid,
+            tab.cwd.as_deref(),
+            tab.claude_config_dir.as_deref(),
+            &all_dirs,
+        ) {
+            ResumePlan::Ready {
+                account,
+                dir,
+                command,
+            } => {
+                resumable += 1;
+                println!("    account       {}", account.display());
+                println!(
+                    "    directory     {}",
+                    dir.map(|d| d.display().to_string())
+                        .unwrap_or_else(|| "(unknown — resumes wherever the shell opens)".into())
+                );
+                println!("    would type    {}", command.trim_end());
+            }
+            ResumePlan::Malformed => println!("    SKIPPED       not a session id"),
+            ResumePlan::LiveElsewhere => {
+                println!("    SKIPPED       something is already running this conversation")
+            }
+            ResumePlan::NoTranscript => println!(
+                "    SKIPPED       no transcript in any account — claude --resume would fail"
+            ),
+        }
+    }
+    if tabs.iter().all(|t| t.claude_session.is_none()) && !tabs.is_empty() {
+        println!(
+            "  nothing to resume: no tab has a conversation recorded.\n               ids are captured by the SessionStart hook, so a session that\n               started before hooks were installed is not one of them — run\n               claude once in a tab and check here again."
+        );
+    } else {
+        println!("  {resumable} of {} would resume", tabs.len());
+    }
+}
+
 /// `giverny doctor` — print exactly what the app sees of your Claude setup.
 fn doctor() {
     use giverny_claude::{hooks, profiles, registry, usage};
@@ -2569,6 +2682,8 @@ fn doctor() {
             None => println!("    usage      no cache yet — run /usage once in this account"),
         }
     }
+
+    restore_report(&profs);
 
     let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
     let live = registry::scan(dirs);

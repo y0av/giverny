@@ -2596,26 +2596,6 @@ fn doctor() {
     }
 
     let cfg = config::load(Paths::default_dirs().base());
-    let profs = profiles::discover(&cfg.behavior.extra_profile_dirs);
-    if profs.is_empty() {
-        println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
-        return;
-    }
-    // Name the sources consulted: when an account goes missing, "where do
-    // these come from" is the actual question.
-    let mut sources = vec!["~/.claude"];
-    if giverny_claude::profiles::ambient_dirs().len() > 1 {
-        sources.push("claude* in ~ and ~/.config");
-    }
-    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
-        sources.push("$CLAUDE_CONFIG_DIR");
-    }
-    if std::env::var_os("CCTOP_CONFIG_DIRS").is_some() {
-        sources.push("$CCTOP_CONFIG_DIRS");
-    }
-    if !cfg.behavior.extra_profile_dirs.is_empty() {
-        sources.push("config");
-    }
     // Usage numbers are refreshed by running `claude -p /usage`, so a
     // Giverny that cannot find claude shows whatever the cache last held and
     // says nothing about why.
@@ -2664,6 +2644,27 @@ fn doctor() {
         }
     }
     println!();
+
+    let profs = profiles::discover(&cfg.behavior.extra_profile_dirs);
+    if profs.is_empty() {
+        println!("NO CLAUDE PROFILES FOUND — is Claude Code installed?");
+        return;
+    }
+    // Name the sources consulted: when an account goes missing, "where do
+    // these come from" is the actual question.
+    let mut sources = vec!["~/.claude"];
+    if giverny_claude::profiles::ambient_dirs().len() > 1 {
+        sources.push("claude* in ~ and ~/.config");
+    }
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+        sources.push("$CLAUDE_CONFIG_DIR");
+    }
+    if std::env::var_os("CCTOP_CONFIG_DIRS").is_some() {
+        sources.push("$CCTOP_CONFIG_DIRS");
+    }
+    if !cfg.behavior.extra_profile_dirs.is_empty() {
+        sources.push("config");
+    }
     println!(
         "profiles ({} found via {}):",
         profs.len(),

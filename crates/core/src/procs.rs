@@ -120,10 +120,12 @@ pub fn program_name(command: &str) -> &str {
     let Some(first) = words.next() else {
         return "";
     };
-    match first.rsplit('/').next().unwrap_or(first) {
+    // Both separators: a command on Windows arrives as a `\`-separated path,
+    // and one that keeps its directories never matches the restore list.
+    match first.rsplit(['/', '\\']).next().unwrap_or(first) {
         "sudo" | "doas" | "env" => words
             .find(|w| !w.contains('='))
-            .map(|w| w.rsplit('/').next().unwrap_or(w))
+            .map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w))
             .unwrap_or(""),
         other => other,
     }

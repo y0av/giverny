@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-claude"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "0.6.15"
+version = "0.6.16"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

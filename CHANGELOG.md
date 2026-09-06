@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.16 — 2026-09-06
+
+- A tab whose title is nothing but a path to a program is named after the
+  program. Windows names a console after the command line that opened it and
+  ConPTY forwards that, so every PowerShell tab called itself
+  `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe` — a rail's
+  width of path saying one word. Now `powershell`. A title with anything else
+  in it is left alone.
+
+- Restoring a program a tab was running works on Windows. The check that
+  matches a remembered command against the restore list split paths on `/`
+  only, so a `\`-separated Windows command never matched anything on it.
+
 ## v0.6.15 — 2026-09-06
 
 - Opening Giverny from the Start menu no longer leaves a console window beside

@@ -57,10 +57,30 @@ pub fn display_title(raw: &str, cfg: &TitlesConfig) -> String {
     if cfg.strip_host_prefix {
         out = strip_host_prefix(out);
     }
+    if let Some(program) = program_title(out) {
+        return program;
+    }
     if cfg.shorten_paths {
         return shorten_paths(out);
     }
     out.to_string()
+}
+
+/// A title that is nothing but the path to the program is that program.
+///
+/// Windows sets a console's title to the command line that opened it, and
+/// ConPTY passes that on, so a PowerShell tab announces itself as
+/// `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe` — a rail's
+/// width of path saying one word. Unconditional: no `[titles]` option makes a
+/// tab want to be called that.
+fn program_title(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let name = trimmed.rsplit(['\\', '/']).next()?;
+    let stem = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))?;
+    // Only a bare path: anything with arguments is a title someone chose.
+    (!stem.is_empty() && !trimmed.contains(char::is_whitespace)).then(|| stem.to_string())
 }
 
 /// `yoz@yoz-framework:~/Dev/bobo` → `~/Dev/bobo`.
@@ -283,6 +303,27 @@ pub fn load(base: &Path) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows names a console after the program that opened it, and ConPTY
+    /// forwards that as the title.
+    #[test]
+    fn a_program_path_is_shown_as_the_program() {
+        let cfg = TitlesConfig::default();
+        assert_eq!(
+            display_title(
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                &cfg
+            ),
+            "powershell"
+        );
+        assert_eq!(display_title(r"C:\WINDOWS\system32\cmd.exe", &cfg), "cmd");
+        // A title someone chose is left alone, even when it names a program.
+        assert_eq!(
+            display_title("build C:\\tools\\make.exe", &cfg),
+            "build C:\\tools\\make.exe"
+        );
+        assert_eq!(display_title("~/Dev/giverny", &cfg), "~/Dev/giverny");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("giverny-cfg-{name}-{}", std::process::id()));

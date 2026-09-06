@@ -39,3 +39,7 @@ raw-window-handle = "0.6"
 # scrollback-and-state write that closing the window does.
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
+
+[target.'cfg(windows)'.dependencies]
+# Only to tell a console we were given from a console we were launched from.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

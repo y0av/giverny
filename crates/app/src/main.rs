@@ -170,6 +170,35 @@ fn restart_on_opengl() -> ! {
     });
 }
 
+/// Let go of a console Windows gave us, but never one we were launched from.
+///
+/// The binary is console-subsystem, because `giverny doctor` and the hook
+/// entrypoints have to be able to print. The cost is that opening the app from
+/// the Start menu or a shortcut also opens a console window beside it, full of
+/// log lines, which cannot be closed without killing the app — reported as
+/// "it opens PowerShell in the background and I'm not allowed to close it".
+///
+/// The two cases are distinguishable: a console Windows created for us has one
+/// process attached, and a console we inherited from a shell has at least two.
+/// Detaching from ours closes it; detaching from theirs would leave their
+/// window alone, but there is no reason to, and every reason to keep printing
+/// where they can see it.
+#[cfg(windows)]
+fn release_own_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut attached = [0u32; 4];
+    // SAFETY: the pointer and length describe the array above.
+    let count = unsafe { GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) };
+    if count == 1 {
+        // SAFETY: no console output is expected after this; the app is a
+        // window from here on.
+        unsafe { FreeConsole() };
+    }
+}
+
+#[cfg(not(windows))]
+fn release_own_console() {}
+
 fn scrub_inherited_claude_markers() {
     const MARKERS: &[&str] = &[
         "CLAUDECODE",
@@ -257,6 +286,10 @@ fn main() -> eframe::Result {
         }
         _ => {}
     }
+
+    // Past every subcommand: what follows is the window, and a console that
+    // exists only because Windows made one has nothing left to show.
+    release_own_console();
 
     tracing_subscriber::fmt()
         .with_env_filter(

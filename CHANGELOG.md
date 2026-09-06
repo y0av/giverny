@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.15 — 2026-09-06
+
+- Opening Giverny from the Start menu no longer leaves a console window beside
+  it. The binary is console-subsystem — `giverny doctor` and the hook
+  entrypoints have to be able to print — so Windows made a console for it,
+  filled it with log lines, and closing it killed the app. It now lets go of a
+  console that exists only because Windows made one, and keeps the one it was
+  launched from: the two differ by how many processes are attached.
+
 ## v0.6.14 — 2026-09-06
 
 - Shift+Enter is a newline on Windows again. It only ever was one through the

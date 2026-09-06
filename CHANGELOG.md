@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.14 — 2026-09-06
+
+- Shift+Enter is a newline on Windows again. It only ever was one through the
+  kitty keyboard protocol, and on Windows the child sits behind ConPTY, which
+  re-renders its output instead of forwarding it — the sequence that turns that
+  protocol on never reaches us, so no tab there is ever in kitty mode and
+  Shift+Enter arrived as an ordinary submit. Without kitty it now sends `ESC
+  CR`, which is what Claude Code's own terminal setup teaches other terminals
+  to send, and what it reads as a newline.
+
 ## v0.6.13 — 2026-09-06
 
 - Tab status marks are drawn rather than typed. The spinner and the

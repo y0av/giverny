@@ -90,7 +90,17 @@ fn encode_legacy(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 
     let seq = match key {
         Key::Enter => {
-            if mods.alt {
+            // Alt+Enter, and Shift+Enter where the kitty protocol never
+            // arrived: both mean "a newline, do not send this yet". `ESC CR`
+            // is what Claude Code's own terminal setup teaches other terminals
+            // to send for exactly this, and what it reads as a newline.
+            //
+            // Windows is where it matters. The child there sits behind
+            // ConPTY, which re-renders its output rather than forwarding it,
+            // so the sequence that turns the kitty protocol on never reaches
+            // us: no tab on Windows is ever in kitty mode, and Shift+Enter
+            // arrived as an ordinary submit.
+            if mods.alt || mods.shift {
                 b"\x1b\r".to_vec()
             } else {
                 b"\r".to_vec()
@@ -400,6 +410,23 @@ mod tests {
             encode_key(Key::A, none(), m),
             None,
             "plain letters come via Text"
+        );
+    }
+
+    /// Shift+Enter has to mean a newline even where the kitty protocol never
+    /// gets through, which is every tab on Windows.
+    #[test]
+    fn shift_enter_is_a_newline_without_kitty() {
+        let plain = TermMode::empty();
+        assert_eq!(
+            encode_key(Key::Enter, Modifiers::SHIFT, plain).unwrap(),
+            b"\x1b\r".to_vec(),
+            "shift+enter asks for a newline"
+        );
+        assert_eq!(
+            encode_key(Key::Enter, Modifiers::NONE, plain).unwrap(),
+            b"\r".to_vec(),
+            "enter alone still submits"
         );
     }
 

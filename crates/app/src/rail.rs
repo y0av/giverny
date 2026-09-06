@@ -655,21 +655,22 @@ fn category_header(
     badge_x -= 20.0;
     if cat.busy > 0 {
         let time = ui.input(|i| i.time);
-        let glyph = SPINNER[(time * 10.0) as usize % SPINNER.len()];
+        spinner(&p, Pos2::new(badge_x, rect.center().y), time, cat.color);
         p.text(
-            Pos2::new(badge_x, rect.center().y),
+            Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
-            format!("{}{glyph}", cat.busy),
+            format!("{}", cat.busy),
             FontId::monospace(10.0),
             cat.color,
         );
-        badge_x -= 26.0;
+        badge_x -= 28.0;
     }
     if cat.needs > 0 {
+        flag(&p, Pos2::new(badge_x - 3.0, rect.center().y), c.amber);
         p.text(
-            Pos2::new(badge_x, rect.center().y),
+            Pos2::new(badge_x - 9.0, rect.center().y),
             Align2::RIGHT_CENTER,
-            format!("{}⚑", cat.needs),
+            format!("{}", cat.needs),
             FontId::monospace(10.0),
             c.amber,
         );
@@ -709,6 +710,57 @@ fn category_header(
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
     rect
+}
+
+/// A ring with a gap, turning. What the braille spinner was for, minus the
+/// assumption that the font has braille in it.
+fn spinner(p: &egui::Painter, at: Pos2, time: f64, color: Color32) {
+    const R: f32 = 5.0;
+    let head = (time * 4.0) as f32;
+    let mut points = Vec::with_capacity(14);
+    for step in 0..14 {
+        let angle = head + step as f32 * 0.36;
+        points.push(at + Vec2::new(angle.cos() * R, angle.sin() * R));
+    }
+    // Fades towards the tail, so which way it turns is legible at 5px.
+    for (i, pair) in points.windows(2).enumerate() {
+        let strength = 0.25 + 0.75 * (i as f32 / 13.0);
+        p.line_segment(
+            [pair[0], pair[1]],
+            Stroke::new(1.6, color.gamma_multiply(strength)),
+        );
+    }
+}
+
+/// A pennant on a staff: this tab wants you.
+fn flag(p: &egui::Painter, at: Pos2, color: Color32) {
+    let staff = at + Vec2::new(-3.0, -6.0);
+    p.line_segment(
+        [staff, staff + Vec2::new(0.0, 12.0)],
+        Stroke::new(1.4, color),
+    );
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            staff + Vec2::new(0.5, 0.0),
+            staff + Vec2::new(7.0, 3.0),
+            staff + Vec2::new(0.5, 6.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// A tick: finished while you were elsewhere.
+fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.8, color);
+    p.line_segment(
+        [at + Vec2::new(-4.5, 0.0), at + Vec2::new(-1.5, 3.5)],
+        stroke,
+    );
+    p.line_segment(
+        [at + Vec2::new(-1.5, 3.5), at + Vec2::new(4.5, -4.0)],
+        stroke,
+    );
 }
 
 fn tab_row(
@@ -765,59 +817,36 @@ fn tab_row(
         );
     }
 
-    // Status glyph: Claude state wins over the plain shell dot.
+    // Status mark: Claude state wins over the plain shell dot.
+    //
+    // Drawn, not typed. These were characters — a braille spinner, a braille
+    // ⠿ for a background shell — and a font without the braille block turns
+    // them into empty boxes, which is what every Windows machine did. A shape
+    // is a shape everywhere.
     let dot = Pos2::new(rect.min.x + 18.0, rect.min.y + 13.0);
     let time = ui.input(|i| i.time);
     match row.claude {
-        ClaudeState::Busy => {
-            let glyph = SPINNER[(time * 10.0) as usize % SPINNER.len()];
-            p.text(
-                dot,
-                Align2::CENTER_CENTER,
-                glyph,
-                FontId::monospace(13.0),
-                row.color,
-            );
-        }
+        ClaudeState::Busy => spinner(&p, dot, time, row.color),
         ClaudeState::NeedsYou => {
-            let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
-            p.text(
-                dot,
-                Align2::CENTER_CENTER,
-                "⚑",
-                FontId::monospace(13.0),
-                c.amber.gamma_multiply(pulse as f32),
-            );
+            let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
+            flag(&p, dot, c.amber.gamma_multiply(pulse));
         }
-        ClaudeState::DoneUnseen => {
-            // Green and still: finished, nothing owed. The amber flag above
-            // is the one that wants something, and the two are told apart by
-            // colour and by movement, not by shape alone.
-            p.text(
-                dot,
-                Align2::CENTER_CENTER,
-                "✓",
-                FontId::monospace(12.0),
-                c.green,
-            );
-        }
+        // Green and still: finished, nothing owed. The amber flag above is
+        // the one that wants something, and the two differ in colour, shape
+        // and movement.
+        ClaudeState::DoneUnseen => tick(&p, dot, c.green),
         ClaudeState::Idle => {
             // A background shell keeps running while Claude waits at its
             // prompt. Worth showing — it is why a directory is still churning
             // — but it is not the agent working, and animating it would say
             // "come back later" about a tab that is waiting on you.
-            let (glyph, size) = if row.background {
-                ("⠿", 12.0)
+            if row.background {
+                for i in -1..=1 {
+                    p.circle_filled(dot + Vec2::new(i as f32 * 4.0, 0.0), 1.4, dim);
+                }
             } else {
-                ("✳", 11.0)
-            };
-            p.text(
-                dot,
-                Align2::CENTER_CENTER,
-                glyph,
-                FontId::monospace(size),
-                dim,
-            );
+                p.circle_stroke(dot, 4.0, Stroke::new(1.4, dim));
+            }
         }
         ClaudeState::None => {
             if row.exited {

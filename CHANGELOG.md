@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.13 — 2026-09-06
+
+- Tab status marks are drawn rather than typed. The spinner and the
+  background-shell mark were braille characters, and no font shipped with
+  Windows has the braille block: every one of them rendered as an empty box.
+  They are shapes now — a turning ring, a pennant, a tick, a hollow ring, three
+  dots — which look the same on every machine because nothing looks them up.
+
 ## v0.6.12 — 2026-09-01
 
 - The OpenGL fallback actually fires. v0.6.11 wrapped the event loop in

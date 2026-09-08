@@ -363,8 +363,25 @@ impl TermSession {
     /// Ask the io loop to stop and join it.
     pub fn shutdown(mut self) {
         let _ = self.sender.send(Msg::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // Waited for, but not indefinitely. The io thread almost always
+        // returns at once; an io thread blocked writing to a pty whose child
+        // has stopped reading never does, and `join` has no timeout — so one
+        // wedged tab held the whole window open until someone force-killed
+        // it, which is precisely the unclean shutdown the next launch
+        // complains about. The process is on its way out; a thread that will
+        // not come is left behind rather than waited on.
+        let (done, waited) = std::sync::mpsc::channel();
+        let watcher = std::thread::Builder::new()
+            .name("giverny pty join".into())
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done.send(());
+            });
+        if watcher.is_ok() {
+            let _ = waited.recv_timeout(std::time::Duration::from_millis(500));
         }
     }
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.18 — 2026-09-08
+
+- Closing waits for a tab, but not forever. Each tab's io thread was joined
+  with no timeout on the way out; one blocked writing to a pty whose child has
+  stopped reading never returns, so the window stayed open until someone
+  force-killed it — which is where the "last run did not shut down cleanly"
+  on the next launch comes from. Half a second each, then the process leaves
+  without it.
+
 ## v0.6.17 — 2026-09-08
 
 - The Windows executable carries its icon. The window icon was set at runtime,

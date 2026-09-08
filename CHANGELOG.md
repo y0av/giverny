@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.17 — 2026-09-08
+
+- The Windows executable carries its icon. The window icon was set at runtime,
+  but Explorer, the taskbar and a Start-menu shortcut read a resource inside
+  the `.exe` and nothing else — so before opening the app, every Windows user
+  saw the generic "unknown program" square.
+
+- The session registry is read on a worker. Two full scans a second happened on
+  the UI thread — one for tab state, one to ask whether any session predates
+  its settings file — and for an account inside WSL each of those is a file
+  read across a share. With several agents running it was the difference
+  between a window that paints and one that stutters.
+
 ## v0.6.16 — 2026-09-06
 
 - A tab whose title is nothing but a path to a program is named after the

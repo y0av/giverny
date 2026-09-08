@@ -103,6 +103,12 @@ pub struct ClaudeWatch {
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
     last_scan: Instant,
+    /// The last registry scan, and whether every live session predates the
+    /// settings file. Both are filesystem work — for an account inside WSL,
+    /// filesystem work across a share — so they happen on a worker and the UI
+    /// reads whatever it last said.
+    scan_rx: Option<crossbeam_channel::Receiver<ScanResult>>,
+    scanned: ScanResult,
     last_jobs: Instant,
     last_usage: Instant,
     /// When each account's cache file was last seen changing, so a rewrite is
@@ -190,6 +196,15 @@ fn merge_registry(
     }
 }
 
+/// One pass over the session registries, done on a worker.
+#[derive(Default)]
+struct ScanResult {
+    live: Vec<registry::LiveSession>,
+    /// Every live session started before its `settings.json` was last
+    /// written, so none of them loaded the hooks in it.
+    stale: bool,
+}
+
 impl ClaudeWatch {
     pub fn new(
         spool: &Path,
@@ -223,6 +238,8 @@ impl ClaudeWatch {
             accounts: Vec::new(),
             hook_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
+            scan_rx: None,
+            scanned: ScanResult::default(),
             last_jobs: Instant::now() - Duration::from_secs(10),
             last_usage: Instant::now() - USAGE_READ_INTERVAL,
             cache_mtimes: Arc::new(Mutex::new(HashMap::new())),
@@ -412,14 +429,88 @@ impl ClaudeWatch {
             self.handle_msg(msg, active, &title, &mut effects);
         }
 
-        // Registry scan: baseline busy/idle + identity, ~1 Hz.
-        if self.last_scan.elapsed() >= Duration::from_secs(1) {
-            self.last_scan = Instant::now();
-            for tab in self.tabs.values_mut() {
-                tab.seen_in_scan = false;
+        // Registry scan: baseline busy/idle + identity, ~1 Hz, off-thread.
+        if let Some(rx) = &self.scan_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.scan_rx = None;
+                    self.scanned = result;
+                    self.merge_scan(shell_pids, &mut effects);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.scan_rx = None,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
+        }
+        if self.scan_rx.is_none() && self.last_scan.elapsed() >= Duration::from_secs(1) {
+            self.last_scan = Instant::now();
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
-            for live in registry::scan(dirs) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            if std::thread::Builder::new()
+                .name("giverny session scan".into())
+                .spawn(move || {
+                    let live = registry::scan(dirs);
+                    // Asked here too: it is another `stat` per session, and
+                    // the answer only matters once a scan has happened.
+                    let stale = !live.is_empty()
+                        && live.iter().all(|s| {
+                            let settings = s.config_dir.join("settings.json");
+                            match (
+                                std::fs::metadata(&settings).and_then(|m| m.modified()),
+                                std::time::UNIX_EPOCH
+                                    .checked_add(Duration::from_millis(s.entry.started_at_ms)),
+                            ) {
+                                (Ok(settings_at), Some(started)) => started < settings_at,
+                                _ => false,
+                            }
+                        });
+                    let _ = tx.send(ScanResult { live, stale });
+                })
+                .is_ok()
+            {
+                self.scan_rx = Some(rx);
+            }
+        }
+
+        // Background agents: a handful of small files, so a slower tick than
+        // the session registry is plenty.
+        if self.last_jobs.elapsed() >= Duration::from_secs(3) {
+            self.last_jobs = Instant::now();
+            let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+            self.jobs = jobs::scan(dirs);
+        }
+
+        // Re-read the caches when the file says so, when a refresh we asked
+        // for has just rewritten one, or on the slow timer as a backstop.
+        //
+        // The timer alone meant a number could be a minute out of date with a
+        // file that had already been rewritten — Claude Code updates the cache
+        // itself every time a session fetches usage, which is the freshest
+        // source there is short of the statusline push.
+        self.watch_caches();
+        if self.cache_dirty.swap(false, Ordering::Relaxed)
+            || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
+        {
+            self.refresh_usage();
+        }
+
+        effects.animating = self
+            .tabs
+            .values()
+            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou))
+            || self
+                .jobs
+                .iter()
+                .any(|j| j.live && j.state == jobs::JobState::Working);
+        effects
+    }
+
+    /// Fold the last scan into per-tab state.
+    fn merge_scan(&mut self, shell_pids: &HashMap<TabId, u32>, effects: &mut WatchEffects) {
+        for tab in self.tabs.values_mut() {
+            tab.seen_in_scan = false;
+        }
+        {
+            for live in self.scanned.live.clone() {
                 let Some(tab_id) = shell_pids
                     .iter()
                     .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
@@ -473,38 +564,6 @@ impl ClaudeWatch {
                 }
             }
         }
-
-        // Background agents: a handful of small files, so a slower tick than
-        // the session registry is plenty.
-        if self.last_jobs.elapsed() >= Duration::from_secs(3) {
-            self.last_jobs = Instant::now();
-            let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
-            self.jobs = jobs::scan(dirs);
-        }
-
-        // Re-read the caches when the file says so, when a refresh we asked
-        // for has just rewritten one, or on the slow timer as a backstop.
-        //
-        // The timer alone meant a number could be a minute out of date with a
-        // file that had already been rewritten — Claude Code updates the cache
-        // itself every time a session fetches usage, which is the freshest
-        // source there is short of the statusline push.
-        self.watch_caches();
-        if self.cache_dirty.swap(false, Ordering::Relaxed)
-            || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
-        {
-            self.refresh_usage();
-        }
-
-        effects.animating = self
-            .tabs
-            .values()
-            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou))
-            || self
-                .jobs
-                .iter()
-                .any(|j| j.live && j.state == jobs::JobState::Working);
-        effects
     }
 
     /// A statusline push: official `rate_limits` for one account.
@@ -753,20 +812,7 @@ impl ClaudeWatch {
     /// True when every live session predates the settings file — i.e. the
     /// user needs to restart claude for any of it to take effect.
     pub fn sessions_predate_settings(&self) -> bool {
-        let live = registry::scan(self.profiles.iter().map(|p| p.config_dir.clone()));
-        if live.is_empty() {
-            return false;
-        }
-        live.iter().all(|s| {
-            let settings = s.config_dir.join("settings.json");
-            match (
-                std::fs::metadata(&settings).and_then(|m| m.modified()),
-                std::time::UNIX_EPOCH.checked_add(Duration::from_millis(s.entry.started_at_ms)),
-            ) {
-                (Ok(settings_at), Some(started)) => started < settings_at,
-                _ => false,
-            }
-        })
+        self.scanned.stale
     }
 
     /// How fresh this account's numbers actually are, and from where.
@@ -851,6 +897,8 @@ impl ClaudeWatch {
             hooks_installed: true,
             hook_rx: None,
             last_scan: Instant::now(),
+            scan_rx: None,
+            scanned: ScanResult::default(),
             last_jobs: Instant::now(),
             last_usage: Instant::now(),
             cache_mtimes: Arc::new(Mutex::new(HashMap::new())),

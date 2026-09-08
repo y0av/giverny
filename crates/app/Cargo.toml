@@ -40,6 +40,10 @@ raw-window-handle = "0.6"
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
 
+[build-dependencies]
+# Puts the icon inside the .exe, where Explorer and the taskbar look for it.
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 # Only to tell a console we were given from a console we were launched from.
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -90,6 +90,9 @@ jobs:
       - name: Check every binary is there, then make it latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job, so `gh` has no repository to infer from a
+          # git remote — it has to be told which one it is talking about.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           expected="giverny-x86_64-unknown-linux-gnu.tar.gz

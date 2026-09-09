@@ -43,7 +43,7 @@ mod mac {
 mod imp {
     use std::sync::OnceLock;
 
-    use windows::Win32::Foundation::{HMODULE, HWND};
+    use windows::Win32::Foundation::{HINSTANCE, HWND};
     use windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     };
@@ -86,9 +86,9 @@ mod imp {
             .get_or_init(|| {
                 // SAFETY: loading an icon resource out of our own module.
                 unsafe {
-                    let module: HMODULE = GetModuleHandleW(PCWSTR::null()).ok()?;
+                    let module = GetModuleHandleW(PCWSTR::null()).ok()?;
                     let handle = LoadImageW(
-                        Some(module.into()),
+                        Some(HINSTANCE(module.0)),
                         // MAKEINTRESOURCE(2): the id `build.rs` gave it.
                         PCWSTR(2 as *const u16),
                         IMAGE_ICON,
@@ -106,7 +106,13 @@ mod imp {
 
     pub fn set(hwnd: isize, waiting: usize) {
         let Some(taskbar) = taskbar() else { return };
-        let icon = if waiting > 0 { badge() } else { None };
+        // No overlay is the null icon, not an absent argument.
+        let none = HICON(std::ptr::null_mut());
+        let icon = if waiting > 0 {
+            badge().unwrap_or(none)
+        } else {
+            none
+        };
         // SAFETY: a live window handle from the running viewport, and an icon
         // owned by this process for its lifetime.
         unsafe {

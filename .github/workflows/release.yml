@@ -19,7 +19,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Born a pre-release, so `/releases/latest` — what the installers
+            # and the in-app update check both ask for — keeps pointing at the
+            # last complete release until every binary here has uploaded. A
+            # release that is "latest" while a platform's zip is still building
+            # is a 404 for whoever updates in that window, and a build that
+            # fails leaves it a 404 for good.
             gh release create "$GITHUB_REF_NAME" \
+              --prerelease \
               --title "Giverny $GITHUB_REF_NAME" \
               --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md).
 
@@ -74,3 +81,34 @@ jobs:
           bin: giverny
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Only now is it a release anyone should be sent to.
+  publish:
+    needs: upload-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every binary is there, then make it latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          expected="giverny-x86_64-unknown-linux-gnu.tar.gz
+          giverny-aarch64-unknown-linux-gnu.tar.gz
+          giverny-aarch64-apple-darwin.tar.gz
+          giverny-x86_64-apple-darwin.tar.gz
+          giverny-x86_64-pc-windows-msvc.zip
+          install.sh
+          install.ps1"
+          have=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
+          missing=0
+          for asset in $expected; do
+            if ! grep -qx "$asset" <<<"$have"; then
+              echo "missing: $asset"
+              missing=1
+            fi
+          done
+          if [ "$missing" = 1 ]; then
+            echo "leaving $GITHUB_REF_NAME as a pre-release"
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest

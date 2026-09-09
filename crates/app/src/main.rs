@@ -1748,12 +1748,10 @@ impl App {
             .get(&id)
             .and_then(|rt| rt.session.as_ref())
             .and_then(|s| s.child_pid);
-        let Some(tab) = self.ws.tab_mut(id) else {
-            return;
-        };
         #[cfg(target_os = "linux")]
         if let Some(pid) = pid
             && let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            && let Some(tab) = self.ws.tab_mut(id)
         {
             tab.cwd = Some(cwd);
         }

@@ -815,6 +815,24 @@ impl ClaudeWatch {
         self.scanned.stale
     }
 
+    /// When the five-hour window for `account` reopens, if the numbers say.
+    ///
+    /// The message on screen names a reset time too, in the local words of
+    /// whoever is reading it ("resets 3pm"); this is the same moment as a
+    /// timestamp, from the cache Claude Code writes.
+    pub fn window_reopens(&self, account: &str) -> Option<jiff::Timestamp> {
+        let panel = self.accounts.iter().find(|a| a.profile.name == account)?;
+        let now = jiff::Timestamp::now();
+        panel
+            .usage
+            .as_ref()?
+            .limits
+            .iter()
+            .filter(|l| l.kind == "session")
+            .filter_map(|l| l.resets_at.as_deref()?.parse::<jiff::Timestamp>().ok())
+            .find(|at| *at > now)
+    }
+
     /// How fresh this account's numbers actually are, and from where.
     /// Reporting only the cache age reads as "stale" even when a live push
     /// has already overridden the bars.

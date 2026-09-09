@@ -89,6 +89,22 @@ fn row_data(
             format!("{sub} ·  {branch}")
         };
     }
+    // A tab waiting on a window says so, and when: stopped and stopped-until
+    // look identical otherwise.
+    if app.is_limited(t.id) {
+        let until = match app.limited_until(t.id) {
+            Some(at) => {
+                let zoned = at.to_zoned(jiff::tz::TimeZone::system());
+                format!("resumes {}", zoned.strftime("%H:%M"))
+            }
+            None => "waiting for the window".to_string(),
+        };
+        sub = if sub.is_empty() {
+            format!("out of limit · {until}")
+        } else {
+            format!("{sub} · out of limit · {until}")
+        };
+    }
     let ct = app.claude.tabs.get(&t.id);
     if let Some(account) = ct.and_then(|c| c.account.as_deref()) {
         sub = if sub.is_empty() {

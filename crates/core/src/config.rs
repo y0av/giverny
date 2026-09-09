@@ -27,6 +27,8 @@ pub struct ClaudeConfig {
     /// Suppress Claude Code's "resume from summary / resume full session
     /// as-is" prompt, so a resumed conversation comes back whole.
     pub skip_resume_summary: bool,
+    /// Pick a session back up when the usage window that stopped it reopens.
+    pub resume_after_limit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

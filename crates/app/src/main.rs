@@ -460,6 +460,19 @@ struct Switcher {
     index: usize,
 }
 
+/// A tab stopped by a usage limit, and what it would take to pick it up.
+struct Limited {
+    /// When the window reopens, once the numbers say. `None` until then: the
+    /// account's cache refreshes on its own clock, so this is filled in later.
+    reopens: Option<jiff::Timestamp>,
+    /// The tab's input counter when it stopped. If it moves, someone has been
+    /// here since, and this is theirs to continue rather than ours.
+    untouched_at: u64,
+    /// Whether Claude itself is still running: a session that exited has to be
+    /// resumed first, one still sitting at its prompt only needs asking.
+    session_gone: bool,
+}
+
 /// What one tab needs to open: the shell, the account it is on (named the
 /// way Giverny stores accounts), and the environment that reaches the shell.
 struct TabShape {
@@ -603,6 +616,11 @@ pub struct App {
     /// How many tabs wanted you at the last frame, so the taskbar is only
     /// told when that changes.
     attention: usize,
+    /// Tabs whose session stopped because the account ran out of limit.
+    limited: HashMap<TabId, Limited>,
+    /// Each tab's Claude state as of the last frame: stopping is a transition,
+    /// not a state, and only the transition is worth looking at a screen for.
+    was: HashMap<TabId, claude_watch::ClaudeState>,
     /// A newer release, once the background check finds one.
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
@@ -635,6 +653,11 @@ enum Inject {
     /// `cd` on startup (e.g. `cd ~/Dev`) override our spawn cwd — type a
     /// visible `cd` back when that happened.
     CwdFix(PathBuf),
+    /// Typing into a tab the user has already worked in — waking a session a
+    /// usage limit stopped. `Raw` stands down for any tab that has ever been
+    /// typed in, which is every tab this applies to; the guard here is
+    /// narrower and the right one: nobody has touched it *since it stopped*.
+    Wake { bytes: Vec<u8>, seq: u64 },
 }
 
 /// Start our own Wayland drag-and-drop listener, on the connection eframe
@@ -984,6 +1007,8 @@ impl App {
             row_rects: Vec::new(),
             stale_sessions: false,
             attention: 0,
+            limited: HashMap::new(),
+            was: HashMap::new(),
             repo_cache: HashMap::new(),
             repo_rx: None,
             wsl_cwd_rx: None,
@@ -1534,6 +1559,145 @@ impl App {
         }
     }
 
+    /// Notice a session that stopped because the account ran out of limit,
+    /// and pick it up when the window reopens.
+    ///
+    /// Nothing reports this: the `Stop` hook is the same one a finished turn
+    /// sends, and the usage cache is a percentage with no opinion about why a
+    /// session ended. What says it is the message left on the tab's screen, so
+    /// that is what gets read — but only at the moment a tab stops working,
+    /// and only for that tab, because reading a screen means locking a
+    /// terminal.
+    fn watch_for_limits(&mut self) {
+        use claude_watch::ClaudeState;
+        let now = jiff::Timestamp::now();
+        let states: Vec<(TabId, ClaudeState)> = self
+            .ws
+            .tabs
+            .iter()
+            .map(|t| (t.id, self.claude.state_of(t.id)))
+            .collect();
+
+        for (id, state) in states {
+            let before = self.was.insert(id, state);
+            // Someone came back to it: theirs now.
+            if let Some(waiting) = self.limited.get(&id) {
+                let touched = self
+                    .rt
+                    .get(&id)
+                    .and_then(|rt| rt.session.as_ref())
+                    .is_some_and(|s| s.input_seq() != waiting.untouched_at);
+                if touched || state == ClaudeState::Busy {
+                    self.limited.remove(&id);
+                }
+            }
+            // Stopping is the moment to look, and the only one.
+            let stopped = before == Some(ClaudeState::Busy) && state != ClaudeState::Busy;
+            if !stopped || self.limited.contains_key(&id) {
+                continue;
+            }
+            let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) else {
+                continue;
+            };
+            if !giverny_claude::usage::looks_rate_limited(&session.screen_text()) {
+                continue;
+            }
+            let reopens = self
+                .claude
+                .tabs
+                .get(&id)
+                .and_then(|t| t.account.as_deref())
+                .and_then(|account| self.claude.window_reopens(account));
+            tracing::info!(
+                "tab {id:?}: out of limit{}",
+                match reopens {
+                    Some(at) => format!("; window reopens {at}"),
+                    None => String::new(),
+                }
+            );
+            self.limited.insert(
+                id,
+                Limited {
+                    reopens,
+                    untouched_at: session.input_seq(),
+                    session_gone: state == ClaudeState::None,
+                },
+            );
+        }
+
+        if self.limited.is_empty() {
+            return;
+        }
+        // Fill in reset times that were not known when the tab stopped, and
+        // wake the ones whose window has come round.
+        let ready: Vec<TabId> = self
+            .limited
+            .iter_mut()
+            .filter_map(|(id, waiting)| {
+                if waiting.reopens.is_none() {
+                    waiting.reopens = self
+                        .claude
+                        .tabs
+                        .get(id)
+                        .and_then(|t| t.account.as_deref())
+                        .and_then(|account| self.claude.window_reopens(account));
+                }
+                waiting.reopens.filter(|at| *at <= now).map(|_| *id)
+            })
+            .collect();
+        for id in ready {
+            let Some(waiting) = self.limited.remove(&id) else {
+                continue;
+            };
+            if !self.cfg.claude.resume_after_limit {
+                tracing::info!("tab {id:?}: window reopened (resume_after_limit is off)");
+                continue;
+            }
+            self.carry_on(id, waiting.session_gone);
+        }
+    }
+
+    /// Ask a tab to pick up where the limit stopped it.
+    ///
+    /// A session that is still running only needs the ask. One that exited has
+    /// to be brought back first, and the prompt follows far enough behind for
+    /// Claude Code to be listening — the same settle delay a restored tab uses,
+    /// and the same standing-down if the user starts typing in the meantime.
+    fn carry_on(&mut self, id: TabId, session_gone: bool) {
+        const CONTINUE: &str = "continue\r";
+        let seq = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .map(|s| s.input_seq())
+            .unwrap_or_default();
+        let wake = |bytes: &str| Inject::Wake {
+            bytes: bytes.as_bytes().to_vec(),
+            seq,
+        };
+        if !session_gone {
+            tracing::info!("tab {id:?}: window reopened, asking it to continue");
+            self.pending_inject
+                .push((Instant::now(), id, wake(CONTINUE)));
+            return;
+        }
+        let Some(sid) = self.session_to_resume(id) else {
+            tracing::info!("tab {id:?}: window reopened, but no conversation to resume");
+            return;
+        };
+        let Some(cmd) = self.resume_command(&sid, id) else {
+            return;
+        };
+        tracing::info!("tab {id:?}: window reopened, resuming {sid} to continue");
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(1300),
+            id,
+            Inject::Wake { bytes: cmd, seq },
+        ));
+        self.pending_inject
+            .push((Instant::now() + Duration::from_secs(9), id, wake(CONTINUE)));
+    }
+
     /// Say outside the window what the rail says inside it.
     ///
     /// A tab that wants you is invisible from another application, which is
@@ -1630,6 +1794,17 @@ impl App {
         {
             self.wsl_cwd_rx = Some(rx);
         }
+    }
+
+    /// When this tab's usage window reopens, if it is waiting for one.
+    /// `None` for every tab that is not.
+    pub fn limited_until(&self, id: TabId) -> Option<jiff::Timestamp> {
+        self.limited.get(&id).and_then(|w| w.reopens)
+    }
+
+    /// Is this tab stopped by a usage limit at all, reset time known or not?
+    pub fn is_limited(&self, id: TabId) -> bool {
+        self.limited.contains_key(&id)
     }
 
     /// How the rail groups tabs right now.
@@ -2121,12 +2296,19 @@ impl App {
                 let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) else {
                     continue;
                 };
-                // The user took over — automated typing stands down.
-                if session.had_user_input() {
+                // The user took over — automated typing stands down. Except
+                // a wake, which is aimed at a tab they have worked in and
+                // carries its own, narrower test.
+                if session.had_user_input() && !matches!(inject, Inject::Wake { .. }) {
                     continue;
                 }
                 match inject {
                     Inject::Raw(bytes) => session.write(bytes),
+                    Inject::Wake { bytes, seq } => {
+                        if session.input_seq() == seq {
+                            session.write(bytes);
+                        }
+                    }
                     Inject::CwdFix(expected) => {
                         let actual = session.proc_cwd();
                         if actual.as_ref().is_some_and(|a| *a != expected) && expected.is_dir() {
@@ -2400,6 +2582,7 @@ impl eframe::App for App {
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         self.show_attention(&ctx, frame);
+        self.watch_for_limits();
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
                 tab.claude_session = session;

@@ -386,6 +386,22 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "claude.resume_after_limit",
+        label: "resume after a limit",
+        section: Section::Claude,
+        doc: "Pick a session back up when the usage window that stopped it reopens.",
+        note: &[
+            "A session that runs out of limit stops mid-task and stays stopped",
+            "until someone comes back to it — which, for work started in the",
+            "evening, means the morning. With this on, Giverny waits for the",
+            "window to reset and asks it to carry on.",
+            "Off by default: it spends the new window without being asked, and",
+            "a tab you have typed in since it stopped is left alone either way.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "usage.refresh_minutes",
         label: "usage refresh",
         section: Section::Claude,

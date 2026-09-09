@@ -333,6 +333,23 @@ pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Does this look like Claude Code saying it has run out of limit?
+///
+/// Matched against what the tab has on screen, because nothing else says so:
+/// a session that stops for this reason emits the same `Stop` hook as one that
+/// stops because it finished, and the on-disk usage cache is a percentage, not
+/// a reason. The wording has changed more than once — "Claude usage limit
+/// reached", "5-hour limit reached", "approaching your usage limit" — so this
+/// matches the part that has not: a limit, and having reached it.
+pub fn looks_rate_limited(screen: &str) -> bool {
+    let text = screen.to_ascii_lowercase();
+    // The last lines only: an agent that discussed rate limits an hour ago is
+    // not rate limited, and the message is the last thing on the screen.
+    let tail: String = text.lines().rev().take(12).collect::<Vec<_>>().join("\n");
+    (tail.contains("limit reached") || tail.contains("limit exceeded"))
+        && !tail.contains("approaching")
+}
+
 /// Cache age in minutes given the current wall clock.
 pub fn age_minutes(usage: &AccountUsage, now: jiff::Timestamp) -> i64 {
     let now_ms = now.as_millisecond();
@@ -398,6 +415,25 @@ mod tests {
         assert_eq!(u.limits[1].effective_percent(now), 15.0);
         let cd = u.limits[1].reset_countdown(now).unwrap();
         assert!(cd.ends_with('h'), "countdown in days+hours: {cd}");
+    }
+
+    #[test]
+    fn a_limit_message_is_recognised_and_a_conversation_about_one_is_not() {
+        assert!(looks_rate_limited(
+            "> build the thing\n\nClaude usage limit reached. Your limit will reset at 3pm."
+        ));
+        assert!(looks_rate_limited("5-hour limit reached ∙ resets 8pm"));
+        // A warning is not a stop.
+        assert!(!looks_rate_limited(
+            "You are approaching your usage limit for this window"
+        ));
+        // Talking about it is not hitting it.
+        assert!(!looks_rate_limited(
+            "the docs explain what happens when a limit is reached\n> ok"
+        ));
+        // And it has to be recent: the same message, long scrolled away.
+        let old = format!("Claude usage limit reached{}", "\nwork\n".repeat(40));
+        assert!(!looks_rate_limited(&old));
     }
 
     #[test]

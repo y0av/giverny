@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.2 — 2026-09-09
+
+- A session stopped by a usage limit can pick itself up when the window
+  reopens. Nothing reports that reason — the `Stop` hook is the one a finished
+  turn sends, and the usage cache is a percentage with no opinion about why
+  anything ended — so Giverny reads the message the tab has on screen at the
+  moment it stops working, and takes the reset time from the account's own
+  numbers rather than from the words in the message. The tab then says what it
+  is waiting for and until when: `out of limit · resumes 20:15`.
+
+  Carrying on is off by default (`claude.resume_after_limit`, settings →
+  claude): it spends the new window without being asked. With it on, a session
+  still sitting at its prompt is asked to continue; one that exited is resumed
+  first. Either way a tab that has been typed in since it stopped is left
+  alone — that one has an owner.
+
 ## v0.7.1 — 2026-09-09
 
 - v0.7.0 shipped without a Windows binary: its taskbar code had never

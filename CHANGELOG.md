@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.0 — 2026-09-09
+
+- A tab that wants you says so outside the window. The window title carries the
+  count — what a hover over the taskbar button shows, and what Alt-Tab shows —
+  and the first tab to want anything asks the desktop for attention: a
+  highlighted taskbar button on Windows, a bouncing dock icon on macOS, an
+  urgency hint on Linux. On Windows it also wears a mark: an amber dot in the
+  corner of the taskbar button, which stays until nothing is waiting, rather
+  than ending at the next click.
+
 ## v0.6.18 — 2026-09-08
 
 - Closing waits for a tab, but not forever. Each tab's io thread was joined

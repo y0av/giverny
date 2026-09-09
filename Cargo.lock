@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1420,13 +1420,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
  "winresource",
 ]
 
 [[package]]
 name = "giverny-claude"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1443,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1460,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "0.6.18"
+version = "0.7.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

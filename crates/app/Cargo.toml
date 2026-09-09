@@ -27,13 +27,14 @@ crossbeam-channel.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
+# The window handle: Wayland drag-and-drop needs it, so does the taskbar badge.
+raw-window-handle = "0.6"
 
 # Wayland drag-and-drop, which winit 0.30 does not implement. It arrives
 # through the clipboard crate eframe already uses — patched in the workspace
 # root; see src/wayland_dnd.rs.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
 smithay-clipboard = "0.7.3"
-raw-window-handle = "0.6"
 
 # Shutting down on a signal, so a logout or a `kill` gets the same
 # scrollback-and-state write that closing the window does.
@@ -47,3 +48,11 @@ winresource = "0.1"
 [target.'cfg(windows)'.dependencies]
 # Only to tell a console we were given from a console we were launched from.
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+# The taskbar overlay icon, which is COM and so needs the interfaces.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

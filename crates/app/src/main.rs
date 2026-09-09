@@ -10,6 +10,7 @@ mod oom;
 mod overlays;
 mod rail;
 mod settings_ui;
+mod taskbar;
 mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
@@ -599,6 +600,9 @@ pub struct App {
     /// because nothing on this side of the boundary knows them.
     wsl_cwd_rx: Option<crossbeam_channel::Receiver<Vec<(String, String, String)>>>,
     last_wsl_probe: Instant,
+    /// How many tabs wanted you at the last frame, so the taskbar is only
+    /// told when that changes.
+    attention: usize,
     /// A newer release, once the background check finds one.
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
@@ -979,6 +983,7 @@ impl App {
             drag_hover: None,
             row_rects: Vec::new(),
             stale_sessions: false,
+            attention: 0,
             repo_cache: HashMap::new(),
             repo_rx: None,
             wsl_cwd_rx: None,
@@ -1526,6 +1531,49 @@ impl App {
                     tab.git_branch = branch;
                 }
             }
+        }
+    }
+
+    /// Say outside the window what the rail says inside it.
+    ///
+    /// A tab that wants you is invisible from another application, which is
+    /// where you are when a tab starts wanting you. The window title carries
+    /// the count — it is what a hover over the taskbar button shows, and what
+    /// Alt-Tab shows — and the first tab to want anything asks the desktop for
+    /// attention, which is a highlighted taskbar button on Windows, a bouncing
+    /// dock icon on macOS and an urgency hint on Linux. Only ever on a change:
+    /// a title set every frame is a title flickering every frame.
+    fn show_attention(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        use claude_watch::ClaudeState;
+        let waiting = self
+            .claude
+            .tabs
+            .values()
+            .filter(|t| t.state == ClaudeState::NeedsYou)
+            .count();
+        if waiting == self.attention {
+            return;
+        }
+        let first = waiting > self.attention;
+        self.attention = waiting;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(if waiting > 0 {
+            format!("Giverny ({waiting})")
+        } else {
+            "Giverny".to_string()
+        }));
+        // Windows can wear the mark on the button itself, which outlasts the
+        // highlight below: it stays until it is taken away.
+        if let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(frame)
+            && let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+        {
+            taskbar::set(win32.hwnd.get(), waiting);
+        }
+        // Asking for attention while the window already has it is how a
+        // window ends up flashing at someone looking straight at it.
+        if first && !ctx.input(|i| i.focused) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
         }
     }
 
@@ -2291,7 +2339,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Documentation capture (GIVERNY_CAPTURE); no-op otherwise.
         if let Some(cap) = &mut self.capture {
             cap.on_frame(ui.ctx());
@@ -2353,6 +2401,7 @@ impl eframe::App for App {
         }
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        self.show_attention(&ctx, frame);
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
                 tab.claude_session = session;

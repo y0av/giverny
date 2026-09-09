@@ -12,8 +12,16 @@ fn main() {
     }
     let icon = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/icon/giverny.ico");
     println!("cargo:rerun-if-changed={icon}");
+    let badge = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/icon/attention.ico"
+    );
+    println!("cargo:rerun-if-changed={badge}");
     let mut resource = winresource::WindowsResource::new();
     resource.set_icon(icon);
+    // The overlay the taskbar button wears when a tab wants you; loaded by
+    // this id at runtime (see `taskbar`).
+    resource.set_icon_with_id(badge, "2");
     // Cross-building without a resource compiler is not a reason to fail the
     // build; it costs the icon, not the binary.
     if let Err(err) = resource.compile() {

@@ -45,6 +45,13 @@ signal-hook = "0.4.4"
 # Puts the icon inside the .exe, where Explorer and the taskbar look for it.
 winresource = "0.1"
 
+# The dock badge: the Mac equivalent of the taskbar overlay below. Same
+# versions winit already pulls in, so this adds no new tree.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSDockTile"] }
+objc2-foundation = "0.3"
+
 [target.'cfg(windows)'.dependencies]
 # Only to tell a console we were given from a console we were launched from.
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

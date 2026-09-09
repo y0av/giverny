@@ -8,13 +8,35 @@
 //! click. Nowhere else has an equivalent worth a dependency; elsewhere the
 //! window title and the attention request carry it.
 
-/// Show or clear the "a tab wants you" mark. `hwnd` is a Win32 window handle;
-/// everywhere else this is nothing.
+/// Show or clear the "a tab wants you" mark. `hwnd` is a Win32 window handle,
+/// ignored everywhere else: macOS marks the dock tile, which belongs to the
+/// application rather than to a window, and Linux has the title and the
+/// urgency hint the caller already sets.
 pub fn set(hwnd: isize, waiting: usize) {
     #[cfg(windows)]
     imp::set(hwnd, waiting);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    mac::set(waiting);
     let _ = (hwnd, waiting);
+}
+
+/// The dock tile's badge: the same red bubble Mail puts an unread count in.
+/// It outlasts a bouncing icon, which is over in a second.
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+
+    pub fn set(waiting: usize) {
+        // Only from the thread AppKit belongs to, which is the one painting.
+        let Some(marker) = MainThreadMarker::new() else {
+            return;
+        };
+        let tile = NSApplication::sharedApplication(marker).dockTile();
+        let label = (waiting > 0).then(|| NSString::from_str(&waiting.to_string()));
+        unsafe { tile.setBadgeLabel(label.as_deref()) };
+    }
 }
 
 #[cfg(windows)]

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.1 — 2026-09-09
+
+- v0.7.0 shipped without a Windows binary: its taskbar code had never
+  compiled, and the release went out on a CI result read off the previous
+  commit. v0.7.0 is marked as a pre-release so nothing updates into it; this is
+  the same release with the Windows build fixed, plus the macOS dock badge.
+
 ## v0.7.0 — 2026-09-09
 
 - A tab that wants you says so outside the window. The window title carries the

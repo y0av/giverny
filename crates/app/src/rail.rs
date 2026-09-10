@@ -279,13 +279,27 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .input(|i| i.pointer.interact_pos())
         .filter(|_| arrangeable);
     let mut drop_target: Option<(CategoryId, usize, f32)> = None;
+    // Where a dragged *category* would land: an index in rail order, and the
+    // line to draw for it.
+    let mut category_drop: Option<(usize, f32)> = None;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(6.0);
-            for cat in &cats {
+            for (position, cat) in cats.iter().enumerate() {
                 let header = category_header(app, ui, cat, dim, &mut actions);
+                // Above a header's middle drops before this category, below it
+                // after — the same rule as tabs, one level up.
+                if let Some(p) = pointer
+                    && app.dragging_category.is_some()
+                    && p.y >= header.min.y - 8.0
+                    && p.y <= header.max.y + 8.0
+                {
+                    let after = p.y > header.center().y;
+                    let y = if after { header.max.y } else { header.min.y };
+                    category_drop = Some((position + usize::from(after), y));
+                }
                 // Dropping on a header (or an empty category's band) appends
                 // to that category.
                 if let Some(p) = pointer
@@ -328,6 +342,29 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             }
             ui.add_space(8.0);
         });
+
+    // A category being dragged: its own line, its own commit.
+    if let Some(dragged) = app.dragging_category {
+        if let Some((_, y)) = category_drop {
+            let x0 = ui.min_rect().min.x + 4.0;
+            let x1 = ui.min_rect().max.x - 4.0;
+            ui.painter()
+                .hline(x0..=x1, y, egui::Stroke::new(2.5, app.chrome.accent));
+        }
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some((index, _)) = category_drop {
+                // Taking it out first shifts everything after it up by one.
+                let from = cats
+                    .iter()
+                    .position(|c| c.key == GroupKey::Category(dragged))
+                    .unwrap_or(index);
+                let index = index - usize::from(index > from);
+                actions.push(Action::ReorderCategory(dragged, index));
+            }
+            app.dragging_category = None;
+        }
+    }
 
     // Drop indicator + commit on release.
     if let Some(dragged) = app.dragging {
@@ -547,7 +584,7 @@ fn category_header(
 ) -> Rect {
     let c = app.chrome;
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_H), Sense::click_and_drag());
     let p = ui.painter_at(rect);
 
     let as_category = match &cat.key {
@@ -709,6 +746,18 @@ fn category_header(
         FontId::monospace(13.0),
         if plus.hovered() { cat.color } else { dim },
     );
+    // Dragging a header reorders categories; a repository group is where its
+    // tabs are and cannot be moved by hand.
+    if let Some(id) = as_category {
+        if resp.drag_started() {
+            app.dragging_category = Some(id);
+            app.dragging = None;
+        }
+        if app.dragging_category == Some(id) {
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 4.0, cat.color.gamma_multiply(0.12));
+        }
+    }
     if plus.clicked() {
         actions.push(Action::NewTab {
             category: cat.category,
@@ -839,7 +888,10 @@ fn tab_row(
     // ⠿ for a background shell — and a font without the braille block turns
     // them into empty boxes, which is what every Windows machine did. A shape
     // is a shape everywhere.
-    let dot = Pos2::new(rect.min.x + 18.0, rect.min.y + 13.0);
+    // Indented past the header above it: a category's name starts at 34, so
+    // its tabs start after that. Outdented children read as a list that lost
+    // its heading.
+    let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     let time = ui.input(|i| i.time);
     match row.claude {
         ClaudeState::Busy => spinner(&p, dot, time, row.color),
@@ -865,10 +917,13 @@ fn tab_row(
             }
         }
         ClaudeState::None => {
+            // A plain shell, which most tabs are most of the time. It was a
+            // bright green dot on every row, which is a lot of green saying
+            // nothing and drowning the three marks that mean something.
             if row.exited {
-                p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
+                p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim.gamma_multiply(0.7)));
             } else {
-                p.circle_filled(dot, 3.5, Color32::from_rgb(0x7b, 0xa2, 0x5a));
+                p.circle_filled(dot, 3.0, dim);
             }
         }
     }
@@ -878,8 +933,8 @@ fn tab_row(
         && *id == row.id
     {
         let edit_rect = Rect::from_min_size(
-            Pos2::new(rect.min.x + 28.0, rect.min.y + 3.0),
-            Vec2::new(width - 40.0, 20.0),
+            Pos2::new(rect.min.x + 44.0, rect.min.y + 3.0),
+            Vec2::new(width - 56.0, 20.0),
         );
         let te = ui.put(
             edit_rect,
@@ -901,9 +956,9 @@ fn tab_row(
     }
 
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 52.0) / 7.2).max(4.0) as usize;
+    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
     p.text(
-        Pos2::new(rect.min.x + 28.0, rect.min.y + 13.0),
+        Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
         truncate_chars(&row.title, char_budget),
         FontId::monospace(12.5),
@@ -915,7 +970,7 @@ fn tab_row(
     );
     if !row.sub.is_empty() {
         p.text(
-            Pos2::new(rect.min.x + 28.0, rect.min.y + 29.0),
+            Pos2::new(rect.min.x + 44.0, rect.min.y + 29.0),
             Align2::LEFT_CENTER,
             truncate_chars(&row.sub, char_budget + 2),
             FontId::monospace(10.0),

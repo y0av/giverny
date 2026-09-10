@@ -433,6 +433,8 @@ pub enum Action {
     ResumeSpecific(TabId, String, PathBuf),
     /// Drag-and-drop: place a tab in a category at a position.
     ReorderTab(TabId, CategoryId, usize),
+    /// Drag-and-drop: move a category to a position in rail order.
+    ReorderCategory(CategoryId, usize),
     /// Run the official install command in a visible tab.
     RunUpdate,
     DismissUpdate,
@@ -588,6 +590,9 @@ pub struct App {
     input_seen: HashMap<TabId, u64>,
     /// Tab currently being dragged in the rail.
     pub dragging: Option<TabId>,
+    /// Category currently being dragged in the rail. Never both at once: a
+    /// drag starts on one thing.
+    pub dragging_category: Option<CategoryId>,
     /// A Ctrl+Tab walk in progress: where it started, the recency order it
     /// snapshotted, and how far into it the user has stepped.
     switcher: Option<Switcher>,
@@ -1000,6 +1005,7 @@ impl App {
             session_picker: None,
             input_seen: HashMap::new(),
             dragging: None,
+            dragging_category: None,
             switcher: None,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
@@ -1408,6 +1414,10 @@ impl App {
             }
             Action::MoveTab(tab, category) => {
                 self.ws.move_tab_to_category(tab, category);
+            }
+            Action::ReorderCategory(id, index) => {
+                self.ws.reorder_category(id, index);
+                self.state_dirty = true;
             }
             Action::ReorderTab(tab, category, index) => {
                 self.ws.reorder_tab(tab, category, index);

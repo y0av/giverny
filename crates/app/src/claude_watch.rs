@@ -173,9 +173,10 @@ fn merge_registry(
     live: &giverny_claude::registry::SessionEntry,
 ) -> ClaudeState {
     // Working is unambiguous evidence Claude is running again, so it always
-    // clears a stale attention flag — even under hook authority (a declined
-    // prompt emits no hook to clear it).
-    if current == ClaudeState::NeedsYou && live.busy() {
+    // clears a stale flag — even under hook authority. A declined permission
+    // prompt emits no hook to clear the one it raised, and a turn that ended
+    // before this one left a tick behind that "finished" no longer describes.
+    if live.busy() && matches!(current, ClaudeState::NeedsYou | ClaudeState::DoneUnseen) {
         return ClaudeState::Busy;
     }
     if hooks_own {
@@ -289,6 +290,15 @@ impl ClaudeWatch {
         for p in profiles {
             let settings = p.config_dir.join("settings.json");
             if !hooks::installed_in(&settings) {
+                // Installed once, but not for everything we listen to now: a
+                // new event in a new version. Consent was given; bring the
+                // file up to date rather than asking again.
+                if hooks::partly_installed_in(&settings) {
+                    match hooks::install_into(&settings) {
+                        Ok(_) => tracing::info!("hooks brought up to date for {}", p.name),
+                        Err(e) => tracing::warn!("hook update failed for {}: {e}", p.name),
+                    }
+                }
                 continue;
             }
             // Our entries point at whichever binary installed them. After a
@@ -363,6 +373,11 @@ impl ClaudeWatch {
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
             }
             Some("UserPromptSubmit") => entry.state = ClaudeState::Busy,
+            // A tool call is work happening now, whoever asked for it. It is
+            // what tells a tab apart from the turn that ended before it: a
+            // session carrying on after a permission was granted, or an agent
+            // continuing by itself, emits nothing else.
+            Some("PostToolUse") => entry.state = ClaudeState::Busy,
             Some("Stop") => {
                 entry.state = if is_active {
                     ClaudeState::Idle

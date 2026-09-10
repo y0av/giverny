@@ -306,6 +306,20 @@ impl Workspace {
         self.switch_to(self.tabs[next].id);
     }
 
+    /// Move a category to `index` in rail order. Tabs follow their category:
+    /// they are stored with it, so nothing about them changes.
+    pub fn reorder_category(&mut self, id: CategoryId, index: usize) {
+        let Some(from) = self.categories.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let to = index.min(self.categories.len().saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let moved = self.categories.remove(from);
+        self.categories.insert(to, moved);
+    }
+
     /// Move `id` into `category` at `index` counted among that category's
     /// tabs (clamped). Used by rail drag-and-drop.
     pub fn reorder_tab(&mut self, id: TabId, category: CategoryId, index: usize) {
@@ -455,6 +469,28 @@ mod tests {
         ws.close_tab(c);
         ws.commit_switch(c);
         assert_eq!(ws.recent_order(), vec![b]);
+    }
+
+    #[test]
+    fn categories_can_be_reordered() {
+        let mut ws = Workspace::default();
+        let main = ws.categories[0].id;
+        let work = ws.add_category("work");
+        let infra = ws.add_category("infra");
+        let tab = ws.add_tab(work);
+
+        ws.reorder_category(infra, 0);
+        let order: Vec<CategoryId> = ws.categories.iter().map(|c| c.id).collect();
+        assert_eq!(order, vec![infra, main, work]);
+        // A tab is stored with its category and does not notice.
+        assert_eq!(ws.tab(tab).unwrap().category, work);
+
+        // Past the end lands at the end; a move to where it already is is
+        // not a move.
+        ws.reorder_category(infra, 99);
+        assert_eq!(ws.categories.last().unwrap().id, infra);
+        ws.reorder_category(infra, 99);
+        assert_eq!(ws.categories.last().unwrap().id, infra);
     }
 
     #[test]

@@ -13,10 +13,38 @@ use serde::{Deserialize, Serialize};
 pub const RELAY_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
+    // Every tool call, which is the only thing that says "still working"
+    // during a turn nobody prompted — a session carrying on after a
+    // permission was granted, or an agent running itself. Without it a tab
+    // keeps whatever the last turn's `Stop` left on it, and shows a tick
+    // while it works.
+    "PostToolUse",
     "Stop",
     "Notification",
     "SessionEnd",
 ];
+
+/// Do any of our entries exist in this file, whatever the event?
+///
+/// The difference between "never installed" and "installed before this
+/// version knew about a new event". The second one is ours to repair.
+pub fn partly_installed_in(settings_path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(|h| h.as_object())
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(|v| v.as_array())
+                .flatten()
+                .any(is_our_entry)
+        })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayMsg {

@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.3 — 2026-09-10
+
+- A tab shows a tick while it is working, no longer. Giverny listens for tool
+  calls now, which is the only thing that says "still working" during a turn
+  nobody prompted — a session carrying on after a permission was granted, or an
+  agent running itself. Before that, a tab kept whatever the last turn's `Stop`
+  left on it until someone looked at it. Existing installs are updated in
+  place: the consent was given, the list of events has changed.
+
+- A plain shell is a quiet grey dot, not a bright green one. Most tabs are
+  plain shells most of the time, and a rail full of green says nothing while
+  drowning the three marks that mean something.
+
+- Tabs sit to the right of the category they are under. They started to the
+  left of it, which reads as a list that has lost its heading.
+
+- Categories can be dragged into any order, the way tabs already could.
+
 ## v0.7.2 — 2026-09-09
 
 - A session stopped by a usage limit can pick itself up when the window

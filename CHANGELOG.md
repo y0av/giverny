@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.4 — 2026-09-10
+
+- A tab inside WSL shows what Claude is doing, instead of reverting to "no
+  Claude" five seconds after every turn. Registry entries were matched to tabs
+  by process ancestry alone, and for a session inside a distribution that can
+  never match: the entry carries a Linux pid, the tab's shell is a `wsl.exe` on
+  the Windows side. So no tab there was ever "seen in the scan", and the rule
+  that clears state for a session that has genuinely gone took every tab with
+  it between turns. Entries are matched by conversation as well now — the hooks
+  say which tab holds which session, and the registry says which session an
+  entry is.
+
 ## v0.7.3 — 2026-09-10
 
 - A tab shows a tick while it is working, no longer. Giverny listens for tool

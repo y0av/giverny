@@ -524,12 +524,26 @@ impl ClaudeWatch {
         for tab in self.tabs.values_mut() {
             tab.seen_in_scan = false;
         }
+        // Which tab holds which conversation, as the hooks reported it. This
+        // is the only way to match a session that runs where our process ids
+        // mean nothing: an entry inside a WSL distribution carries a Linux pid
+        // and the tab's shell is a `wsl.exe` on the Windows side, so the
+        // ancestry walk below can never connect the two. Without a match the
+        // tab is "not seen in the scan", and five seconds after its last hook
+        // it goes back to showing no Claude at all — which is what a tab does
+        // between turns, all day.
+        let by_session: HashMap<String, TabId> = self
+            .tabs
+            .iter()
+            .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
+            .collect();
         {
             for live in self.scanned.live.clone() {
                 let Some(tab_id) = shell_pids
                     .iter()
                     .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
                     .map(|(id, _)| *id)
+                    .or_else(|| by_session.get(&live.entry.session_id).copied())
                 else {
                     continue;
                 };

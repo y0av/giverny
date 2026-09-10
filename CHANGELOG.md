@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.7.5 — 2026-09-10
+
+- Usage bars say when the limit renews again. The countdown came from the
+  cached `/usage` numbers, so on a machine where that refresh is failing — a
+  Claude installed inside WSL, most of the time — the cache eventually claims
+  the window already reset and the countdown disappears, while the percentages
+  carry on updating from the status line. The status line carries the reset
+  time too; Giverny now reads it, and prefers it over the cache, which is the
+  fresher of the two anyway.
+
+- A plain shell is a green dot again. Greying it out made the rail calmer and
+  also made a live shell look like nothing at all.
+
 ## v0.7.4 — 2026-09-10
 
 - A tab inside WSL shows what Claude is doing, instead of reverting to "no

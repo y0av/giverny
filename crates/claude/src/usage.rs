@@ -89,18 +89,7 @@ impl LimitEntry {
     /// `"2h14m"`-style countdown to the reset, when in the future.
     pub fn reset_countdown(&self, now: jiff::Timestamp) -> Option<String> {
         let at = self.resets_at_ts()?;
-        if at <= now {
-            return None;
-        }
-        let secs = at.as_second() - now.as_second();
-        let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
-        Some(if d > 0 {
-            format!("{d}d{h}h")
-        } else if h > 0 {
-            format!("{h}h{m:02}m")
-        } else {
-            format!("{m}m")
-        })
+        (at > now).then(|| countdown_to(at, now))
     }
 }
 
@@ -330,6 +319,19 @@ pub fn refresh_via_cli(config_dir: &Path) -> anyhow::Result<()> {
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
+    }
+}
+
+/// `"2h14m"`, `"1d3h"`, `"9m"` — how long until `at`.
+pub fn countdown_to(at: jiff::Timestamp, now: jiff::Timestamp) -> String {
+    let secs = (at.as_second() - now.as_second()).max(0);
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
     }
 }
 

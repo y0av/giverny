@@ -71,6 +71,12 @@ pub struct LiveUsage {
     pub at: Instant,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
+    /// When each window reopens, if the push says. The on-disk cache carries
+    /// this too, but a cache older than the window it describes has a reset
+    /// time in the past — and a lapsed reset time is no reset time at all,
+    /// which is how a live 90% ends up with nothing next to it.
+    pub five_hour_resets: Option<jiff::Timestamp>,
+    pub seven_day_resets: Option<jiff::Timestamp>,
 }
 
 /// Side effects for the app to apply after a tick.
@@ -204,6 +210,36 @@ struct ScanResult {
     /// Every live session started before its `settings.json` was last
     /// written, so none of them loaded the hooks in it.
     stale: bool,
+}
+
+/// When one rate-limit window resets, out of a statusline push.
+///
+/// The field has been spelled more than one way across Claude Code versions,
+/// and a moment is written variously: an RFC 3339 string, epoch seconds, or
+/// epoch milliseconds. Read whichever one is there.
+fn reset_time(window: &serde_json::Value) -> Option<jiff::Timestamp> {
+    for name in ["resets_at", "reset_at", "resets_at_ms", "reset_at_ms"] {
+        let Some(value) = window.get(name) else {
+            continue;
+        };
+        if let Some(text) = value.as_str()
+            && let Ok(at) = text.parse::<jiff::Timestamp>()
+        {
+            return Some(at);
+        }
+        if let Some(number) = value.as_i64() {
+            // Milliseconds if it is far too large to be seconds.
+            let millis = if number > 100_000_000_000 {
+                number
+            } else {
+                number * 1000
+            };
+            if let Ok(at) = jiff::Timestamp::from_millisecond(millis) {
+                return Some(at);
+            }
+        }
+    }
+    None
 }
 
 impl ClaudeWatch {
@@ -597,17 +633,16 @@ impl ClaudeWatch {
 
     /// A statusline push: official `rate_limits` for one account.
     fn apply_statusline(&mut self, msg: &RelayMsg) {
-        let pct = |key: &str| -> Option<f64> {
-            msg.event
-                .get("rate_limits")?
-                .get(key)?
-                .get("used_percentage")?
-                .as_f64()
-        };
+        let window =
+            |key: &str| -> Option<&serde_json::Value> { msg.event.get("rate_limits")?.get(key) };
+        let pct = |key: &str| -> Option<f64> { window(key)?.get("used_percentage")?.as_f64() };
+        let resets = |key: &str| -> Option<jiff::Timestamp> { reset_time(window(key)?) };
         let live = LiveUsage {
             at: Instant::now(),
             five_hour: pct("five_hour"),
             seven_day: pct("seven_day"),
+            five_hour_resets: resets("five_hour"),
+            seven_day_resets: resets("seven_day"),
         };
         if live.five_hour.is_none() && live.seven_day.is_none() {
             return;
@@ -1213,6 +1248,8 @@ mod tests {
                 at: Instant::now(),
                 five_hour: Some(p),
                 seven_day: None,
+                five_hour_resets: None,
+                seven_day_resets: None,
             }),
             statusline_on: true,
         };
@@ -1223,6 +1260,28 @@ mod tests {
         // No push ⇒ cache value, not flagged.
         let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, None), &limit, now);
         assert_eq!((pct, is_live), (5.0, false));
+    }
+
+    #[test]
+    fn a_reset_is_read_however_it_is_written() {
+        let at = |v: serde_json::Value| super::reset_time(&v).map(|t| t.as_second());
+        // Epoch seconds, epoch milliseconds, and RFC 3339 all mean the moment.
+        assert_eq!(
+            at(serde_json::json!({ "resets_at": 1_760_000_000 })),
+            Some(1_760_000_000)
+        );
+        assert_eq!(
+            at(serde_json::json!({ "resets_at_ms": 1_760_000_000_000i64 })),
+            Some(1_760_000_000)
+        );
+        assert_eq!(
+            at(serde_json::json!({ "reset_at": "2025-10-09T08:53:20Z" })),
+            Some(1_760_000_000)
+        );
+        // Nothing to read, or something unreadable, is no reset rather than a
+        // wrong one — the bar then simply says nothing about renewal.
+        assert_eq!(at(serde_json::json!({ "used_percentage": 12 })), None);
+        assert_eq!(at(serde_json::json!({ "resets_at": "soon" })), None);
     }
 
     #[test]

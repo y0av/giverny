@@ -61,6 +61,41 @@ pub fn identity_path(config_dir: &Path) -> PathBuf {
     first
 }
 
+/// Would naming this directory in `CLAUDE_CONFIG_DIR` lose the login?
+///
+/// Yes for any account in the default layout, because the variable moves
+/// where Claude Code keeps its identity — inside the directory instead of
+/// beside it — and the file it then looks for is not there. A session handed
+/// the path of its own default account comes up at the first-run prompt, one
+/// that has never heard of the conversation it was told to resume.
+///
+/// So this is the question to ask before putting the variable in front of a
+/// command, and `identity_path` above is where the layouts are explained.
+/// Answered from the identity file alone: a distribution that is slow to
+/// start, or not running, must not be able to change the answer.
+pub fn identity_lives_beside(config_dir: &Path) -> bool {
+    config_dir.with_extension("json").is_file()
+}
+
+/// Must a command that opens this account name it in `CLAUDE_CONFIG_DIR`?
+///
+/// Only for an account that keeps its identity inside itself, which is to say
+/// a profile someone made on purpose. A home's own `.claude` must be left
+/// unnamed: Claude Code finds it by itself, and naming it loses the login (see
+/// `identity_lives_beside`).
+///
+/// An unreadable directory — a distribution that is not running, a share that
+/// is not mounted, a unix path on a Windows machine — is decided by its name,
+/// toward the default. Opening the default account when a profile was meant
+/// puts a session in the wrong place; naming a default account puts every
+/// session in that home at the first-run prompt.
+pub fn must_be_named(config_dir: &Path) -> bool {
+    if config_dir.is_dir() {
+        return !identity_lives_beside(config_dir);
+    }
+    config_dir.file_name().is_none_or(|name| name != ".claude")
+}
+
 fn read_identity(config_dir: &Path) -> (Option<String>, Option<String>) {
     let path = identity_path(config_dir);
     let Ok(bytes) = std::fs::read(&path) else {
@@ -338,6 +373,27 @@ mod tests {
         // the leftover of a CLAUDE_CONFIG_DIR that pointed here once.
         std::fs::write(dir.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
         assert_eq!(identity_path(&dir), beside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The question asked before a command names an account: naming this one
+    /// would send Claude Code looking for an identity file that is not there,
+    /// and it would come up at the first-run prompt with no idea about the
+    /// conversation it was told to resume.
+    #[test]
+    fn a_default_account_must_not_be_named() {
+        let root = scratch("naming");
+        let home = root.join("home").join("itay");
+        let default = home.join(".claude");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.with_extension("json"), r#"{"oauthAccount":{}}"#).unwrap();
+        assert!(identity_lives_beside(&default));
+
+        // A profile dir keeps its identity inside, so naming it is the only
+        // way to open it at all.
+        let work = home.join(".claude-work");
+        account(&work, "sam@example.com");
+        assert!(!identity_lives_beside(&work));
         let _ = std::fs::remove_dir_all(&root);
     }
 

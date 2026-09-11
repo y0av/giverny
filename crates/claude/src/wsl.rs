@@ -68,13 +68,6 @@ pub fn account_dir(distro: &str) -> Option<PathBuf> {
     Some(unc_path(distro, &format!("{home}/.claude")))
 }
 
-/// Is `config_dir` the account that distribution's Claude Code uses when
-/// nothing names one? Then a command typed into its shell needs no
-/// `CLAUDE_CONFIG_DIR` in front of it.
-pub fn is_default_account(distro: &str, unix_dir: &str) -> bool {
-    home(distro).is_some_and(|h| format!("{h}/.claude") == unix_dir)
-}
-
 /// The profile directory a config dir reported from inside a distribution
 /// belongs to.
 ///
@@ -278,7 +271,7 @@ fn parse_tab_cwds(text: &str) -> Vec<(String, String)> {
 pub fn distros() -> Vec<String> {
     #[cfg(windows)]
     {
-        imp::distros().to_vec()
+        imp::distros()
     }
     #[cfg(not(windows))]
     {
@@ -343,8 +336,8 @@ mod imp {
     use std::collections::HashMap;
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::sync::{LazyLock, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     /// CREATE_NO_WINDOW: no console flashes up in front of the app.
     const NO_WINDOW: u32 = 0x0800_0000;
@@ -412,12 +405,33 @@ mod imp {
         }
     }
 
-    /// Installed distributions, asked once. `wsl.exe -l -q` answers in
-    /// UTF-16 (it is wsl.exe talking, not a program inside a distribution)
-    /// and fails outright when nothing is installed.
-    pub fn distros() -> &'static [String] {
-        static DISTROS: OnceLock<Vec<String>> = OnceLock::new();
-        DISTROS.get_or_init(|| {
+    /// Installed distributions. `wsl.exe -l -q` answers in UTF-16 (it is
+    /// wsl.exe talking, not a program inside a distribution) and fails
+    /// outright when nothing is installed.
+    ///
+    /// A list is kept; an empty answer is kept only briefly, for the same
+    /// reason `cached` retries — "nothing installed" and "did not answer in
+    /// time" arrive here as the same empty vector, and only one of them is
+    /// worth believing for the rest of the run.
+    pub fn distros() -> Vec<String> {
+        /// The listing, and when it was taken.
+        type Listing = Mutex<Option<(Vec<String>, Instant)>>;
+        static DISTROS: LazyLock<Listing> = LazyLock::new(|| Mutex::new(None));
+        match DISTROS.lock().as_deref() {
+            Ok(Some((found, _))) if !found.is_empty() => return found.clone(),
+            Ok(Some((_, at))) if at.elapsed() < RETRY_AFTER => return Vec::new(),
+            Ok(_) => {}
+            Err(_) => return Vec::new(),
+        }
+        let found = ask_distros();
+        if let Ok(mut slot) = DISTROS.lock() {
+            *slot = Some((found.clone(), Instant::now()));
+        }
+        found
+    }
+
+    fn ask_distros() -> Vec<String> {
+        {
             let mut cmd = Command::new("wsl.exe");
             cmd.args(["-l", "-q"])
                 .creation_flags(NO_WINDOW)
@@ -441,52 +455,66 @@ mod imp {
                 .filter(|line| !line.is_empty())
                 .filter(|name| !is_infrastructure(name))
                 .collect()
-        })
+        }
     }
+
+    /// How long a distribution that did not answer is left alone before it is
+    /// asked again.
+    const RETRY_AFTER: Duration = Duration::from_secs(30);
 
     /// One answer per distribution, kept for the life of the process: these
     /// are asked on the UI thread and each one costs a `wsl.exe` launch.
+    ///
+    /// An answer is kept forever; *no answer* is kept only briefly. A cold
+    /// distribution can take longer to boot than the cap above allows, and
+    /// remembering that as a fact meant one slow morning decided, for the
+    /// whole run, that a distribution had no home and no Claude — which is
+    /// how every tab ended up naming an account it should have left alone.
     fn cached(
-        store: &'static LazyLock<Mutex<HashMap<String, Option<String>>>>,
-        distro: &str,
+        store: &'static LazyLock<Answers>,
+        key: &str,
         ask: impl FnOnce() -> Option<String>,
     ) -> Option<String> {
-        if let Some(hit) = store.lock().ok()?.get(distro) {
-            return hit.clone();
+        match store.lock().ok()?.get(key) {
+            Some((answer @ Some(_), _)) => return answer.clone(),
+            Some((None, at)) if at.elapsed() < RETRY_AFTER => return None,
+            _ => {}
         }
         let answer = ask();
         if let Ok(mut map) = store.lock() {
-            map.insert(distro.to_string(), answer.clone());
+            map.insert(key.to_string(), (answer.clone(), Instant::now()));
         }
         answer
     }
 
-    static HOMES: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    static BINS: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    static EXES: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// What a distribution last said, and when it said it.
+    type Answers = Mutex<HashMap<String, (Option<String>, Instant)>>;
+
+    static HOMES: LazyLock<Answers> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static BINS: LazyLock<Answers> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static EXES: LazyLock<Answers> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static NAMES: LazyLock<Answers> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// The distribution `wsl.exe` opens with no `-d`: the one a tab lands in
     /// unless something says otherwise. Asked, because the listing order is
     /// not it.
+    ///
+    /// The listing is the fallback all the same. A distribution that is still
+    /// starting answers nothing, and answering "none" here is the difference
+    /// between a tab that opens where the user keeps their work and a tab that
+    /// opens in PowerShell — for the rest of the run, if the answer is kept.
     pub fn default_distro() -> Option<String> {
-        static DEFAULT: OnceLock<Option<String>> = OnceLock::new();
-        DEFAULT
-            .get_or_init(|| {
-                let mut cmd = Command::new("wsl.exe");
-                cmd.args(["--", "sh", "-c", "printf %s \"$WSL_DISTRO_NAME\""])
-                    .creation_flags(NO_WINDOW)
-                    .stdin(Stdio::null());
-                let out = run_capped(cmd)?;
-                out.status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())?
-                    .into()
-            })
-            .clone()
-            .filter(|name: &String| !name.is_empty())
+        cached(&NAMES, "default", || {
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args(["--", "sh", "-c", "printf %s \"$WSL_DISTRO_NAME\""])
+                .creation_flags(NO_WINDOW)
+                .stdin(Stdio::null());
+            let asked = run_capped(cmd)
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter(|name| !name.is_empty());
+            asked.or_else(|| distros().first().cloned())
+        })
     }
 
     /// The unix home of the distribution's default user.
@@ -523,14 +551,9 @@ mod imp {
     /// says nothing when it doesn't.
     pub fn to_wsl_path(distro: &str, windows_path: &Path) -> Option<String> {
         let key = format!("{distro}\u{0}{}", windows_path.display());
-        if let Some(hit) = EXES.lock().ok()?.get(&key) {
-            return hit.clone();
-        }
-        let answer = ask_wslpath(distro, windows_path).or_else(|| mnt_guess(windows_path));
-        if let Ok(mut map) = EXES.lock() {
-            map.insert(key, answer.clone());
-        }
-        answer
+        cached(&EXES, &key, || {
+            ask_wslpath(distro, windows_path).or_else(|| mnt_guess(windows_path))
+        })
     }
 
     /// Put the path in the script, where nothing rewrites it.

@@ -828,19 +828,13 @@ fn resume_plan(
     // The command is typed into the tab's own shell, so the account has to be
     // named the way that shell can open it: a session inside WSL knows
     // `/home/x/.claude`, never the Windows share it is stored under here.
-    // Naming the distribution's own default account would be harmless but
-    // noisy, so it is left out the same way `~/.claude` is.
-    let (named, is_default) = match wsl::split_unc(&account) {
-        Some((distro, unix)) => {
-            let default = wsl::is_default_account(&distro, &unix);
-            (unix, default)
-        }
-        None => (
-            account.display().to_string(),
-            dirs::home_dir().is_some_and(|h| h.join(".claude") == account),
-        ),
-    };
-    if !is_default {
+    // And a default account is not named at all — that is what put a first-run
+    // prompt in front of every resumed conversation in a distribution.
+    if giverny_claude::profiles::must_be_named(&account) {
+        let named = match wsl::split_unc(&account) {
+            Some((_, unix)) => unix,
+            None => account.display().to_string(),
+        };
         command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
     }
     // `command` bypasses shell wrapper functions named `claude`.
@@ -2403,14 +2397,17 @@ impl App {
         // `SpawnCfg` would derive: the path has to be the unix one, and for
         // the distribution's own default account the right value is no value.
         let account = profile_dir.or_else(|| wsl::account_dir(&distro));
-        if let Some((_, unix)) = account.as_deref().and_then(wsl::split_unc) {
+        if let Some((dir, (_, unix))) = account
+            .as_deref()
+            .and_then(|d| wsl::split_unc(d).map(|split| (d, split)))
+        {
             // Naming the account Claude Code would have picked anyway is not
             // the harmless no-op it looks like: `CLAUDE_CONFIG_DIR` also
             // moves where Claude Code keeps its identity — inside the
             // directory instead of beside it — so a session handed the path
             // of its own default account comes up logged out. Say nothing,
             // and it finds that account by itself.
-            if !wsl::is_default_account(&distro, &unix) {
+            if giverny_claude::profiles::must_be_named(dir) {
                 env.push(("CLAUDE_CONFIG_DIR".into(), unix));
             }
         }
@@ -2955,7 +2952,20 @@ fn doctor() {
                 }
             }
             match wsl::account_dir(distro) {
-                Some(dir) if dir.is_dir() => println!("             account {}", dir.display()),
+                Some(dir) if dir.is_dir() => {
+                    println!("             account {}", dir.display());
+                    // Naming a default account in CLAUDE_CONFIG_DIR moves
+                    // where Claude Code looks for its login, so a session
+                    // handed its own account comes up at the first-run
+                    // prompt with no conversation to resume.
+                    println!(
+                        "             named   {}",
+                        match profiles::must_be_named(&dir) {
+                            true => "yes — CLAUDE_CONFIG_DIR goes in front of claude here",
+                            false => "no — this is the distribution's default account",
+                        }
+                    );
+                }
                 Some(dir) => println!("             account none yet ({})", dir.display()),
                 None => println!("             account unknown (no home reported)"),
             }
@@ -3169,6 +3179,53 @@ mod tests {
         // prompt appears only above both, so both have to be out of reach.
         assert!(value("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES") > 70);
         assert!(value("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD") > 100_000);
+    }
+
+    /// What ita saw: every resumed conversation in his distribution came up
+    /// at Claude Code's first-run prompt instead. The command carried
+    /// `CLAUDE_CONFIG_DIR=/home/ita/.claude` — his own default account —
+    /// which moves where Claude Code looks for its identity, so it found
+    /// none, and a Claude that has just met you knows no conversation to
+    /// resume. The account is named only when it is a profile.
+    #[test]
+    fn a_default_account_is_not_named_in_the_resume_command() {
+        let root = std::env::temp_dir().join(format!("giverny-resume-{}", std::process::id()));
+        let sid = "4eb78e38-0f2e-4a7d-a58c-045e90c5b912";
+        let plan_for = |account: &Path, cwd: &str| {
+            let project = account.join("projects").join("-home-ita-Inbar");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join(format!("{sid}.jsonl")),
+                format!("{{\"cwd\":\"{cwd}\"}}\n"),
+            )
+            .unwrap();
+            resume_plan(sid, Some(account), None, &[account.to_path_buf()])
+        };
+
+        let home = root.join("home").join("ita");
+        let default = home.join(".claude");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.with_extension("json"), r#"{"oauthAccount":{}}"#).unwrap();
+        match plan_for(&default, "/home/ita/Inbar") {
+            ResumePlan::Ready { command, .. } => {
+                assert!(!command.contains("CLAUDE_CONFIG_DIR"), "{command}");
+                assert!(command.starts_with("cd \"/home/ita/Inbar\" && command claude"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A profile is the other way round: it is only reachable by name.
+        let work = home.join(".claude-work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        match plan_for(&work, "/home/ita/Inbar") {
+            ResumePlan::Ready { command, .. } => assert!(
+                command.contains(&format!("CLAUDE_CONFIG_DIR=\"{}\"", work.display())),
+                "{command}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The regression that shipped in v0.5.3: every Windows tab opened

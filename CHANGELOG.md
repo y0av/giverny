@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.6 — 2026-09-11
+
+- Claude resumes the conversation instead of opening at the first-run prompt.
+  A command that opens an account names it in `CLAUDE_CONFIG_DIR`, and that
+  variable also moves where Claude Code keeps its login — inside the directory
+  instead of beside it. Naming a *default* account therefore hands Claude Code
+  a path with no identity file in it, and it comes up as a fresh install that
+  has never heard of the session it was told to resume. Giverny knew not to do
+  that, but it asked the distribution where its home was to find out, and a
+  distribution that is still starting does not answer in time. The answer now
+  comes from the account directory itself, which needs nothing running.
+
+- A distribution that was still starting when Giverny opened is asked again.
+  Every answer it failed to give — its home, where `claude` is, which one is
+  the default — was remembered as a fact for the rest of the run, so one slow
+  morning meant no usage, no account, and tabs opening in PowerShell until
+  Giverny was restarted. Only answers are kept now; silence is retried.
+
 ## v0.7.5 — 2026-09-10
 
 - Usage bars say when the limit renews again. The countdown came from the

@@ -124,6 +124,12 @@ pub struct ClaudeWatch {
     /// One stat sweep at a time: a share that is slow to answer must not
     /// stack up threads behind it.
     stat_in_flight: Arc<AtomicFlag>,
+    /// What a later, warmer discovery found, the one worker looking, and when
+    /// it last looked.
+    late: Arc<Mutex<Option<Vec<Profile>>>>,
+    last_look: Instant,
+    late_in_flight: Arc<AtomicFlag>,
+    extra_dirs: Vec<PathBuf>,
 }
 
 /// How often the on-disk usage caches are re-read. The numbers inside them
@@ -133,6 +139,8 @@ pub struct ClaudeWatch {
 const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the cache files are checked for having been rewritten.
 const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often accounts are looked for again while none inside WSL is known.
+const LOOK_AGAIN_INTERVAL: Duration = Duration::from_secs(45);
 
 /// A bool two threads share. `AtomicBool` in a name that says what it is for.
 #[derive(Default)]
@@ -282,6 +290,10 @@ impl ClaudeWatch {
             cache_mtimes: Arc::new(Mutex::new(HashMap::new())),
             last_cache_stat: Instant::now() - CACHE_STAT_INTERVAL,
             stat_in_flight: Arc::new(AtomicFlag::default()),
+            late: Arc::new(Mutex::new(None)),
+            last_look: Instant::now(),
+            late_in_flight: Arc::new(AtomicFlag::default()),
+            extra_dirs: extra_dirs.to_vec(),
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -538,6 +550,7 @@ impl ClaudeWatch {
         // itself every time a session fetches usage, which is the freshest
         // source there is short of the statusline push.
         self.watch_caches();
+        self.look_again();
         if self.cache_dirty.swap(false, Ordering::Relaxed)
             || self.last_usage.elapsed() >= USAGE_READ_INTERVAL
         {
@@ -694,6 +707,52 @@ impl ClaudeWatch {
                         seen.insert(path, at);
                         dirty.store(true, Ordering::Relaxed);
                     }
+                }
+                in_flight.set(false);
+            });
+    }
+
+    /// Look for accounts again, off the UI thread, while none inside WSL has
+    /// turned up.
+    ///
+    /// Discovery runs once, at startup — and a distribution that has to boot
+    /// first can take longer to say where its home is than anything here will
+    /// wait for it. Asked while it was still cold, it says nothing, and the
+    /// account living in it is then missing for the whole run: no usage, no
+    /// identity, and a resumed session attributed to nobody. It will answer a
+    /// minute later; this is what asks again.
+    fn look_again(&mut self) {
+        if !cfg!(windows)
+            || self.late_in_flight.get()
+            || self.last_look.elapsed() < LOOK_AGAIN_INTERVAL
+        {
+            return;
+        }
+        if self
+            .profiles
+            .iter()
+            .any(|p| wsl::is_wsl_path(&p.config_dir))
+        {
+            return;
+        }
+        if let Some(found) = self.late.lock().ok().and_then(|mut l| l.take())
+            && found.len() > self.profiles.len()
+        {
+            self.profiles = found;
+            self.refresh_usage();
+            return;
+        }
+        self.last_look = Instant::now();
+        let extra = self.extra_dirs.clone();
+        let slot = Arc::clone(&self.late);
+        let in_flight = Arc::clone(&self.late_in_flight);
+        in_flight.set(true);
+        let _ = std::thread::Builder::new()
+            .name("giverny accounts".into())
+            .spawn(move || {
+                let found = profiles::discover(&extra);
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = Some(found);
                 }
                 in_flight.set(false);
             });
@@ -986,6 +1045,10 @@ impl ClaudeWatch {
             cache_mtimes: Arc::new(Mutex::new(HashMap::new())),
             last_cache_stat: Instant::now(),
             stat_in_flight: Arc::new(AtomicFlag::default()),
+            late: Arc::new(Mutex::new(None)),
+            last_look: Instant::now(),
+            late_in_flight: Arc::new(AtomicFlag::default()),
+            extra_dirs: Vec::new(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),

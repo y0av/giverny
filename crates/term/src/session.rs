@@ -1,7 +1,7 @@
 //! `TermSession`: one tab's live terminal bundle — Term + io loop + channels.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::Notify;
@@ -32,6 +32,8 @@ pub struct TermSession {
     sender: LoopSender,
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
+    /// Bumped each time `dirty` is taken: [`Self::content_seq`].
+    content_seq: AtomicU64,
     size: GridSize,
     handle: Option<JoinHandle<(IoLoop<Pty, EventProxy>, State)>>,
 }
@@ -107,6 +109,7 @@ impl TermSession {
             sender,
             notifier,
             dirty,
+            content_seq: AtomicU64::new(0),
             size: cfg.size,
             handle: Some(handle),
         })
@@ -334,6 +337,37 @@ impl TermSession {
         out
     }
 
+    /// The rows on screen right now, top to bottom, scrollback position
+    /// included: each row's text, and whether its first cell has a background
+    /// of its own (Claude Code shades a sent prompt; its input box it does
+    /// not).
+    pub fn viewport_rows(&self) -> Vec<(String, bool)> {
+        viewport_rows(self.term.lock().grid())
+    }
+
+    /// Walk the rows above the top of the view, nearest first, at most `max`
+    /// of them, until `found` returns something. Each row comes as its text
+    /// and whether its first cell is shaded, as in [`Self::viewport_rows`].
+    ///
+    /// Only rows whose first character that is not blank is one of `starts`
+    /// are read and handed over: the walk holds the terminal's lock, which
+    /// the output parser needs, and most rows are told apart by a cell or two.
+    pub fn find_above<T>(
+        &self,
+        max: usize,
+        starts: &[char],
+        found: impl FnMut(&str, bool) -> Option<T>,
+    ) -> Option<T> {
+        find_above(self.term.lock().grid(), max, starts, found)
+    }
+
+    /// Counts the changes to what the terminal shows, as the widget takes
+    /// them to draw: output, a scroll, a resize. While it stands still, so
+    /// does every row on screen and in the scrollback.
+    pub fn content_seq(&self) -> u64 {
+        self.content_seq.load(Ordering::Acquire)
+    }
+
     /// Snap the viewport back to the live (bottom) position.
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
@@ -350,7 +384,11 @@ impl TermSession {
 
     /// True when terminal content changed since the last call (consumes flag).
     pub fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::AcqRel)
+        let dirty = self.dirty.swap(false, Ordering::AcqRel);
+        if dirty {
+            self.content_seq.fetch_add(1, Ordering::AcqRel);
+        }
+        dirty
     }
 
     pub fn mark_dirty(&self) {
@@ -386,6 +424,78 @@ impl TermSession {
             });
         watcher.is_ok() && waited.recv_timeout(wait).is_ok()
     }
+}
+
+type Grid = alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>;
+
+/// The cell at `col` of `line`, unless it is the spacer a double-width
+/// character leaves after it (or before it, wrapped to the next row): that
+/// is no character of its own, and read as one, `❯ 日本語` came out as
+/// `❯ 日 本 語`.
+fn char_at(grid: &Grid, line: alacritty_terminal::index::Line, col: usize) -> Option<char> {
+    use alacritty_terminal::index::{Column, Point};
+    use alacritty_terminal::term::cell::Flags;
+    let cell = &grid[Point::new(line, Column(col))];
+    (!cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER))
+    .then_some(cell.c)
+}
+
+/// A row's text as it reads, into `out`.
+fn row_text(grid: &Grid, line: alacritty_terminal::index::Line, out: &mut String) {
+    use alacritty_terminal::grid::Dimensions;
+    out.clear();
+    out.extend((0..grid.columns()).filter_map(|c| char_at(grid, line, c)));
+}
+
+/// Does a row's first cell have a background of its own?
+fn row_shaded(grid: &Grid, line: alacritty_terminal::index::Line) -> bool {
+    use alacritty_terminal::index::{Column, Point};
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    grid[Point::new(line, Column(0))].bg != Color::Named(NamedColor::Background)
+}
+
+/// [`TermSession::viewport_rows`] of a grid.
+fn viewport_rows(grid: &Grid) -> Vec<(String, bool)> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::Line;
+    let offset = grid.display_offset() as i32;
+    (0..grid.screen_lines() as i32)
+        .map(|row| {
+            let line = Line(row - offset);
+            let mut text = String::with_capacity(grid.columns());
+            row_text(grid, line, &mut text);
+            (text, row_shaded(grid, line))
+        })
+        .collect()
+}
+
+/// [`TermSession::find_above`] in a grid.
+fn find_above<T>(
+    grid: &Grid,
+    max: usize,
+    starts: &[char],
+    mut found: impl FnMut(&str, bool) -> Option<T>,
+) -> Option<T> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::Line;
+    let top = -(grid.display_offset() as i32);
+    let oldest = -(grid.history_size() as i32);
+    let mut text = String::with_capacity(grid.columns());
+    for line in (oldest..top).rev().take(max).map(Line) {
+        let first = (0..grid.columns())
+            .filter_map(|c| char_at(grid, line, c))
+            .find(|ch| !ch.is_whitespace() && *ch != '\0');
+        if !first.is_some_and(|ch| starts.contains(&ch)) {
+            continue;
+        }
+        row_text(grid, line, &mut text);
+        if let Some(hit) = found(&text, row_shaded(grid, line)) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 /// Minimal SGR re-emitter for snapshot serialization: on any style change,
@@ -513,4 +623,119 @@ fn local_hostname() -> Option<String> {
         }
     }
     std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn term(cols: usize, rows: usize, bytes: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(
+            Config {
+                scrolling_history: 10_000,
+                ..Config::default()
+            },
+            &TermSize::new(cols, rows),
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    fn texts(term: &Term<VoidListener>) -> Vec<String> {
+        viewport_rows(term.grid())
+            .into_iter()
+            .map(|(text, _)| text.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_double_width_character_reads_as_one() {
+        let t = term(20, 4, "❯ 日本語\r\n❯ 👋 hi 🎉\r\n".as_bytes());
+        assert_eq!(texts(&t)[..2], ["❯ 日本語", "❯ 👋 hi 🎉"]);
+    }
+
+    #[test]
+    fn a_double_width_character_wrapped_early_leaves_no_gap() {
+        // Five columns taken, and the sixth too narrow for 日: it goes on
+        // the next row, and a spacer holds the sixth.
+        let t = term(6, 4, "❯ abc日本\r\n".as_bytes());
+        assert_eq!(texts(&t)[..2], ["❯ abc", "日本"]);
+    }
+
+    /// `n` numbered rows of answer, as if streamed.
+    fn answer(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("{i} the answer goes on and on, filling the row\r\n"))
+            .collect()
+    }
+
+    #[test]
+    fn the_nearest_prompt_above_is_found_and_only_prompt_rows_are_read() {
+        let bytes = format!(
+            "❯ 古い質問\r\n{}❯ 日本語で答えて\r\n{}",
+            answer(30),
+            answer(40)
+        );
+        let t = term(60, 10, bytes.as_bytes());
+        let mut read = Vec::new();
+        let hit = find_above(t.grid(), 5000, &['❯', '>'], |row, _| {
+            read.push(row.trim_end().to_string());
+            row.contains("日本語").then(|| row.trim_end().to_string())
+        });
+        assert_eq!(hit.as_deref(), Some("❯ 日本語で答えて"));
+        assert_eq!(read, ["❯ 日本語で答えて"], "no answer row is read");
+        // Past `max` rows up, it is not looked for.
+        assert_eq!(
+            find_above(t.grid(), 20, &['❯'], |row, _| Some(row.to_string())),
+            None
+        );
+    }
+
+    /// Before and after: the walk up a full scrollback with no prompt in
+    /// it, as every frame of a streaming answer paid. Run with
+    /// `cargo test -p giverny-term --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing, not a check"]
+    fn time_the_walk_up_the_scrollback() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        let t = term(120, 50, answer(10_000).as_bytes());
+        let grid = t.grid();
+        // What `prompt_bar::prompt_of_row` does first with each row.
+        let matcher = |row: &str, _: bool| {
+            let row = row.trim();
+            row.strip_prefix('❯')
+                .or_else(|| row.strip_prefix('>'))
+                .map(|_| ())
+        };
+        let runs = 50;
+        let before = std::time::Instant::now();
+        for _ in 0..runs {
+            // The walk as it was: every cell of every row, into a string.
+            let top = -(grid.display_offset() as i32);
+            let oldest = -(grid.history_size() as i32);
+            let mut text = String::new();
+            let mut hit = None;
+            for line in (oldest..top).rev().take(5000).map(Line) {
+                text.clear();
+                text.extend((0..grid.columns()).map(|c| grid[Point::new(line, Column(c))].c));
+                if let Some(h) = matcher(&text, false) {
+                    hit = Some(h);
+                    break;
+                }
+            }
+            assert!(hit.is_none());
+        }
+        let before = before.elapsed() / runs;
+        let after = std::time::Instant::now();
+        for _ in 0..runs {
+            assert!(find_above(grid, 5000, &['❯', '>'], matcher).is_none());
+        }
+        let after = after.elapsed() / runs;
+        println!("5,000 rows of 120 columns: {before:?} before, {after:?} after");
+    }
 }

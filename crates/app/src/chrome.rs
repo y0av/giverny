@@ -50,7 +50,7 @@ fn contrast(a: Color32, b: Color32) -> f32 {
     (x + 0.05) / (y + 0.05)
 }
 
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+pub(crate) fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| {
         (x as f32 + (y as f32 - x as f32) * t)
             .round()

@@ -69,6 +69,10 @@ impl RelayMsg {
     pub fn message(&self) -> Option<&str> {
         self.event.get("message").and_then(|v| v.as_str())
     }
+    /// What the user typed, on `UserPromptSubmit`.
+    pub fn prompt(&self) -> Option<&str> {
+        self.event.get("prompt").and_then(|v| v.as_str())
+    }
 }
 
 pub fn socket_path() -> PathBuf {

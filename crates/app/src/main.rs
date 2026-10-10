@@ -8,6 +8,7 @@ mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod prompt_bar;
 mod rail;
 mod settings_ui;
 mod splash;
@@ -823,6 +824,8 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// Which prompt the bar over the terminal pins, kept between frames.
+    pub prompt_bar: prompt_bar::Owner,
 }
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
@@ -2057,8 +2060,11 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    prompt_bar: prompt_bar::Owner::default(),
                 });
                 entry.session = Some(session);
+                // A new session counts its changes from nothing again.
+                entry.prompt_bar = prompt_bar::Owner::default();
                 // Startup rc files may `cd` away from the spawn dir; verify
                 // and correct once the shell has settled. Not across the WSL
                 // boundary: what Windows can see of `wsl.exe` is its own
@@ -3462,6 +3468,9 @@ impl eframe::App for App {
 
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
+                    // The wheel over the closed prompt bar scrolls the
+                    // terminal under it.
+                    rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     // Typing goes to the terminal. egui drops a widget's
@@ -3480,6 +3489,39 @@ impl eframe::App for App {
                     if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
+                    }
+                    // The prompt whose turn is in view, once its own row
+                    // has scrolled out of sight.
+                    let pinned = self.claude.prompts_of(active).and_then(|history| {
+                        rt.prompt_bar
+                            .get(session.content_seq(), history, || {
+                                let rows = session.viewport_rows();
+                                prompt_bar::owner(history, &rows, |matches| {
+                                    session.find_above(
+                                        prompt_bar::SEARCH_ABOVE,
+                                        &prompt_bar::PROMPT_MARKS,
+                                        |row, shaded| matches(row, shaded),
+                                    )
+                                })
+                            })
+                            .map(|i| history[i].as_str())
+                    });
+                    match pinned {
+                        Some(prompt) => {
+                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                            if prompt_bar::show(
+                                &ctx,
+                                &self.chrome,
+                                response.rect,
+                                row,
+                                self.shared.font_size,
+                                active,
+                                prompt,
+                            ) {
+                                self.focus_terminal = true;
+                            }
+                        }
+                        None => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {

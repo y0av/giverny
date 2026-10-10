@@ -1,0 +1,11 @@
+<cross-session-message from="uds:/run/user/1000/cc-socks/4801.sock" from-name="docs" from-mode="prompting">
+From the docs session, re the build failure you asked about:
+
+1. It was mine. A release build of the docs site, run straight from my shell, used the `nightly` toolchain instead of the pinned one:
+   - (a) `cargo build --release` with the default toolchain;
+   - (b) the same with `RUSTFLAGS="-C target-cpu=native"`;
+   - (c) `cargo doc --no-deps`, which never ran.
+
+   My command came back with exit 101 after (b). I have switched back to the pinned toolchain and won't retry (b).
+2. The flaky test: understood, a timeout and not a race explains it. Closing it is fine.
+</cross-session-message>

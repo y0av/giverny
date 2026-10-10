@@ -429,18 +429,35 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
 
 /// Whether a user-role turn is one Claude Code or another agent sent, not
 /// something the user typed: a background task's `<task-notification>`, a
-/// subagent's or peer's `<agent-message>` hand-back, a plugin's message, the
-/// "usage limit has reset" nudge, background agents the user stopped, an
-/// interrupted request. Known by its text alone, because the
-/// `UserPromptSubmit` hook fires for these turns too and its payload says
-/// nothing else about who sent them; a transcript's `origin` says it first.
+/// subagent's or peer's `<agent-message>` hand-back, another session's
+/// `<cross-session-message>`, a teammate's or a channel's message, a
+/// `<system-reminder>` Claude Code wrapped one in, a coordinator's message
+/// to its subagent, a plugin's message, the "usage limit has reset" nudge,
+/// background agents the user stopped, an interrupted request. Known by its
+/// text alone, because the `UserPromptSubmit` hook fires for these turns too
+/// and its payload (Claude Code 2.1.296) carries no `origin`; a transcript's
+/// `origin` says it first.
 pub fn is_injected_prompt(text: &str) -> bool {
     let text = text.trim_start();
+    // Claude Code's envelopes, as `<tag>` or `<tag attr="…">`.
+    const TAGS: &[&str] = &[
+        "task-notification",
+        "agent-message",
+        "cross-session-message",
+        "teammate-message",
+        "channel-message",
+        "channel",
+        "system-reminder",
+    ];
+    if TAGS.iter().any(|t| opens_tag(text, t)) {
+        return true;
+    }
     const PREFIXES: &[&str] = &[
-        "<task-notification>",
-        "<agent-message ",
-        "<agent-message>",
-        "Another Claude session sent a message:",
+        // "…sent a message:" and "…sent a message while you were working:"
+        "Another Claude session sent a message",
+        "A peer session sent a message",
+        "The coordinator sent a message",
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]",
         "Your claude.ai usage limit has reset.",
         "[Request interrupted by user",
     ];
@@ -458,6 +475,16 @@ pub fn is_injected_prompt(text: &str) -> bool {
         && count.starts_with(" background ")
         && (count.contains(" were stopped by the user")
             || count.contains(" was stopped by the user"))
+}
+
+/// Whether `text` starts with the tag `name` opened: `<name>`, or `<name`
+/// followed by whitespace and its attributes, so `channel` is not taken
+/// for `<channels>`.
+fn opens_tag(text: &str, name: &str) -> bool {
+    text.strip_prefix('<')
+        .and_then(|t| t.strip_prefix(name))
+        .and_then(|t| t.chars().next())
+        .is_some_and(|c| c == '>' || c.is_whitespace())
 }
 
 /// Whether a user message is one Claude Code wrote around something that was
@@ -976,6 +1003,71 @@ mod tests {
         assert!(is_injected_prompt(
             "1 background agent was stopped by the user: \"x\""
         ));
+    }
+
+    /// Another session's message, in the shapes Claude Code 2.1.296 gives it:
+    /// enqueued, queued as the turn's prompt, and rendered into the turn.
+    const PEER: [&str; 3] = [
+        include_str!("../testdata/peer-message-enqueued.txt"),
+        include_str!("../testdata/peer-message-prompt.txt"),
+        include_str!("../testdata/peer-message-rendered.txt"),
+    ];
+
+    #[test]
+    fn another_sessions_message_is_not_a_prompt() {
+        for text in PEER {
+            assert!(text.contains("from-name=\"docs\""));
+            assert!(is_injected_prompt(text), "{text}");
+        }
+        // Its other framings, and the other envelopes Claude Code sends in.
+        for injected in [
+            "Another Claude session sent a message while you were working:\n\
+             <cross-session-message from=\"uds:/run/user/1000/cc-socks/1.sock\">hi\
+             </cross-session-message>",
+            "A peer session sent a message while you were working:\nhi",
+            "<cross-session-message>hi</cross-session-message>",
+            "<teammate-message teammate_id=\"tester\">\nall green\n</teammate-message>",
+            "<channel source=\"telegram\" chat_id=\"1\">hi</channel>",
+            "<channel-message from=\"ops\">hi</channel-message>",
+            "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder>",
+            "The coordinator sent a message while you were working:\nrun the tests too",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT] Background agent completed",
+        ] {
+            assert!(is_injected_prompt(injected), "{injected}");
+        }
+        for typed in [
+            "<channels> is the tag I meant",
+            "<cross-session-messages are leaking, fix it",
+            "Another session? no, this one",
+        ] {
+            assert!(!is_injected_prompt(typed), "{typed}");
+        }
+    }
+
+    #[test]
+    fn another_sessions_message_is_not_in_the_history() {
+        // As the transcript files it: a `queued_command` attachment saying
+        // `origin.kind = "peer"`, and nothing in a `lastPrompt` marker.
+        let path = transcript(
+            "peer",
+            &[
+                user(serde_json::json!("tell me when the docs session answers")),
+                serde_json::json!({
+                    "type": "attachment",
+                    "attachment": {
+                        "type": "queued_command",
+                        "prompt": PEER[1],
+                        "commandMode": "prompt",
+                        "origin": {"kind": "peer", "name": "docs"},
+                    },
+                    "isMeta": true,
+                }),
+            ],
+        );
+        assert_eq!(
+            prompt_history(&path),
+            ["tell me when the docs session answers"]
+        );
     }
 
     #[test]

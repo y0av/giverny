@@ -30,6 +30,24 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
+    /// The `refreshInterval` written on Giverny's status line entry, in
+    /// seconds; 0 writes none. Unset (the default) is not the same as set to
+    /// the default: unset, an entry with no value gets
+    /// [`Self::DEFAULT_STATUSLINE_REFRESH_S`] and a value set there by hand is
+    /// left alone; set, this value is written to every account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statusline_refresh_seconds: Option<u64>,
+}
+
+impl ClaudeConfig {
+    /// How often Claude Code reruns the status line while a session sits
+    /// idle, unless the user says otherwise. Without a `refreshInterval` it
+    /// runs only when the conversation changes, so the cold-cache warning
+    /// would never show on an idle session, the only kind it is for. The
+    /// cache it warns about expires after 5 minutes at the shortest, so 30 s
+    /// late costs nothing, while a short tick would launch `giverny
+    /// statusline` in every open session that often for no gain.
+    pub const DEFAULT_STATUSLINE_REFRESH_S: u64 = 30;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

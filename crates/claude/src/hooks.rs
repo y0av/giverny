@@ -568,9 +568,61 @@ pub fn statusline_installed_in(settings_path: &Path) -> bool {
         .is_some_and(|c| c.contains("giverny") && c.trim_end().ends_with("statusline"))
 }
 
+/// What our status line entry's `refreshInterval` (seconds between re-runs
+/// while a session sits idle) should be. Claude Code reruns a status line on
+/// its own only with one, so without it the cold-cache warning never shows on
+/// an idle session, the only kind it is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Giverny's setting is unset: an entry with no value gets this one, and
+    /// a value the user set there by hand is left alone.
+    Fill(u64),
+    /// The user set Giverny's setting: this is written whatever the entry
+    /// holds, and 0 removes the key.
+    Set(u64),
+}
+
+impl Refresh {
+    /// The `refreshInterval` an entry holding `has` should hold (`None`: no
+    /// key).
+    fn want(self, has: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+        let has = has.filter(|v| !v.is_null());
+        match self {
+            Refresh::Fill(_) if has.is_some() => has.cloned(),
+            Refresh::Fill(0) | Refresh::Set(0) => None,
+            Refresh::Fill(secs) | Refresh::Set(secs) => Some(secs.into()),
+        }
+    }
+}
+
+/// Does our statusline entry's `refreshInterval` differ from what `refresh`
+/// asks for? Only ever true for an entry of ours, never for a foreign
+/// statusline or none at all; `set_statusline(.., true, refresh)` then
+/// writes it.
+pub fn statusline_refresh_stale(settings_path: &Path, refresh: Refresh) -> bool {
+    if !statusline_installed_in(settings_path) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let has = root
+        .get("statusLine")
+        .and_then(|s| s.get("refreshInterval"))
+        .filter(|v| !v.is_null());
+    refresh.want(has).as_ref() != has
+}
+
 /// Install/remove the Giverny statusline. Refuses to replace a statusline
 /// the user configured themselves.
-pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
+///
+/// Enabling over an entry of ours (a path refresh) rewrites its `type` and
+/// `command`, and its `refreshInterval` as `refresh` says: a `padding` or
+/// any other key the user set on it is kept.
+pub fn set_statusline(settings_path: &Path, enable: bool, refresh: Refresh) -> anyhow::Result<()> {
     let mut root: serde_json::Value = match std::fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(_) => serde_json::json!({}),
@@ -587,14 +639,21 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
         anyhow::bail!("a custom statusLine is already configured — leaving it alone");
     }
     if enable {
-        obj.insert(
-            "statusLine".into(),
-            serde_json::json!({
-                "type": "command",
-                "command": statusline_command_for(settings_path),
-                "padding": 0,
-            }),
+        let mut entry = match obj.remove("statusLine") {
+            Some(serde_json::Value::Object(ours)) => ours,
+            _ => serde_json::Map::new(),
+        };
+        entry.insert("type".into(), "command".into());
+        entry.insert(
+            "command".into(),
+            statusline_command_for(settings_path).into(),
         );
+        entry.entry("padding").or_insert(0.into());
+        let had = entry.remove("refreshInterval");
+        if let Some(secs) = refresh.want(had.as_ref()) {
+            entry.insert("refreshInterval".into(), secs);
+        }
+        obj.insert("statusLine".into(), entry.into());
     } else {
         obj.remove("statusLine");
     }
@@ -1133,7 +1192,7 @@ mod tests {
     fn detects_stale_binary_paths() {
         let path = scratch("stale-path");
         install_into(&path).unwrap();
-        set_statusline(&path, true).unwrap();
+        set_statusline(&path, true, UNSET).unwrap();
         assert!(
             !needs_path_refresh(&path),
             "freshly installed entries match the running binary"
@@ -1179,9 +1238,9 @@ mod tests {
     #[test]
     fn statusline_install_and_respect_existing() {
         let path = scratch("statusline");
-        set_statusline(&path, true).unwrap();
+        set_statusline(&path, true, UNSET).unwrap();
         assert!(statusline_installed_in(&path));
-        set_statusline(&path, false).unwrap();
+        set_statusline(&path, false, UNSET).unwrap();
         assert!(!statusline_installed_in(&path));
 
         std::fs::write(
@@ -1190,8 +1249,138 @@ mod tests {
         )
         .unwrap();
         assert!(
-            set_statusline(&path, true).is_err(),
+            set_statusline(&path, true, UNSET).is_err(),
             "must not clobber a user statusline"
+        );
+    }
+
+    fn statusline_entry(path: &Path) -> serde_json::Value {
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        root["statusLine"].clone()
+    }
+
+    /// What the app passes while `claude.statusline_refresh_seconds` is
+    /// unset (its default lives in giverny-core).
+    const UNSET: Refresh = Refresh::Fill(30);
+
+    fn write_entry(path: &Path, entry: serde_json::Value) {
+        let root = serde_json::json!({ "statusLine": entry });
+        std::fs::write(path, serde_json::to_vec(&root).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_statusline_gets_the_default_refresh() {
+        let path = scratch("statusline-refresh-fresh");
+        set_statusline(&path, true, UNSET).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["refreshInterval"], 30);
+        assert_eq!(entry["padding"], 0);
+        assert!(!statusline_refresh_stale(&path, UNSET));
+    }
+
+    #[test]
+    fn unset_keeps_a_hand_set_refresh_through_a_path_refresh() {
+        let path = scratch("statusline-refresh-user");
+        write_entry(
+            &path,
+            serde_json::json!({
+                "type": "command",
+                "command": "/old/path/giverny statusline",
+                "padding": 2,
+                "refreshInterval": 5,
+                "note": "mine",
+            }),
+        );
+        assert!(needs_path_refresh(&path));
+        assert!(!statusline_refresh_stale(&path, UNSET), "it has one");
+
+        set_statusline(&path, true, UNSET).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["command"], statusline_command_for(&path));
+        assert_eq!(entry["refreshInterval"], 5, "the user's value is kept");
+        assert_eq!(entry["padding"], 2);
+        assert_eq!(entry["note"], "mine", "other keys of the user's are kept");
+        assert!(!needs_path_refresh(&path));
+
+        set_statusline(&path, true, UNSET).unwrap();
+        assert_eq!(statusline_entry(&path)["refreshInterval"], 5);
+    }
+
+    #[test]
+    fn unset_fills_in_an_older_entry_of_ours() {
+        let path = scratch("statusline-refresh-old");
+        write_entry(
+            &path,
+            serde_json::json!({
+                "type": "command",
+                "command": statusline_command_for(&path),
+                "padding": 0,
+            }),
+        );
+        assert!(statusline_installed_in(&path));
+        assert!(!needs_path_refresh(&path), "the path is current");
+        assert!(statusline_refresh_stale(&path, UNSET));
+
+        set_statusline(&path, true, UNSET).unwrap();
+        assert_eq!(statusline_entry(&path)["refreshInterval"], 30);
+        assert!(!statusline_refresh_stale(&path, UNSET));
+    }
+
+    #[test]
+    fn a_set_refresh_overwrites_a_hand_set_one() {
+        let path = scratch("statusline-refresh-set");
+        write_entry(
+            &path,
+            serde_json::json!({
+                "type": "command",
+                "command": statusline_command_for(&path),
+                "refreshInterval": 5,
+                "note": "mine",
+            }),
+        );
+        assert!(statusline_refresh_stale(&path, Refresh::Set(10)));
+        assert!(!statusline_refresh_stale(&path, Refresh::Set(5)));
+
+        set_statusline(&path, true, Refresh::Set(10)).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["refreshInterval"], 10);
+        assert_eq!(entry["note"], "mine");
+        assert!(!statusline_refresh_stale(&path, Refresh::Set(10)));
+        assert!(
+            !statusline_refresh_stale(&path, UNSET),
+            "unsetting it again keeps what was written"
+        );
+    }
+
+    #[test]
+    fn a_refresh_set_to_zero_removes_the_key() {
+        let path = scratch("statusline-refresh-zero");
+        set_statusline(&path, true, UNSET).unwrap();
+        assert!(statusline_refresh_stale(&path, Refresh::Set(0)));
+
+        set_statusline(&path, true, Refresh::Set(0)).unwrap();
+        let entry = statusline_entry(&path);
+        assert!(entry.get("refreshInterval").is_none(), "{entry}");
+        assert_eq!(entry["command"], statusline_command_for(&path));
+        assert!(!statusline_refresh_stale(&path, Refresh::Set(0)));
+    }
+
+    #[test]
+    fn a_foreign_statusline_never_has_a_stale_refresh() {
+        let path = scratch("statusline-refresh-foreign");
+        let mine = r#"{"statusLine":{"type":"command","command":"my-own-script.sh"}}"#;
+        std::fs::write(&path, mine).unwrap();
+        for refresh in [UNSET, Refresh::Set(10), Refresh::Set(0)] {
+            assert!(!statusline_refresh_stale(&path, refresh), "not ours");
+            assert!(set_statusline(&path, true, refresh).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+
+        let none = scratch("statusline-refresh-none");
+        assert!(
+            !statusline_refresh_stale(&none, Refresh::Set(10)),
+            "no statusline of ours, nothing to write"
         );
     }
 

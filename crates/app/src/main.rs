@@ -1038,13 +1038,14 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode.
+/// Bring every account in line with the config at startup: auto mode, and
+/// the status line's refresh.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
 /// following those would rewrite accounts against what the user configured.
 /// Once the file parses again, the hot reload applies what it says. Hook
-/// paths and the status line read nothing from the config, so
+/// paths and the status line read nothing else from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
 fn set_up_accounts(
     claude: &mut claude_watch::ClaudeWatch,
@@ -1060,6 +1061,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
+    claude.set_statusline_refresh(claude_watch::statusline_refresh(&cfg.claude));
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1367,9 +1369,17 @@ impl App {
         };
 
         let wake_ctx = cc.egui_ctx.clone();
+        // Unset while the config's `[claude]` values cannot be trusted, which
+        // only fills in what is missing, as `set_up_accounts` explains.
+        let refresh = if config_read {
+            claude_watch::statusline_refresh(&cfg.claude)
+        } else {
+            claude_watch::statusline_refresh(&config::ClaudeConfig::default())
+        };
         let (claude, spooled) = claude_watch::ClaudeWatch::new(
             &paths.hook_spool(),
             &cfg.behavior.extra_profile_dirs,
+            refresh,
             move || wake_ctx.request_repaint(),
         );
         // Events spooled while the app was closed: keep session captures.
@@ -2561,6 +2571,10 @@ impl App {
         }
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
+        }
+        if cfg.claude.statusline_refresh_seconds != self.cfg.claude.statusline_refresh_seconds {
+            self.claude
+                .set_statusline_refresh(claude_watch::statusline_refresh(&cfg.claude));
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
@@ -4001,6 +4015,66 @@ mod tests {
         let after = std::fs::read_to_string(&settings).unwrap();
         assert!(after.contains("defaultMode"), "{after}");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `claude.statusline_refresh_seconds` reaches our status line in every
+    /// account through the account pass, without a restart: unset keeps a
+    /// value set by hand, set overwrites it, 0 removes it, and setting it
+    /// never turns a status line on.
+    #[test]
+    fn the_statusline_refresh_follows_the_config() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-statusline-refresh-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let profile = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            giverny_claude::profiles::Profile {
+                name: name.into(),
+                config_dir: dir,
+                email: None,
+                account_uuid: None,
+            }
+        };
+        let (ours, off) = (profile("ours"), profile("off"));
+        let ours_json = ours.config_dir.join("settings.json");
+        let off_json = off.config_dir.join("settings.json");
+        let unset = claude_watch::statusline_refresh(&config::ClaudeConfig::default());
+        giverny_claude::hooks::set_statusline(&ours_json, true, unset).unwrap();
+        let hand_set = std::fs::read_to_string(&ours_json)
+            .unwrap()
+            .replace("\"refreshInterval\": 30", "\"refreshInterval\": 5");
+        std::fs::write(&ours_json, &hand_set).unwrap();
+        std::fs::write(&off_json, r#"{"theme":"dark"}"#).unwrap();
+        let refresh = || {
+            let root: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ours_json).unwrap()).unwrap();
+            root["statusLine"].get("refreshInterval").cloned()
+        };
+
+        let mut watch = claude_watch::ClaudeWatch::for_tests();
+        watch.profiles = vec![ours, off];
+        let mut cfg = config::Config::default();
+        set_up_accounts(&mut watch, &cfg, true);
+        assert_eq!(refresh(), Some(5.into()), "unset keeps the hand-set 5");
+
+        cfg.claude.statusline_refresh_seconds = Some(10);
+        set_up_accounts(&mut watch, &cfg, true);
+        assert_eq!(refresh(), Some(10.into()));
+
+        // What a reload does when the value changes.
+        cfg.claude.statusline_refresh_seconds = Some(0);
+        watch.set_statusline_refresh(claude_watch::statusline_refresh(&cfg.claude));
+        assert_eq!(refresh(), None, "0 writes no refreshInterval");
+
+        assert_eq!(
+            std::fs::read_to_string(&off_json).unwrap(),
+            r#"{"theme":"dark"}"#,
+            "an account without our status line is left alone"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

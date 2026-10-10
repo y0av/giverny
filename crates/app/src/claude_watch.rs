@@ -15,6 +15,7 @@ use giverny_claude::profiles::{self, Profile};
 use giverny_claude::registry;
 use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
+use giverny_core::config::ClaudeConfig;
 use giverny_core::tabs::TabId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -221,6 +222,8 @@ pub struct ClaudeWatch {
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
+    /// The `refreshInterval` our status line entries get, from the config.
+    statusline_refresh: hooks::Refresh,
     /// When the link was last checked for a target that is gone.
     #[cfg(unix)]
     last_link_check: Instant,
@@ -252,6 +255,15 @@ pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 /// (`cargo install`, a moved build) also changes.
 pub fn leaves_accounts_alone(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// What `claude.statusline_refresh_seconds` asks of our status line entries:
+/// unset fills in the default only where an entry has none, set writes it.
+pub fn statusline_refresh(cfg: &ClaudeConfig) -> hooks::Refresh {
+    match cfg.statusline_refresh_seconds {
+        None => hooks::Refresh::Fill(ClaudeConfig::DEFAULT_STATUSLINE_REFRESH_S),
+        Some(secs) => hooks::Refresh::Set(secs),
+    }
 }
 
 /// What a write refused by a side instance reports, for the UI's log line.
@@ -380,6 +392,7 @@ impl ClaudeWatch {
     pub fn new(
         spool: &Path,
         extra_dirs: &[PathBuf],
+        statusline_refresh: hooks::Refresh,
         wake: impl Fn() + Send + 'static,
     ) -> (Self, Vec<RelayMsg>) {
         let profiles = profiles::discover(extra_dirs);
@@ -407,9 +420,10 @@ impl ClaudeWatch {
             if let Err(err) = hooks::point_link() {
                 tracing::warn!("giverny link not pointed here: {err}");
             }
-            // Reads nothing from Giverny's config, so a config that does not
-            // parse is no reason to skip it.
-            Self::adopt_statusline_where_hooked(&profiles);
+            // Reads nothing from Giverny's config but `statusline_refresh`,
+            // which the caller makes the unset one when the config does not
+            // parse, so that is no reason to skip it.
+            Self::adopt_statusline_where_hooked(&profiles, statusline_refresh);
         }
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
@@ -434,6 +448,7 @@ impl ClaudeWatch {
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
             leave_accounts,
+            statusline_refresh,
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
@@ -476,7 +491,7 @@ impl ClaudeWatch {
             // Live usage comes with it — the on-disk cache goes stale for
             // accounts that aren't actively running Claude. Profiles with a
             // statusline of their own are left alone (set_statusline errs).
-            if let Err(e) = hooks::set_statusline(&settings, true) {
+            if let Err(e) = hooks::set_statusline(&settings, true, self.statusline_refresh) {
                 tracing::info!("statusline skipped for {}: {e}", p.name);
             }
         }
@@ -492,7 +507,7 @@ impl ClaudeWatch {
     /// Profiles that already have our hooks get the live-usage statusline
     /// too: installing hooks is the consent boundary, and without this the
     /// usage panel silently shows day-old numbers.
-    fn adopt_statusline_where_hooked(profiles: &[Profile]) {
+    fn adopt_statusline_where_hooked(profiles: &[Profile], refresh: hooks::Refresh) {
         for p in profiles {
             let settings = p.config_dir.join("settings.json");
             if !hooks::installed_in(&settings) {
@@ -516,8 +531,13 @@ impl ClaudeWatch {
                     Err(e) => tracing::warn!("hook refresh failed for {}: {e}", p.name),
                 }
             }
-            if !hooks::statusline_installed_in(&settings) || hooks::needs_path_refresh(&settings) {
-                match hooks::set_statusline(&settings, true) {
+            // An entry of ours from before `refreshInterval` was written gains
+            // it here, so existing installs see the cold-cache warning too.
+            if !hooks::statusline_installed_in(&settings)
+                || hooks::needs_path_refresh(&settings)
+                || hooks::statusline_refresh_stale(&settings, refresh)
+            {
+                match hooks::set_statusline(&settings, true, refresh) {
                     Ok(()) => tracing::info!("live-usage statusline enabled for {}", p.name),
                     Err(e) => tracing::info!("statusline skipped for {}: {e}", p.name),
                 }
@@ -1117,7 +1137,8 @@ impl ClaudeWatch {
         }
         let mut errs = Vec::new();
         for p in &self.profiles {
-            if let Err(e) = hooks::set_statusline(&p.config_dir.join("settings.json"), enable) {
+            let settings = p.config_dir.join("settings.json");
+            if let Err(e) = hooks::set_statusline(&settings, enable, self.statusline_refresh) {
                 errs.push(format!("{}: {e}", p.name));
             }
         }
@@ -1126,6 +1147,26 @@ impl ClaudeWatch {
             Ok(())
         } else {
             Err(errs.join("; "))
+        }
+    }
+
+    /// Follow `claude.statusline_refresh_seconds`: every account whose status
+    /// line is ours gets the `refreshInterval` it asks for. One that is off,
+    /// or someone else's, is left alone.
+    pub fn set_statusline_refresh(&mut self, refresh: hooks::Refresh) {
+        self.statusline_refresh = refresh;
+        if self.leave_accounts {
+            return;
+        }
+        for p in &self.profiles {
+            let settings = p.config_dir.join("settings.json");
+            if !hooks::statusline_refresh_stale(&settings, refresh) {
+                continue;
+            }
+            match hooks::set_statusline(&settings, true, refresh) {
+                Ok(()) => tracing::info!("statusline refresh {refresh:?} for {}", p.name),
+                Err(e) => tracing::warn!("statusline refresh unchanged for {}: {e}", p.name),
+            }
         }
     }
 
@@ -1315,6 +1356,7 @@ impl ClaudeWatch {
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: Vec::new(),
             leave_accounts: false,
+            statusline_refresh: statusline_refresh(&ClaudeConfig::default()),
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),

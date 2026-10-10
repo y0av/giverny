@@ -105,6 +105,11 @@ pub struct SettingDef {
     /// Changing this does nothing until Giverny restarts. The screen says so
     /// once you have changed it, rather than looking broken.
     pub needs_restart: bool,
+    /// Absent from `config.toml` unless the user sets it, and an `Option` in
+    /// `Config`, because the app treats "not set" differently from "set to
+    /// the default". The template shows it commented out, and the screen
+    /// shows the default until it is set.
+    pub optional: bool,
     pub kind: Kind,
 }
 
@@ -198,6 +203,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Preferred monospace family; empty auto-detects.",
         note: &["Applied at startup: the glyph atlas is built once."],
         needs_restart: true,
+        optional: false,
         kind: Kind::Text {
             default: "",
             placeholder: "auto-detect",
@@ -210,6 +216,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Point size of the terminal grid.",
         note: &["Ctrl +/-/0 changes this live and writes it back here."],
         needs_restart: false,
+        optional: false,
         kind: Kind::Float {
             default: 13.0,
             min: 6.0,
@@ -223,6 +230,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Colour theme for the grid and the chrome around it.",
         note: &[],
         needs_restart: false,
+        optional: false,
         // Kept in step with `Theme::NAMES` by a test in the app crate —
         // core cannot see the themes, so the check lives where both are.
         kind: Kind::Choice {
@@ -261,6 +269,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "compositor.",
         ],
         needs_restart: true,
+        optional: false,
         kind: Kind::Float {
             default: 1.0,
             min: 0.5,
@@ -274,6 +283,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Drop the `user@host:` your shell puts in front of every title.",
         note: &["The rail is narrow and that prefix is the same on every tab."],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
@@ -283,6 +293,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo.",
         note: &[],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -292,6 +303,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Lines kept above the screen, per tab.",
         note: &[],
         needs_restart: false,
+        optional: false,
         kind: Kind::Int {
             default: 10_000,
             min: 0,
@@ -312,6 +324,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "from here on.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -325,6 +338,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "Applies to shells started from here on.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -334,6 +348,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Notify when Claude needs you in a background tab.",
         note: &[],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
@@ -348,6 +363,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "Ignored where there is no X server.",
         ],
         needs_restart: true,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -357,6 +373,7 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Re-run `claude --resume` in restored tabs.",
         note: &[],
         needs_restart: false,
+        optional: false,
         kind: Kind::Choice {
             default: "auto",
             options: &["auto", "prompt", "off"],
@@ -376,6 +393,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "Ignored off Windows, where $SHELL answers this.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Choice {
             default: "auto",
             options: &["auto", "wsl", "powershell", "cmd"],
@@ -391,6 +409,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "arbitrary last command could deploy, delete or push something.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::StringList {
             default: Some(default_restore_apps),
         },
@@ -408,6 +427,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "was started from a shell or from a launcher.",
         ],
         needs_restart: true,
+        optional: false,
         kind: Kind::StringList { default: None },
     },
     SettingDef {
@@ -424,6 +444,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "different mode by hand.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -441,6 +462,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "which is exactly what that prompt is warning about.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
     },
     SettingDef {
@@ -457,7 +479,28 @@ pub const SETTINGS: &[SettingDef] = &[
             "a tab you have typed in since it stopped is left alone either way.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: false },
+    },
+    SettingDef {
+        key: "claude.statusline_refresh_seconds",
+        label: "status line refresh",
+        section: Section::Claude,
+        doc: "Seconds between re-runs of Giverny's status line in an idle session. 0 waits for a change.",
+        note: &[
+            "So the cold-cache warning shows up without a new message; 0 re-runs",
+            "it only when the conversation changes. Written as `refreshInterval`",
+            "on Giverny's own statusLine entry in each account, never on a status",
+            "line of yours. Left unset, an entry with no value gets the default",
+            "and a value you set there by hand is kept.",
+        ],
+        needs_restart: false,
+        optional: true,
+        kind: Kind::Int {
+            default: config::ClaudeConfig::DEFAULT_STATUSLINE_REFRESH_S as i64,
+            min: 0,
+            max: 3600,
+        },
     },
     SettingDef {
         key: "usage.refresh_minutes",
@@ -470,6 +513,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "immediately after a refresh; statusline pushes land as they arrive.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Int {
             default: 10,
             min: 0,
@@ -486,6 +530,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "makes none. GIVERNY_NO_UPDATE in the environment also disables it.",
         ],
         needs_restart: false,
+        optional: false,
         kind: Kind::Bool { default: true },
     },
 ];
@@ -507,7 +552,12 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
     let doc = toml::Value::try_from(cfg).ok()?;
     let mut node = &doc;
     for part in def.path() {
-        node = node.get(part)?;
+        node = match node.get(part) {
+            Some(next) => next,
+            // Not set, which for an optional key reads as its default.
+            None if def.optional => return Some(def.default_value()),
+            None => return None,
+        };
     }
     Some(match (node, &def.kind) {
         (toml::Value::Boolean(b), _) => Value::Bool(*b),
@@ -564,6 +614,7 @@ fn toml_edit_value(value: &Value) -> toml_edit::Value {
 pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()> {
     let path = config::config_path(base);
     let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = uncomment_optional(text, def);
     let mut doc: toml_edit::DocumentMut = text.parse()?;
 
     // Walk (creating) the tables above the leaf.
@@ -600,6 +651,38 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     }
 
     write_atomic(&path, doc.to_string().as_bytes())
+}
+
+/// An optional key the template wrote commented out (`# leaf = default`) is
+/// set by uncommenting that line, so the value lands under its own comments
+/// instead of at the end of the table with a stale copy left below it. Only
+/// when the uncommented line parses as this key; otherwise `text` as it was.
+fn uncomment_optional(text: String, def: &SettingDef) -> String {
+    if !def.optional {
+        return text;
+    }
+    let commented = format!("# {} = {}", def.leaf(), render_value(&def.default_value()));
+    let Some(at) = text.lines().position(|l| l.trim() == commented) else {
+        return text;
+    };
+    let candidate: String = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == at { &commented[2..] } else { l })
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    let lands = candidate
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            let mut item = doc.as_item();
+            for part in def.path() {
+                item = item.get(part)?;
+            }
+            item.as_value().map(|_| ())
+        })
+        .is_some();
+    if lands { candidate } else { text }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -653,6 +736,10 @@ pub fn template() -> String {
                     def.leaf(),
                     render_value(&example)
                 ));
+            }
+            // Written as a value, it would count as set: show it, unset.
+            _ if def.optional => {
+                out.push_str(&format!("# {} = {}\n", def.leaf(), render_value(&default)))
             }
             _ => out.push_str(&format!("{} = {}\n", def.leaf(), render_value(&default))),
         }
@@ -722,6 +809,10 @@ mod tests {
             defaults.behavior.extra_profile_dirs
         );
         assert_eq!(parsed.usage.refresh_minutes, defaults.usage.refresh_minutes);
+        assert_eq!(
+            parsed.claude.statusline_refresh_seconds, None,
+            "the template leaves it unset"
+        );
         assert_eq!(parsed.update.check, defaults.update.check);
     }
 
@@ -878,6 +969,58 @@ mod tests {
         let cfg: Config =
             toml::from_str(&std::fs::read_to_string(config::config_path(&dir)).unwrap()).unwrap();
         assert_eq!(cfg.usage.refresh_minutes, 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_statusline_refresh_is_unset_until_written() {
+        let def = by_key("claude.statusline_refresh_seconds").expect("declared");
+        assert_eq!(def.section, Section::Claude);
+        assert!(def.optional);
+        match def.kind {
+            Kind::Int { default, min, max } => {
+                assert_eq!(
+                    default,
+                    config::ClaudeConfig::DEFAULT_STATUSLINE_REFRESH_S as i64
+                );
+                assert_eq!(default, 30);
+                assert_eq!((min, max), (0, 3600));
+            }
+            ref other => panic!("{} is {other:?}", def.key),
+        }
+        assert!(
+            template().contains("\n# statusline_refresh_seconds = 30\n"),
+            "shown in the template, commented out"
+        );
+
+        // Unset reads as the default, and is told apart from a written 30.
+        let unset = Config::default();
+        assert_eq!(unset.claude.statusline_refresh_seconds, None);
+        assert_eq!(current(&unset, def), Some(Value::Int(30)));
+        let (thirty, unknown) =
+            config::parse("[claude]\nstatusline_refresh_seconds = 30\n").unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(thirty.claude.statusline_refresh_seconds, Some(30));
+        assert!(is_default(&thirty, def));
+
+        let dir = scratch("statusline-refresh");
+        std::fs::write(config::config_path(&dir), template()).unwrap();
+        for secs in [10, 0] {
+            write(&dir, def, &Value::Int(secs)).unwrap();
+            let text = std::fs::read_to_string(config::config_path(&dir)).unwrap();
+            // Set by uncommenting the template's line, under its comments.
+            assert!(!text.contains("statusline_refresh_seconds = 30"), "{text}");
+            let lines: Vec<&str> = text.lines().collect();
+            let at = lines
+                .iter()
+                .position(|l| *l == format!("statusline_refresh_seconds = {secs}"))
+                .expect("written");
+            assert!(lines[at - 1].starts_with("# "), "{text}");
+            let (cfg, unknown) = config::parse(&text).unwrap();
+            assert!(unknown.is_empty(), "{unknown:?}");
+            assert_eq!(cfg.claude.statusline_refresh_seconds, Some(secs as u64));
+            assert_eq!(current(&cfg, def), Some(Value::Int(secs)));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

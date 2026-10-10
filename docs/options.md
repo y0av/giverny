@@ -25,5 +25,6 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.auto_mode` | `false` | Every new Claude session starts in auto mode instead of asking for each permission. |
 | `claude.skip_resume_summary` | `false` | Skip Claude Code's offer to resume from a summary, and resume the full session. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
+| `claude.statusline_refresh_seconds` | `30` | Seconds between re-runs of Giverny's status line in an idle session. 0 waits for a change. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
 | `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |

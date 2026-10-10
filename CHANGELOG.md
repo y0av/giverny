@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.4.0 — 2026-10-10
+
+The prompt bar is [@theitush](https://github.com/theitush)'s, merged from #5.
+
+- A Claude tab keeps the prompt of the turn you are reading in view. Once a
+  long answer scrolls it off the top, a one-line bar over the top row shows
+  it, and goes when the prompt is back on screen. Click the bar to read the
+  whole prompt. It follows Claude Code's fullscreen view and the terminal's
+  own scrollback, and a session resumed or adopted after a restart has its
+  prompts read back from the transcript. Only what you typed shows:
+  interrupted turns, background-task notifications and subagent hand-backs
+  do not.
+
+- A click on something drawn over the terminal no longer reaches the program
+  under it. With mouse reporting on, as in Claude Code's fullscreen view, a
+  click on an overlay also moved Claude's view.
+
+- Updating from the rail shows the install while it runs, and leads to its
+  tab. If the install ends without replacing the binary, the update button
+  comes back, and the restart button pulses once there is a new version to
+  restart into. Before, the rail went blank between the click and the new
+  binary landing. Run in a terminal, the installers draw Giverny's wordmark
+  and one line per step. Piped, logged or under `NO_COLOR`, they print the
+  same plain lines as before.
+
 ## v1.3.0 — 2026-10-09
 
 All of this is [@theitush](https://github.com/theitush)'s, merged from #3.

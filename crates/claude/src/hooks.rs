@@ -73,6 +73,11 @@ impl RelayMsg {
     pub fn prompt(&self) -> Option<&str> {
         self.event.get("prompt").and_then(|v| v.as_str())
     }
+    /// The subagent a hook fired in, when it fired in one rather than in the
+    /// session the user talks to.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.event.get("agent_id").and_then(|v| v.as_str())
+    }
 }
 
 pub fn socket_path() -> PathBuf {

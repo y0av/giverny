@@ -10,7 +10,9 @@ use giverny_core::tabs::{CategoryId, TabId};
 use giverny_term::render::bidi::egui_line;
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
+use crate::job_end::Ending;
 use crate::{Action, App, RenameTarget};
+use giverny_claude::jobs::End;
 
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
@@ -866,20 +868,49 @@ fn view_switch(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     ui.add_space(2.0);
 }
 
+const STOP_TIP: &str =
+    "stop this agent: `claude stop` — its conversation is kept, `claude attach` brings it back";
+
+/// The menu items that end a background job, for its BACKGROUND row: stop,
+/// and delete behind a confirm.
+fn end_job_items(ui: &mut Ui, id: &str, stopping: bool, actions: &mut Vec<Action>) {
+    ui.separator();
+    if ui
+        .add_enabled(!stopping, egui::Button::new("stop agent"))
+        .on_hover_text(STOP_TIP)
+        .clicked()
+    {
+        actions.push(Action::EndJob(id.to_string(), End::Stop));
+        ui.close();
+    }
+    ui.add_enabled_ui(!stopping, |ui| {
+        ui.menu_button("delete agent…", |ui| {
+            ui.label("`claude rm`: deletes the agent and\nits worktree. It cannot be undone.");
+            if ui.button("delete").clicked() {
+                actions.push(Action::EndJob(id.to_string(), End::Delete));
+                ui.close();
+            }
+        });
+    });
+}
+
 /// Background agents, above the categories. Same grammar as tabs — spinner
 /// while working, flag when it wants you — because it is the same question.
 fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
     use giverny_claude::jobs::JobState;
-    if app.claude.jobs.is_empty() {
-        return;
-    }
-    let c = app.chrome;
-    let needs: usize = app
+    // One that was just ended is not drawn, though the scan may list it a
+    // moment longer.
+    let jobs: Vec<&giverny_claude::jobs::Job> = app
         .claude
         .jobs
         .iter()
-        .filter(|j| j.state.needs_you())
-        .count();
+        .filter(|j| !app.job_ends.hides(&j.id))
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    let c = app.chrome;
+    let needs: usize = jobs.iter().filter(|j| j.state.needs_you()).count();
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -890,7 +921,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .color(dim),
         );
         ui.label(
-            egui::RichText::new(format!("{}", app.claude.jobs.len()))
+            egui::RichText::new(format!("{}", jobs.len()))
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
@@ -907,7 +938,9 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
     let turns = spin_turns(ui);
     let animate = animating(ui);
     let mark = BusyMark::of(&app.cfg.rail);
-    for job in &app.claude.jobs {
+    for job in jobs {
+        let ending = app.job_ends.get(&job.id).cloned();
+        let stopping = matches!(ending, Some(Ending::Running(_)));
         let working = job.live && job.state == JobState::Working;
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
@@ -968,11 +1001,26 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                         format!("{sub} · {detail}")
                     };
                 }
+                // Ending it outranks whatever it was doing.
+                let mut sub_color = dim;
+                match &ending {
+                    Some(Ending::Running(how)) => {
+                        sub = match how {
+                            End::Stop => "stopping…".into(),
+                            End::Delete => "deleting…".into(),
+                        };
+                    }
+                    Some(Ending::Failed(how, _)) => {
+                        sub = format!("{} failed", how.verb());
+                        sub_color = c.amber;
+                    }
+                    _ => {}
+                }
                 if !sub.is_empty() {
                     ui.label(
                         egui::RichText::new(egui_line(&truncate_chars(&sub, 30), None))
                             .font(FontId::monospace(9.5))
-                            .color(dim),
+                            .color(sub_color),
                     );
                 }
             });
@@ -983,7 +1031,13 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 BusyMark::Breath => keep_animating(ui, resp.response.rect),
             }
         }
-        let resp = resp.response.interact(Sense::click());
+        // The whole width of the rail, as a tab row is: the × sits at its
+        // right edge, not after however long the name happens to be.
+        let rect = Rect::from_min_size(
+            resp.response.rect.min,
+            Vec2::new(ui.available_width(), resp.response.rect.height()),
+        );
+        let resp = ui.interact(rect, ui.id().with(("job", job.id.as_str())), Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
@@ -991,14 +1045,55 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
             Some(_) => "open a tab attached to this agent",
             None => "no conversation recorded for this agent",
         };
-        let resp = resp.on_hover_text(format!(
+        let mut tip = format!(
             "{}\n{}",
             job.cwd
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             hover
-        ));
+        );
+        if let Some(Ending::Failed(how, said)) = &ending {
+            tip.push_str(&format!("\n\n{} failed: {said}", how.verb()));
+        }
+        let resp = resp.on_hover_text(tip);
+        // Stop on hover, where a tab has its close. Drawn after the row, so
+        // it is the one the click lands on.
+        if !stopping && ui.rect_contains_pointer(rect) {
+            let close_rect = Rect::from_min_size(
+                Pos2::new(rect.max.x - 24.0, rect.min.y + 2.0),
+                Vec2::splat(18.0),
+            );
+            let close = ui
+                .interact(
+                    close_rect,
+                    ui.id().with(("job-stop", job.id.as_str())),
+                    Sense::click(),
+                )
+                .on_hover_text(STOP_TIP);
+            ui.painter().text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::monospace(13.0),
+                if close.hovered() {
+                    Color32::from_rgb(0xd9, 0x7f, 0x70)
+                } else {
+                    dim
+                },
+            );
+            if close.clicked() {
+                actions.push(Action::EndJob(job.id.clone(), End::Stop));
+                continue;
+            }
+        }
+        resp.context_menu(|ui| {
+            if job.resume_target().is_some() && ui.button("open").clicked() {
+                actions.push(Action::AttachJob(Box::new(job.clone())));
+                ui.close();
+            }
+            end_job_items(ui, &job.id, stopping, actions);
+        });
         if resp.clicked() && job.resume_target().is_some() {
             actions.push(Action::AttachJob(Box::new(job.clone())));
         }

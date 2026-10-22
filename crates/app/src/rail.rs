@@ -1078,6 +1078,17 @@ fn category_header(
             });
             ui.close();
         }
+        // Every started tab here, kept for next time.
+        let started: Vec<TabId> = cat
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .filter(|&id| app.stoppable(id))
+            .collect();
+        if !started.is_empty() && ui.button("stop all").clicked() {
+            actions.push(Action::StopTabs(started));
+            ui.close();
+        }
         let Some(id) = as_category else { return };
         ui.menu_button("account", |ui| {
             if ui.button("(inherit)").clicked() {
@@ -1783,6 +1794,11 @@ fn tab_row(
             }
         });
         ui.separator();
+        // Ends what runs here and keeps the tab for next time.
+        if row.started && app.stoppable(row.id) && ui.button("stop").clicked() {
+            actions.push(Action::StopTabs(vec![row.id]));
+            ui.close();
+        }
         if ui.button("close").clicked() {
             actions.push(Action::CloseTab(row.id));
             ui.close();

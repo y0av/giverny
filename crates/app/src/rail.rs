@@ -11,6 +11,7 @@ use giverny_term::render::bidi::egui_line;
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
 use crate::{Action, App, RenameTarget};
+use giverny_claude::use_reading::Use;
 
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
@@ -397,6 +398,10 @@ struct RowData {
     /// not looked since: a Claude turn, or a shell's command.
     /// Outlives Claude's `DoneUnseen`, which a new turn replaces.
     unseen: bool,
+    /// Its shell's CPU and memory now, with everything under it (Claude
+    /// Code or not), from the reading the total line shows; `None` for a
+    /// tab with no shell running.
+    used: Option<Use>,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -422,6 +427,9 @@ struct GroupData {
     count: usize,
     busy: usize,
     needs: usize,
+    /// Its tabs' readings summed, drawn on its header while it is
+    /// collapsed; `None` when none of them has one.
+    used: Option<Use>,
     /// A tab in it shows the tick, alone or as a badge: something finished
     /// there while you were elsewhere.
     unseen: bool,
@@ -512,6 +520,14 @@ fn row_data(
         running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
         unseen: app.unseen_done.contains(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
+        // Off (`rail.tab_figures`), a row has no figures, so nothing
+        // reserves room for them and no group sums them.
+        used: app
+            .rt
+            .get(&t.id)
+            .filter(|_| app.cfg.rail.tab_figures)
+            .and_then(|rt| rt.session.as_ref()?.child_pid)
+            .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
     }
 }
 
@@ -535,6 +551,25 @@ fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
             .filter(|r| r.claude == ClaudeState::NeedsYou)
             .count(),
     )
+}
+
+/// What a group's tabs use together: the sum of each figure, a GPU one
+/// where any tab has it; `None` when no tab has a reading.
+fn summed<'a>(uses: impl IntoIterator<Item = &'a Use>) -> Option<Use> {
+    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+    uses.into_iter().fold(None, |sum: Option<Use>, u| {
+        let Some(s) = sum else { return Some(*u) };
+        Some(Use {
+            cpu_pct: s.cpu_pct + u.cpu_pct,
+            mem_mb: s.mem_mb + u.mem_mb,
+            gpu_mb: add(s.gpu_mb, u.gpu_mb),
+            gpu_pct: add(s.gpu_pct.map(u64::from), u.gpu_pct.map(u64::from))
+                .map(|p| p.min(100) as u32),
+        })
+    })
 }
 
 /// Whether a group has a finish you have not seen: a row wearing the tick,
@@ -587,6 +622,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                     count,
                     busy,
                     needs,
+                    used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                     unseen: ticks(&rows),
                     rows,
                 }
@@ -641,6 +677,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         count,
                         busy,
                         needs,
+                        used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                         unseen: ticks(&rows),
                         rows,
                     }
@@ -671,15 +708,24 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let fg = app.chrome.fg;
 
     // Bottom section first (panel-inside-panel): hooks banner + usage meters.
-    egui::Panel::bottom("rail-bottom")
+    let bottom = egui::Panel::bottom("rail-bottom")
         .resizable(false)
         .show_separator_line(true)
         .show(ui, |ui| {
             wslg_banner(app, ui, &mut actions);
             update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
-            usage_panel(app, ui, dim, &mut actions);
+            usage_panel(app, ui, dim, &mut actions)
         });
+    // The line over the total row: the one the panel draws over itself,
+    // with the same painter, stroke and span.
+    if let Some(y) = bottom.inner {
+        ui.painter().hline(
+            bottom.response.rect.x_range(),
+            y,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
 
     view_switch(app, ui, &mut actions);
 
@@ -1119,13 +1165,33 @@ fn category_header(
         FontId::monospace(10.0),
         cat.color,
     );
+    // A collapsed group's tabs' use, summed, at the right edge as on a tab
+    // row. While the pointer is on the header the "+" takes the corner, as
+    // a tab's close button does, and the sum steps left of it rather than
+    // hiding. Its counts sit left of where it goes then, so nothing else
+    // moves on hover.
+    let hovered = ui.rect_contains_pointer(rect);
+    let used = cat.used.filter(|_| cat.collapsed);
+    let badge_x = match &used {
+        Some(u) => {
+            let y = rect.center().y;
+            let right = if hovered {
+                rect.max.x - 26.0
+            } else {
+                rect.max.x - 8.0
+            };
+            readout(&p, right, [y - 6.0, y + 6.0], u, c);
+            rect.max.x - 26.0 - readout_width(u) - 4.0
+        }
+        None => rect.max.x - 26.0,
+    };
     // The working dot breathes, so the header asks for frames while it shows
     // (a collapsed group draws no tab rows that would).
     if cat.busy > 0 && cat.needs == 0 {
         keep_animating(ui, rect);
     }
     let breath = calm_breath(animating(ui).then(anim_time));
-    let name_end = header_badges(&p, rect.center().y, rect.max.x - 26.0, cat, dim, breath);
+    let name_end = header_badges(&p, rect.center().y, badge_x, cat, dim, breath);
     // The name, cut to what fits before them (the rail is monospace), right
     // after the fold triangle: no dot between them, the name's own colour is
     // the category's.
@@ -1154,13 +1220,15 @@ fn category_header(
         ui.id().with(("cat-plus", &cat.name, cat.category.0)),
         Sense::click(),
     );
-    p.text(
-        plus_rect.center(),
-        Align2::CENTER_CENTER,
-        "+",
-        FontId::monospace(13.0),
-        if plus.hovered() { cat.color } else { dim },
-    );
+    if used.is_none() || hovered {
+        p.text(
+            plus_rect.center(),
+            Align2::CENTER_CENTER,
+            "+",
+            FontId::monospace(13.0),
+            if plus.hovered() { cat.color } else { dim },
+        );
+    }
     // Dragging a header reorders categories; a repository group is where its
     // tabs are and cannot be moved by hand.
     if let Some(id) = as_category {
@@ -1707,8 +1775,24 @@ fn tab_row(
         return rect;
     }
 
+    // Its shell's CPU over its memory at the right edge, as the account
+    // bars' numbers are drawn, each coloured by its share of the whole
+    // machine. While the pointer is on the row the close button takes the
+    // corner and the figures fold onto the second line, CPU left of memory:
+    // they stay in sight, and the sub line gives way.
+    let sub_y = rect.min.y + 29.0;
+    let mut sub_end = rect.max.x - 8.0;
+    if let Some(u) = &row.used {
+        if hovered {
+            sub_end = readout_inline(&p, rect.max.x - 8.0, sub_y, u, c) - 6.0;
+        } else {
+            readout(&p, rect.max.x - 8.0, [rect.min.y + 13.0, sub_y], u, c);
+        }
+    }
+
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
+    let reserved = row.used.as_ref().map_or(0.0, readout_width);
+    let char_budget = ((width - 68.0 - reserved) / 7.2).max(4.0) as usize;
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
@@ -1721,11 +1805,21 @@ fn tab_row(
         },
     );
     if !row.sub.is_empty() {
+        let sub_font = FontId::monospace(10.0);
+        let sub_budget = if hovered && row.used.is_some() {
+            let char_w = ui
+                .ctx()
+                .fonts_mut(|f| f.glyph_width(&sub_font, 'M'))
+                .max(1.0);
+            ((sub_end - (rect.min.x + 44.0)) / char_w).max(1.0) as usize
+        } else {
+            char_budget + 2
+        };
         p.text(
-            Pos2::new(rect.min.x + 44.0, rect.min.y + 29.0),
+            Pos2::new(rect.min.x + 44.0, sub_y),
             Align2::LEFT_CENTER,
-            truncate_chars(&row.sub, char_budget + 2),
-            FontId::monospace(10.0),
+            truncate_chars(&row.sub, sub_budget),
+            sub_font,
             dim,
         );
     }
@@ -2216,7 +2310,8 @@ fn codex_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     }
 }
 
-fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) {
+/// Returns where the line over the total row goes, when there is one.
+fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) -> Option<f32> {
     let c = app.chrome;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -2274,8 +2369,16 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) 
                 .font(FontId::monospace(10.0))
                 .color(dim),
         );
+        ui.add_space(6.0);
+        return None;
     }
     ui.add_space(6.0);
+    // Off (`rail.total_line`), no line and no rule over it.
+    if !app.cfg.rail.total_line {
+        return None;
+    }
+    let r = app.use_now.clone()?;
+    Some(sessions_load_row(ui, &r, app.chrome))
 }
 
 /// A rotated label interrupts the left category line; its height comes from
@@ -2497,6 +2600,131 @@ fn usage_bar(
     );
 }
 
+/// Under the account bars: what Giverny runs now, summed —
+/// `23% CPU  2.0G RAM  40% GPU`, centred, in the bars' lettering. Hovering
+/// says what is counted. Returns where the line above it goes.
+fn sessions_load_row(
+    ui: &mut Ui,
+    r: &giverny_claude::use_reading::Reading,
+    c: crate::chrome::Chrome,
+) -> f32 {
+    let dim = c.dim;
+    let y = ui.cursor().min.y + 0.5;
+    ui.add_space(5.0);
+    let width = ui.available_width();
+    let (mut rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    // A wide row (a banner, a button) can stretch the panel's layout past
+    // what is shown: the figures end at the visible edge.
+    rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
+    // Each figure coloured by its share of the whole machine, as a tab's
+    // are.
+    let mut job = egui::text::LayoutJob::default();
+    let ram = crate::sessions_load::machine_ram_mb();
+    for (text, share) in crate::sessions_load::figure_parts(&r.total, ram) {
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat::simple(FontId::monospace(9.5), machine_color(share, c)),
+        );
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter_at(rect).galley(at, galley, dim);
+    ui.add_space(5.0);
+    let gpu = match (r.total.gpu_pct, r.total.gpu_mb) {
+        (Some(_), _) => ", the GPUs' compute it uses",
+        (None, Some(_)) => ", GPU memory (this GPU reports no per-process utilisation)",
+        (None, None) => "",
+    };
+    resp.on_hover_text(format!(
+        "Everything Giverny runs now: the app and every tab, Claude or not —\n\
+         {} Claude Code session{} with all they started (commands, builds).\n\
+         CPU as a share of the whole machine, the memory it really uses\n\
+         (shared pages split){gpu}. Each tab's figures are parts of this\n\
+         same reading.",
+        r.claudes,
+        if r.claudes == 1 { "" } else { "s" },
+    ));
+    y
+}
+
+/// A readout's column: four or five 9px monospace figures and some air.
+const READOUT_COL: f32 = 34.0;
+
+/// How wide [`readout`] draws `u`: a column, two with a GPU.
+fn readout_width(u: &Use) -> f32 {
+    if u.gpu_pct.is_some() || u.gpu_mb.is_some() {
+        2.0 * READOUT_COL
+    } else {
+        READOUT_COL
+    }
+}
+
+/// A tab's (or a collapsed group's) use, right-aligned to `right`: CPU at
+/// `ys[0]` over memory at `ys[1]` and, with a GPU, its compute over its
+/// memory in a column to their left, each figure coloured by its share of
+/// the whole machine ([`machine_color`]; GPU memory, whose total is not
+/// known here, stays dim).
+fn readout(p: &egui::Painter, right: f32, ys: [f32; 2], u: &Use, c: crate::chrome::Chrome) {
+    use giverny_claude::session_use::gb;
+    let (cpu, mem) =
+        crate::sessions_load::machine_shares(u, crate::sessions_load::machine_ram_mb());
+    let gpu_x = right - READOUT_COL;
+    let figures = [
+        Some((right, ys[0], format!("{}%", u.cpu_pct.min(100)), cpu)),
+        Some((right, ys[1], gb(u.mem_mb), mem)),
+        u.gpu_pct
+            .map(|g| (gpu_x, ys[0], format!("g{}%", g.min(100)), f64::from(g))),
+        u.gpu_mb.map(|m| (gpu_x, ys[1], format!("g{}", gb(m)), 0.0)),
+    ];
+    for (x, y, text, share) in figures.into_iter().flatten() {
+        p.text(
+            Pos2::new(x, y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::monospace(9.0),
+            machine_color(share, c),
+        );
+    }
+}
+
+/// [`readout`] folded onto one line for a hovered tab row:
+/// `g40% g1.2G  23%  1.2G`, right-aligned to `right` at `y`, coloured as
+/// there. Returns where it starts.
+fn readout_inline(p: &egui::Painter, right: f32, y: f32, u: &Use, c: crate::chrome::Chrome) -> f32 {
+    use giverny_claude::session_use::gb;
+    let (cpu, mem) =
+        crate::sessions_load::machine_shares(u, crate::sessions_load::machine_ram_mb());
+    // Right to left, each with the gap to draw before the next one.
+    let figures = [
+        Some((gb(u.mem_mb), mem, 10.0)),
+        Some((format!("{}%", u.cpu_pct.min(100)), cpu, 10.0)),
+        u.gpu_mb.map(|m| (format!("g{}", gb(m)), 0.0, 4.0)),
+        u.gpu_pct
+            .map(|g| (format!("g{}%", g.min(100)), f64::from(g), 4.0)),
+    ];
+    let mut x = right;
+    let mut gap = 0.0;
+    for (text, share, after) in figures.into_iter().flatten() {
+        let at = p.text(
+            Pos2::new(x - gap, y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::monospace(9.0),
+            machine_color(share, c),
+        );
+        x = at.min.x;
+        gap = after;
+    }
+    x
+}
+
+/// How much of the whole machine a figure is, as the rail colours it: dim
+/// while [`Load::Light`](crate::sessions_load::Load), amber or poppy above.
+fn machine_color(share: f64, c: crate::chrome::Chrome) -> Color32 {
+    crate::sessions_load::Load::of(share).color(c.dim, c)
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -2544,6 +2772,69 @@ mod tests {
         let (delay, turns) = rail_wake(&ctx, true);
         assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
         assert!(turns.is_some(), "no spinner with the switch on");
+    }
+
+    /// A figure is coloured by its share of the whole machine: dim under
+    /// 20 %, amber from 20 % to 50 %, poppy over 50 %. Memory is taken of
+    /// all the RAM: 51 % of it is poppy, as 51 % CPU is.
+    #[test]
+    fn a_figure_is_coloured_by_its_share_of_the_machine() {
+        let c =
+            crate::chrome::Chrome::from_theme(&giverny_term::render::theme::Theme::monet_dark());
+        assert!(c.dim != c.amber && c.amber != c.poppy && c.dim != c.poppy);
+        for (share, want) in [
+            (0.0, c.dim),
+            (19.0, c.dim),
+            (19.9, c.dim),
+            (20.0, c.amber),
+            (29.0, c.amber),
+            (50.0, c.amber),
+            (50.5, c.poppy),
+            (51.0, c.poppy),
+            (100.0, c.poppy),
+        ] {
+            assert_eq!(machine_color(share, c), want, "{share}%");
+        }
+        let ram = 24_000;
+        let at = |cpu_pct, mem_mb| {
+            let u = Use {
+                cpu_pct,
+                mem_mb,
+                gpu_mb: None,
+                gpu_pct: None,
+            };
+            let (cpu, mem) = crate::sessions_load::machine_shares(&u, ram);
+            (machine_color(cpu, c), machine_color(mem, c))
+        };
+        assert_eq!(at(19, 4_560), (c.dim, c.dim), "19 %");
+        assert_eq!(at(20, 4_800), (c.amber, c.amber), "20 %");
+        assert_eq!(at(25, 6_000), (c.amber, c.amber), "25 %");
+        assert_eq!(at(50, 12_000), (c.amber, c.amber), "50 %");
+        assert_eq!(at(51, 12_240), (c.poppy, c.poppy), "51 %");
+        // Each by its own share.
+        assert_eq!(at(51, 100), (c.poppy, c.dim));
+    }
+
+    /// A collapsed group's figure is its tabs' summed; a GPU figure where
+    /// any tab has one; nothing where no tab reads.
+    #[test]
+    fn a_group_sums_its_tabs() {
+        let u = |cpu_pct, mem_mb, gpu_mb| Use {
+            cpu_pct,
+            mem_mb,
+            gpu_mb,
+            gpu_pct: None,
+        };
+        assert_eq!(summed(&[]), None);
+        assert_eq!(summed(&[u(3, 100, None)]), Some(u(3, 100, None)));
+        assert_eq!(
+            summed(&[u(3, 100, None), u(40, 2048, Some(512)), u(0, 5, None)]),
+            Some(u(43, 2153, Some(512)))
+        );
+        assert_eq!(
+            summed(&[u(1, 1, None), u(1, 1, None)]).unwrap().gpu_mb,
+            None
+        );
     }
 
     #[test]
@@ -2766,6 +3057,7 @@ mod tests {
             count: 3,
             busy,
             needs,
+            used: None,
             unseen,
             rows: Vec::new(),
         };
@@ -2865,6 +3157,7 @@ mod tests {
             count: 1,
             busy: 1,
             needs: 0,
+            used: None,
             unseen: false,
             rows: Vec::new(),
         };
@@ -2944,6 +3237,7 @@ mod tests {
             background: false,
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
+            used: None,
         }
     }
 

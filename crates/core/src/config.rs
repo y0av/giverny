@@ -287,6 +287,13 @@ pub struct RailConfig {
     /// A working tab breathes a slow dot in its colour instead of spinning.
     /// With `animate` off the dot holds still, full.
     pub calm_busy: bool,
+    /// Show each tab's CPU and memory at its row's right edge, and a
+    /// collapsed group's summed. Off, none is drawn and the title, sub-line
+    /// and group name take the room.
+    pub tab_figures: bool,
+    /// Show the total line under the account bars: what Giverny runs now,
+    /// summed (`23% CPU  2.0G RAM`).
+    pub total_line: bool,
 }
 
 impl Default for RailConfig {
@@ -294,6 +301,8 @@ impl Default for RailConfig {
         RailConfig {
             animate: true,
             calm_busy: true,
+            tab_figures: true,
+            total_line: true,
         }
     }
 }

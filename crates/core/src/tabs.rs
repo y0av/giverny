@@ -63,6 +63,11 @@ pub struct Tab {
     /// the git lookups that would otherwise silently find nothing.
     #[serde(default)]
     pub wsl_distro: Option<String>,
+    /// The background agent this tab was opened on from the rail's
+    /// BACKGROUND list, by its short id: the tab is shown there, as that
+    /// agent's row, not under its category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_job: Option<String>,
     #[serde(skip)]
     pub exited: bool,
 }
@@ -190,6 +195,7 @@ impl Workspace {
                 git_branch: None,
                 git_repo: None,
                 wsl_distro: None,
+                bg_job: None,
                 exited: false,
             },
         );
@@ -227,6 +233,22 @@ impl Workspace {
         // A closed tab is nobody's "previous", and the tab that replaced it
         // is the current one rather than a step back from it.
         self.recent.retain(|&x| x != id && Some(x) != self.active);
+    }
+
+    /// Close every tab opened from BACKGROUND. Such a tab is a view onto a
+    /// background agent, gone when the attach ends; restored after a restart
+    /// it would attach again and so start a job the restart had stopped.
+    /// A live agent is in BACKGROUND anyway.
+    pub fn drop_background_tabs(&mut self) {
+        let ids: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| t.bg_job.is_some())
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.close_tab(id);
+        }
     }
 
     pub fn tab(&self, id: TabId) -> Option<&Tab> {

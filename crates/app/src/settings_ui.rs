@@ -10,8 +10,11 @@
 //! screen teaches the file, so the next edit can be made over SSH or dropped
 //! into dotfiles.
 
+use std::sync::OnceLock;
+
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText};
-use giverny_core::settings::{self, Kind, Section, SettingDef, Value};
+use giverny_core::limits::{self, Auto, GpuLimit, Limits, Machine, Mem};
+use giverny_core::settings::{self, Kind, LimitField, Section, SettingDef, Value};
 
 use crate::{Action, App};
 
@@ -25,6 +28,9 @@ pub struct SettingsState {
     /// number rows commit on Enter or focus loss, not on every keystroke — a
     /// half-typed "1" in a "10000" field must not be written to disk.
     pub editing: Option<(String, String)>,
+    /// A value that was typed but refused (a limit larger than the machine,
+    /// say): the row's edit key and why. Cleared by the next good commit.
+    pub error: Option<(String, String)>,
 }
 
 impl Default for SettingsState {
@@ -34,8 +40,32 @@ impl Default for SettingsState {
             search: String::new(),
             search_focus: true,
             editing: None,
+            error: None,
         }
     }
+}
+
+/// This machine's cores, RAM and GPUs, for the manager limits.
+///
+/// Detected once per process, off the UI thread: GPU detection runs
+/// `nvidia-smi`, which can take a second, and none of it changes while
+/// Giverny runs. `None` until the first detection finishes.
+fn machine(ctx: &egui::Context) -> Option<&'static Machine> {
+    static MACHINE: OnceLock<Machine> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("detect-machine".into())
+            .spawn(move || {
+                let _ = MACHINE.set(Machine::detect());
+                ctx.request_repaint();
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("could not detect the machine: {err}");
+        }
+    });
+    MACHINE.get()
 }
 
 /// Rows to show: everything in the current section, or — while searching —
@@ -80,6 +110,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
 
     let cfg = app.cfg.clone();
     let c = app.chrome;
+    let machine = machine(&ctx);
     let rows = visible(&state);
     // Suggestions for the restore list, from what tabs have actually run.
     let allowed: Vec<String> = cfg.behavior.restore_apps.clone();
@@ -112,6 +143,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
                                 ui,
                                 &mut state,
                                 &cfg,
+                                machine,
                                 &rows,
                                 &suggestions,
                                 &mut actions,
@@ -200,6 +232,7 @@ fn body(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
     rows: &[&'static SettingDef],
     suggestions: &[String],
     actions: &mut Vec<Action>,
@@ -237,6 +270,10 @@ fn body(
         ui.add_space(8.0);
     }
 
+    if state.search.is_empty() && state.section == Section::ManagementPanel {
+        return management_panel_page(ui, state, cfg, machine, rows, suggestions, actions, c);
+    }
+
     if state.search.is_empty() && state.section == Section::Codex {
         ui.label(
             "Codex is detected automatically. Type codex normally in any tab; usage uses its existing sign-in.",
@@ -272,20 +309,172 @@ fn body(
         ui.add_space(10.0);
     }
     for def in rows {
+        if skip_gpus(cfg, machine, def) {
+            continue;
+        }
         // Sharing is a refinement of history per terminal: greyed out while
         // there is no per-terminal history to share from.
         let enabled = def.key != "behavior.history_also_shared" || cfg.behavior.history_per_tab;
         ui.add_enabled_ui(enabled, |ui| {
-            row(ui, state, cfg, def, suggestions, actions, c);
+            row(ui, state, cfg, machine, def, suggestions, actions, c);
         });
         ui.add_space(10.0);
     }
 }
 
+/// No GPU, no GPU row — unless one is set, which then needs a reset.
+fn skip_gpus(
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    def: &SettingDef,
+) -> bool {
+    matches!(
+        def.kind,
+        Kind::Limit {
+            field: LimitField::Gpus
+        }
+    ) && settings::is_default(cfg, def)
+        && machine.is_none_or(|m| m.gpus.is_empty())
+}
+
+/// The table under the `columns` row: `management_panel.columns.*`.
+const COLUMNS: &str = "management_panel.columns.";
+
+/// Settings → Management panel, in the order a person reads it: the pane,
+/// the skill and the names switch, the columns as one row of switches (in the pane's own order,
+/// which is `SETTINGS`'), then the default lease and the limits under their
+/// headings.
+#[allow(clippy::too_many_arguments)]
+fn management_panel_page(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    rows: &[&'static SettingDef],
+    suggestions: &[String],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let draw = |ui: &mut egui::Ui,
+                state: &mut SettingsState,
+                actions: &mut Vec<Action>,
+                keep: &dyn Fn(&SettingDef) -> bool| {
+        for def in rows.iter().copied().filter(|d| keep(d)) {
+            if skip_gpus(cfg, machine, def) {
+                continue;
+            }
+            row(ui, state, cfg, machine, def, suggestions, actions, c);
+            ui.add_space(10.0);
+        }
+    };
+    draw(ui, state, actions, &|d| {
+        matches!(
+            d.key,
+            "claude.management_panel"
+                | "management_panel.manage_skill"
+                | "management_panel.ask_names"
+        )
+    });
+    let columns: Vec<&'static SettingDef> = rows
+        .iter()
+        .copied()
+        .filter(|d| d.key.starts_with(COLUMNS))
+        .collect();
+    columns_row(ui, state, cfg, &columns, actions, c);
+    ui.add_space(10.0);
+    ui.add_space(8.0);
+    heading(ui, "default lease", c);
+    draw(ui, state, actions, &|d| {
+        matches!(d.kind, Kind::Lease { .. })
+    });
+    ui.add_space(8.0);
+    heading(ui, "limits", c);
+    draw(ui, state, actions, &|d| {
+        matches!(d.kind, Kind::Limit { .. })
+    });
+}
+
+/// One row for every column of the pane: a switch each, lit while the
+/// column shows, and one ● ↺ putting every column back.
+fn columns_row(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    columns: &[&'static SettingDef],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let modified: Vec<&'static SettingDef> = columns
+        .iter()
+        .copied()
+        .filter(|d| !settings::is_default(cfg, d))
+        .collect();
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(230.0);
+            ui.label(RichText::new("columns").font(FontId::monospace(12.5)));
+            ui.label(
+                RichText::new(COLUMNS.trim_end_matches('.'))
+                    .font(FontId::monospace(10.0))
+                    .color(c.dim),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            for def in columns {
+                let on = settings::current(cfg, def)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if ui
+                    .selectable_label(
+                        on,
+                        RichText::new(def.label)
+                            .font(FontId::monospace(12.0))
+                            .color(if on { c.accent } else { c.dim }),
+                    )
+                    .on_hover_text(format!("{}\n{}", def.doc, def.key))
+                    .clicked()
+                {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Bool(!on)));
+                }
+            }
+            if !modified.is_empty() {
+                ui.label(
+                    RichText::new("●")
+                        .font(FontId::monospace(9.0))
+                        .color(c.amber),
+                )
+                .on_hover_text("changed from the default");
+                if ui
+                    .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
+                    .on_hover_text("every column back on")
+                    .clicked()
+                {
+                    for def in &modified {
+                        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
+                    }
+                    state.editing = None;
+                }
+            }
+        });
+    });
+}
+
+/// A heading on the Management panel page — the fields show their own figures.
+fn heading(ui: &mut egui::Ui, text: &str, c: Chrome) {
+    ui.label(
+        RichText::new(text)
+            .font(FontId::monospace(12.5))
+            .color(c.accent),
+    );
+    ui.add_space(10.0);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
     def: &'static SettingDef,
     suggestions: &[String],
     actions: &mut Vec<Action>,
@@ -309,13 +498,25 @@ fn row(
         });
 
         ui.vertical(|ui| {
+            // The limits are bare figures, their ● ↺ beside the field; the
+            // doc stays on the def for search.
+            if let Kind::Limit { field } = def.kind {
+                return limit_widget(ui, state, cfg, machine, def, field, &value, actions, c);
+            }
+            if let Kind::Lease { field, .. } = def.kind {
+                return lease_widget(ui, state, machine, def, field, &value, actions, c);
+            }
             widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(def.doc)
-                        .font(FontId::monospace(10.0))
-                        .color(c.dim),
-                );
+                // The Management panel page is bare figures and switches; the
+                // doc stays on the def for search (and on hover).
+                if def.section != Section::ManagementPanel {
+                    ui.label(
+                        RichText::new(def.doc)
+                            .font(FontId::monospace(10.0))
+                            .color(c.dim),
+                    );
+                }
                 if def.needs_restart && modified {
                     ui.label(
                         RichText::new("restart to apply")
@@ -325,24 +526,37 @@ fn row(
                     .on_hover_text("the change is saved; it loads at startup");
                 }
                 if modified {
-                    ui.label(
-                        RichText::new("●")
-                            .font(FontId::monospace(9.0))
-                            .color(c.amber),
-                    )
-                    .on_hover_text("changed from the default");
-                    if ui
-                        .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
-                        .on_hover_text("reset to default")
-                        .clicked()
-                    {
-                        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
-                        state.editing = None;
-                    }
+                    changed_mark(ui, state, def, actions, c);
                 }
             });
         });
     });
+}
+
+/// `● ↺`: the row is changed from its default, and the button putting the
+/// default back.
+fn changed_mark(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    def: &'static SettingDef,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    ui.label(
+        RichText::new("●")
+            .font(FontId::monospace(9.0))
+            .color(c.amber),
+    )
+    .on_hover_text("changed from the default");
+    if ui
+        .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
+        .on_hover_text("reset to default")
+        .clicked()
+    {
+        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
+        state.editing = None;
+        state.error = None;
+    }
 }
 
 fn widget(
@@ -450,6 +664,323 @@ fn widget(
             }
         }
         Kind::StringList { .. } => list_widget(ui, state, def, value, suggestions, actions, c),
+        // Drawn by `limit_widget` and `lease_widget`, which need the machine.
+        Kind::Limit { .. } | Kind::Lease { .. } => {}
+    }
+}
+
+/// A short text field committing on Enter or focus loss, like the text
+/// rows. It shows `shown` — the figure in force, never the word `auto` —
+/// and gives `Some(typed)` once something other than that is committed.
+fn commit_field(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    key: &str,
+    shown: &str,
+) -> Option<String> {
+    let editing = state.editing.as_ref().is_some_and(|(k, _)| k == key);
+    let mut buf = match (&state.editing, editing) {
+        (Some((_, b)), true) => b.clone(),
+        _ => shown.to_string(),
+    };
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .hint_text(shown)
+            .desired_width(90.0)
+            .font(FontId::monospace(12.0)),
+    );
+    if resp.changed() {
+        state.editing = Some((key.into(), buf.clone()));
+    }
+    let done = resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter));
+    if done && editing {
+        state.editing = None;
+        if buf.trim() != shown {
+            return Some(buf);
+        }
+    }
+    None
+}
+
+fn dim(ui: &mut egui::Ui, text: String, c: Chrome) {
+    ui.label(
+        RichText::new(text)
+            .font(FontId::monospace(11.0))
+            .color(c.dim),
+    );
+}
+
+fn refused(ui: &mut egui::Ui, state: &SettingsState, key: &str, c: Chrome) {
+    if let Some((_, why)) = state.error.as_ref().filter(|(k, _)| k == key) {
+        ui.label(
+            RichText::new(why)
+                .font(FontId::monospace(10.0))
+                .color(c.amber),
+        );
+    }
+}
+
+/// One `[manager.limits]` row: a bare field holding the figure in
+/// force — at `auto`, what that comes to on this machine. The row's ↺ puts
+/// `auto` back.
+#[allow(clippy::too_many_arguments)]
+fn limit_widget(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    field: LimitField,
+    value: &Value,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let limits = &cfg.manager.limits;
+    if field == LimitField::Gpus {
+        return gpu_rows(ui, state, limits, machine, def, actions, c);
+    }
+    let stored = value.as_str().unwrap_or("auto").to_string();
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let shown = limit_figure(limits, m, field);
+    let typed = ui
+        .horizontal(|ui| {
+            let typed = commit_field(ui, state, def.key, &shown);
+            if *value != def.default_value() {
+                changed_mark(ui, state, def, actions, c);
+            }
+            dim(ui, limit_share(limits, m, field), c);
+            typed
+        })
+        .inner;
+    if let Some(typed) = typed {
+        let parsed = match field {
+            LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
+                Auto::Auto => "auto".to_string(),
+                Auto::Set(n) => n.to_string(),
+            }),
+            _ => limits::parse_ram(&typed, m).map(|a| match a {
+                Auto::Auto => "auto".to_string(),
+                Auto::Set(mem) => limits::mem_text(mem),
+            }),
+        };
+        match parsed {
+            Ok(text) => {
+                state.error = None;
+                if text != stored {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                }
+            }
+            Err(why) => state.error = Some((def.key.into(), why)),
+        }
+    }
+    refused(ui, state, def.key, c);
+}
+
+/// One `[management_panel.lease]` row: a bare field holding the figure, its
+/// ● ↺, and the share of this machine it is, like a limit's.
+#[allow(clippy::too_many_arguments)]
+fn lease_widget(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    field: LimitField,
+    value: &Value,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let stored = value.as_str().unwrap_or_default().to_string();
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let typed = ui
+        .horizontal(|ui| {
+            let typed = commit_field(ui, state, def.key, &stored);
+            if *value != def.default_value() {
+                changed_mark(ui, state, def, actions, c);
+            }
+            dim(ui, lease_share(&stored, m, field), c);
+            typed
+        })
+        .inner;
+    if let Some(typed) = typed {
+        // `auto` (or nothing) here means the default lease.
+        let parsed = match field {
+            LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
+                Auto::Auto => def.default_value().as_str().unwrap_or("3").to_string(),
+                Auto::Set(n) => n.to_string(),
+            }),
+            _ => limits::parse_ram(&typed, m).map(|a| match a {
+                Auto::Auto => def.default_value().as_str().unwrap_or("3G").to_string(),
+                Auto::Set(mem) => limits::mem_text(mem),
+            }),
+        };
+        match parsed {
+            Ok(text) => {
+                state.error = None;
+                if text != stored {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                }
+            }
+            Err(why) => state.error = Some((def.key.into(), why)),
+        }
+    }
+    refused(ui, state, def.key, c);
+}
+
+/// What sits after a default-lease field: `of 16 cores · 19 %`,
+/// `of 31.3G · 10 %`.
+fn lease_share(stored: &str, m: &Machine, field: LimitField) -> String {
+    match field {
+        LimitField::Cores => {
+            let n: u64 = stored.trim().parse().unwrap_or(0);
+            format!(
+                "of {} core{} · {} %",
+                m.cores,
+                if m.cores == 1 { "" } else { "s" },
+                share_pct(n, m.cores.into())
+            )
+        }
+        _ => {
+            let mb = Mem::parse(stored).map_or(0, |x| x.0);
+            format!("of {} · {} %", m.ram, share_pct(mb, m.ram.0))
+        }
+    }
+}
+
+/// The figure a cores or RAM limit comes to on `m`: `12`, `18.8G`.
+fn limit_figure(limits: &Limits, m: &Machine, field: LimitField) -> String {
+    let r = limits.resolve(m);
+    match field {
+        LimitField::Cores => r.cpu_cores.to_string(),
+        _ => r.ram.to_string(),
+    }
+}
+
+/// `part` as a whole percent of `whole` (0 when `whole` is).
+fn share_pct(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    (part as f64 * 100.0 / whole as f64).round() as u64
+}
+
+/// What sits after a cores or RAM field: this machine's total and the
+/// share the figure in force is of it — `of 16 cores · 88 %`,
+/// `of 31.3G · 70 %`.
+fn limit_share(limits: &Limits, m: &Machine, field: LimitField) -> String {
+    let r = limits.resolve(m);
+    match field {
+        LimitField::Cores => format!(
+            "of {} core{} · {} %",
+            m.cores,
+            if m.cores == 1 { "" } else { "s" },
+            share_pct(r.cpu_cores.into(), m.cores.into())
+        ),
+        _ => format!("of {} · {} %", m.ram, share_pct(r.ram.0, m.ram.0)),
+    }
+}
+
+/// `gpus`: a line per GPU the machine has. The file holds one list, so
+/// setting one GPU writes them all — the rest at their auto figure — and a
+/// list that comes back to every GPU at auto is written as `"auto"` again.
+fn gpu_rows(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    limits: &Limits,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let auto_list = Limits::default().resolve(m).gpus;
+    let current: Vec<GpuLimit> = limits.gpus.get().cloned().unwrap_or(auto_list.clone());
+    if m.gpus.is_empty() {
+        // Shown only when set: then it needs its ↺.
+        ui.horizontal(|ui| {
+            dim(ui, "no GPU detected (nvidia-smi)".into(), c);
+            if !matches!(limits.gpus, Auto::Auto) {
+                changed_mark(ui, state, def, actions, c);
+            }
+        });
+    }
+    for (i, g) in m.gpus.iter().enumerate() {
+        let first = i == 0;
+        let key = format!("{}#{}", def.key, g.index);
+        let set = current.iter().find(|l| l.index == g.index);
+        // The VRAM in force, at auto too: the field never says `auto`.
+        let stored = match set {
+            Some(l) => l.vram.to_string(),
+            None => "off".to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} {} {}", g.index, g.name, g.vram))
+                    .font(FontId::monospace(11.0)),
+            );
+            let typed = commit_field(ui, state, &key, &stored);
+            // One list in the file: one ● ↺, on the first GPU's line.
+            if first && !matches!(limits.gpus, Auto::Auto) {
+                changed_mark(ui, state, def, actions, c);
+            }
+            // The row already names the GPU's VRAM; say the share of it.
+            if let Some(l) = set {
+                dim(ui, format!("{} %", share_pct(l.vram.0, g.vram.0)), c);
+            }
+            if let Some(typed) = typed {
+                let t = typed.trim().to_ascii_lowercase();
+                let auto_vram = auto_list
+                    .iter()
+                    .find(|l| l.index == g.index)
+                    .map(|l| l.vram);
+                let vram = match t.as_str() {
+                    "" | "auto" => Ok(auto_vram),
+                    "off" | "none" | "0" => Ok(None),
+                    _ => limits::parse_share_of(&t, g.vram, "VRAM").map(Some),
+                };
+                match vram {
+                    Ok(vram) => {
+                        state.error = None;
+                        let mut next: Vec<GpuLimit> = current
+                            .iter()
+                            .filter(|l| l.index != g.index)
+                            .cloned()
+                            .collect();
+                        if let Some(vram) = vram {
+                            next.push(GpuLimit {
+                                index: g.index,
+                                vram,
+                            });
+                        }
+                        next.sort_by_key(|l| l.index);
+                        let text = if next == auto_list {
+                            "auto".to_string()
+                        } else {
+                            limits::gpus_text(&next)
+                        };
+                        actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                    }
+                    Err(why) => state.error = Some((key.clone(), why)),
+                }
+            }
+        });
+        refused(ui, state, &key, c);
+    }
+    // Set in the file for a GPU this machine does not have.
+    for l in current
+        .iter()
+        .filter(|l| !m.gpus.iter().any(|g| g.index == l.index))
+    {
+        dim(
+            ui,
+            format!("GPU {}: {} set, not detected", l.index, l.vram),
+            c,
+        );
     }
 }
 
@@ -781,5 +1312,18 @@ mod tests {
         // Searching by TOML key works too — that is half the point of showing it.
         state.search = "titles.strip_host".into();
         assert_eq!(visible(&state).len(), 1);
+        // The manager limits, by their table and by what they are.
+        state.search = "limits".into();
+        let keys: Vec<&str> = visible(&state).iter().map(|d| d.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "manager.limits.cpu_cores",
+                "manager.limits.ram",
+                "manager.limits.gpus"
+            ]
+        );
+        state.search = "vram".into();
+        assert_eq!(visible(&state)[0].key, "manager.limits.gpus");
     }
 }

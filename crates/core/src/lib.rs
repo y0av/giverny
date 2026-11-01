@@ -8,6 +8,7 @@ pub mod agent;
 pub mod config;
 pub mod git;
 pub mod history;
+pub mod limits;
 pub mod procs;
 pub mod settings;
 pub mod state;

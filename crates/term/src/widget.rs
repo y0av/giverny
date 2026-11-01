@@ -34,8 +34,8 @@ pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// Render resources shared by all tabs.
 pub struct RenderShared {
-    fonts: FontSet,
-    atlas: Atlas,
+    pub(crate) fonts: FontSet,
+    pub(crate) atlas: Atlas,
     pub theme: Theme,
     /// Font size in logical points.
     pub font_size: f32,
@@ -43,7 +43,7 @@ pub struct RenderShared {
     /// the window was not made see-through.
     pub opacity: f32,
     metrics: Option<(u32, CellMetrics)>,
-    generation: u32,
+    pub(crate) generation: u32,
 }
 
 impl RenderShared {
@@ -70,7 +70,7 @@ impl RenderShared {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn metrics_for(&mut self, px: f32) -> CellMetrics {
+    pub(crate) fn metrics_for(&mut self, px: f32) -> CellMetrics {
         let key = px.to_bits();
         if let Some((k, m)) = self.metrics
             && k == key
@@ -118,6 +118,41 @@ impl RenderShared {
         }
     }
 
+    /// One terminal cell at the current font size, in logical points.
+    pub fn cell_size(&mut self, pixels_per_point: f32) -> Vec2 {
+        let m = self.metrics_for(self.font_size * pixels_per_point);
+        Vec2::new(m.cell_w as f32, m.cell_h as f32) / pixels_per_point
+    }
+
+    /// Paint one line of `text` in the terminal's own glyphs — same face,
+    /// size, hinting and cell grid as the session — with cell 0's top-left
+    /// at `top_left` (snapped to the pixel grid). One cell per `char`.
+    pub fn paint_text(
+        &mut self,
+        painter: &egui::Painter,
+        top_left: Pos2,
+        text: &str,
+        color: Color32,
+    ) {
+        let ctx = painter.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let metrics = self.metrics_for(self.font_size * ppp);
+        let origin_px = Vec2::new((top_left.x * ppp).round(), (top_left.y * ppp).round());
+        let meshes = mesh::text_line(
+            &ctx,
+            &self.fonts,
+            &mut self.atlas,
+            metrics,
+            origin_px,
+            ppp,
+            text,
+            color,
+        );
+        for m in meshes {
+            painter.add(Shape::Mesh(Arc::new(m)));
+        }
+    }
+
     /// Change the font size; invalidates every tab's cached meshes.
     pub fn set_font_size(&mut self, size: f32) {
         let size = size.clamp(7.0, 32.0);
@@ -154,12 +189,55 @@ pub struct TabView {
     hints: Option<Hints>,
     /// Uploaded image textures, keyed by graphics id.
     textures: std::collections::HashMap<u32, egui::TextureHandle>,
+    /// Paint the default background as the theme's worker background
+    /// ([`Theme::worker_bg`]): the app sets it while the tab shows a worker.
+    pub worker_bg: bool,
+    /// Reads the screen's text (row per line) into [`RowMarks`] whenever the
+    /// grid is redrawn: rows the app wants painted over. `None`: none.
+    pub marks_for: Option<fn(&str) -> RowMarks>,
+    marks: RowMarks,
+    /// The row button's label, longest first: the first that fits the
+    /// row's blank cells is drawn, and none when none fits.
+    pub button_labels: &'static [&'static str],
+    /// The row button's fill; its text is drawn in the background colour.
+    pub button_fill: Color32,
+    /// Set by [`TabView::show`] for a frame in which the row button was
+    /// clicked, or Esc pressed for it ([`RowMarks::escape`]).
+    pub button_pressed: bool,
+    /// Keep painting the last frame drawn, whatever the program writes
+    /// meanwhile: the app sets it while it walks Claude Code
+    /// from one view to another, so the steps between never reach the
+    /// screen and the view changes in one frame. Input still goes through.
+    pub hold: bool,
+    /// The frame on screen was held: the next frame is drawn afresh.
+    was_held: bool,
     /// Watches for a paste chord that found no text.
     paste_chord: input::PasteChord,
     /// Set by [`TabView::show`] for a frame in which a paste chord found no
     /// text in the clipboard while the terminal had the keyboard: the app
     /// looks for files or an image there and pastes them.
     pub paste_image: bool,
+}
+
+/// What the app paints over a tab's grid (the management panel
+/// standing in for Claude Code's agent strip). Rows are screen rows of the
+/// live screen, and nothing is painted while the view is scrolled back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowMarks {
+    /// Rows drawn as blank background.
+    pub hidden: Vec<u16>,
+    /// `(row, used)`: a button on `row`, on its blank cells from column
+    /// `used` on: at the row's right end, or at [`Self::button_left`].
+    pub button: Option<(u16, u16)>,
+    /// The button's label starts at this column instead of the button
+    /// sitting at the row's right end (where the strip's
+    /// `main` was, under the terminal's other text).
+    pub button_left: Option<u16>,
+    /// The button ends before this column instead of at the row's end
+    /// (text further right on the row, which it must not cover).
+    pub button_end: Option<u16>,
+    /// Esc presses the button instead of reaching the program.
+    pub escape: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -238,6 +316,14 @@ impl Default for TabView {
             hover_target: None,
             hints: None,
             textures: std::collections::HashMap::new(),
+            worker_bg: false,
+            marks_for: None,
+            marks: RowMarks::default(),
+            button_labels: &[],
+            button_fill: Color32::from_rgb(0x8a, 0xb4, 0xf8),
+            button_pressed: false,
+            hold: false,
+            was_held: false,
             paste_chord: input::PasteChord::default(),
             paste_image: false,
         }
@@ -304,12 +390,20 @@ fn still_swallowed(
 struct CachedFrame {
     origin_px: Vec2,
     generation: u32,
+    bg: Color32,
     meshes: Vec<Arc<Mesh>>,
     /// Rows drawn right to left, as last painted: what the pointer is over.
     orders: Vec<(u16, RowOrder)>,
 }
 
 impl TabView {
+    /// Whether the cursor is blinking at egui time `now`: a held picture
+    /// ([`TabView::hold`]) would stop it mid-blink, so a hold nothing asked
+    /// for is not started while it does.
+    pub fn cursor_blinking(&self, now: f64) -> bool {
+        self.blink_from.is_some_and(|from| now - from < BLINK_FOR)
+    }
+
     /// Let the mouse wheel through these layers, drawn over the grid, to the
     /// terminal: over them it scrolls exactly as over the grid. A bar pinned
     /// to the top row covers the grid, but nothing of its own scrolls.
@@ -350,6 +444,30 @@ impl TabView {
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mouse_reporting = mode.intersects(TermMode::MOUSE_MODE) && !shift_held;
 
+        // The row button, where the last redraw found its row. Registered
+        // after the grid's response, so it is on top of it and a click on
+        // it goes to it alone.
+        self.button_pressed = false;
+        let live = session.term.lock().grid().display_offset() == 0;
+        if !live {
+            self.marks = RowMarks::default();
+        } else if self.was_held
+            && !self.hold
+            && let Some(marks_for) = self.marks_for
+        {
+            // The first frame after a hold: its marks now, so the button
+            // comes with the picture rather than a frame after it.
+            self.marks = marks_for(&session.screen_text());
+        }
+        let button = row_button(&self.marks, self.button_labels, rect, ppp, metrics, cols);
+        let button_resp = button.map(|(r, _)| {
+            ui.interact(r, response.id.with("row-button"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+        });
+        if button_resp.as_ref().is_some_and(|r| r.clicked()) {
+            self.button_pressed = true;
+        }
+
         self.handle_search(ui, session, rect, ppp, metrics);
         self.handle_hints(ui, session, rect, ppp, metrics);
         self.handle_click_targets(ui, session, &response, rect, ppp, metrics);
@@ -357,7 +475,8 @@ impl TabView {
         // under it, so the click must not also reach the program. Claude Code
         // opens hyperlinks itself (`onHyperlinkClick` → `xdg-open`), and a
         // forwarded click opened the same link a second time.
-        let pointer_is_ours = self.hover_target.is_some();
+        let pointer_is_ours =
+            self.hover_target.is_some() || button_resp.as_ref().is_some_and(|r| r.hovered());
         self.handle_keyboard(ui, shared, session, &response, mode);
         if pointer_is_ours {
             // Neither reported nor treated as a selection drag.
@@ -432,26 +551,58 @@ impl TabView {
 
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
-        let dirty = session.take_dirty();
-        let needs_rebuild = dirty
-            || self.last_blink != cursor_visible
-            || self
+        let bg = if self.worker_bg {
+            shared.theme.worker_bg()
+        } else {
+            shared.theme.bg
+        };
+        // Held: the last frame stays, with its background and marks, as
+        // long as it still fits where it is drawn. The program's output
+        // stays dirty, so the first frame after is drawn from it.
+        let held = self.hold
+            && self
                 .cached
                 .as_ref()
-                .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
-        self.last_blink = cursor_visible;
+                .is_some_and(|c| c.origin_px == origin_px && c.generation == shared.generation);
+        let bg = match (&self.cached, held) {
+            (Some(c), true) => c.bg,
+            _ => bg,
+        };
+        let released = std::mem::replace(&mut self.was_held, held) && !held;
+        let needs_rebuild = !held
+            && (session.take_dirty()
+                || released
+                || self.last_blink != cursor_visible
+                || self.cached.as_ref().is_none_or(|c| {
+                    c.origin_px != origin_px || c.generation != shared.generation || c.bg != bg
+                }));
+        if !held {
+            self.last_blink = cursor_visible;
+        }
         if needs_rebuild {
+            // A worker's tab resolves the default background to its tint,
+            // so it is elided and filled below like any default cell.
+            let tinted = (bg != shared.theme.bg).then(|| Theme {
+                bg,
+                ..shared.theme.clone()
+            });
+            let metrics = shared.metrics_for(shared.font_size * ppp);
+            let theme = tinted.as_ref().unwrap_or(&shared.theme);
+            if let (Some(marks_for), true) = (self.marks_for, live) {
+                self.marks = marks_for(&session.screen_text());
+            } else if self.marks_for.is_none() {
+                self.marks = RowMarks::default();
+            }
             let snapshot = {
                 let term = session.term.lock();
-                Snapshot::capture(&term, &shared.theme)
+                Snapshot::capture(&term, theme)
             };
-            let metrics = shared.metrics_for(shared.font_size * ppp);
             let mut params = BuildParams {
                 ctx: ui.ctx(),
                 fonts: &shared.fonts,
                 atlas: &mut shared.atlas,
                 metrics,
-                theme: &shared.theme,
+                theme,
                 origin_px,
                 pixels_per_point: ppp,
                 cursor_visible,
@@ -464,13 +615,14 @@ impl TabView {
             self.cached = Some(CachedFrame {
                 origin_px,
                 generation: shared.generation,
+                bg,
                 meshes,
                 orders: snapshot.orders,
             });
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, see_through(shared.theme.bg, shared.opacity));
+        painter.rect_filled(rect, 0.0, see_through(bg, shared.opacity));
         // Search match rows, as bands across the grid.
         let search_bands: Vec<Rect> = self
             .search
@@ -495,7 +647,7 @@ impl TabView {
         // would be a tint over whatever the wallpaper is.
         if shared.opacity < 1.0 {
             for band in &search_bands {
-                painter.rect_filled(*band, 0.0, shared.theme.bg);
+                painter.rect_filled(*band, 0.0, bg);
             }
         }
         if let Some(cached) = &self.cached {
@@ -504,6 +656,25 @@ impl TabView {
                     painter.add(Shape::Mesh(mesh.clone()));
                 }
             }
+        }
+
+        // The rows the app blanks, and its row button, over the grid.
+        let row_band = |row: u16| {
+            Rect::from_min_size(
+                Pos2::new(
+                    rect.min.x,
+                    rect.min.y + (row as f32 * metrics.cell_h as f32) / ppp,
+                ),
+                Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
+            )
+        };
+        for &row in &self.marks.hidden {
+            if i32::from(row) < rows_now(rect, ppp, metrics) {
+                painter.rect_filled(row_band(row), 0.0, bg);
+            }
+        }
+        if let (Some((r, label)), Some(resp)) = (button, &button_resp) {
+            paint_row_button(&painter, shared, r, label, self.button_fill, bg, resp);
         }
 
         // Search match highlight + hovered link underline, over the grid.
@@ -638,6 +809,11 @@ impl TabView {
                         }
                         if modifiers.ctrl && *key == Key::Num0 {
                             zoom_reset = true;
+                            continue;
+                        }
+                        // Esc is the row button's while it asks for it.
+                        if *key == Key::Escape && modifiers.is_none() && self.marks.escape {
+                            self.button_pressed = true;
                             continue;
                         }
                         if let Some(seq) = input::encode_key(*key, *modifiers, mode) {
@@ -1293,8 +1469,67 @@ impl TabView {
     }
 }
 
+/// The row button's rect and label, when `marks` ask for one and a label
+/// fits the row's blank cells with a cell to spare each side: the first of
+/// `labels` (longest first) that fits. Shared by a tab's terminal and a
+/// [`crate::page::Page`], so the two draw the one button.
+pub(crate) fn row_button(
+    marks: &RowMarks,
+    labels: &'static [&'static str],
+    rect: Rect,
+    ppp: f32,
+    m: CellMetrics,
+    cols: u16,
+) -> Option<(Rect, &'static str)> {
+    let (row, used) = marks.button?;
+    if i32::from(row) >= rows_now(rect, ppp, m) {
+        return None;
+    }
+    // One cell of padding inside each end; at the right, the end one
+    // cell in; at the left, the label on the column asked for.
+    let end = marks.button_end.map_or(cols, |e| e.min(cols));
+    let (free, left) = match marks.button_left {
+        Some(at) => {
+            let start = at.saturating_sub(1).max(used);
+            (end.saturating_sub(start), Some(start))
+        }
+        None => (end.saturating_sub(used), None),
+    };
+    let label = labels
+        .iter()
+        .find(|l| (l.chars().count() as u16) + 4 <= free)?;
+    let width = label.chars().count() as u16 + 2;
+    let start = left.unwrap_or(end - 1 - width);
+    let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
+    let r = Rect::from_min_size(
+        Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),
+        Vec2::new(width as f32 * cw, ch),
+    );
+    Some((r, *label))
+}
+
+/// Paint the row button at `r`: `fill`, a shade lighter while the pointer
+/// is on it (`resp`), its label in the grid's background colour `bg`.
+pub(crate) fn paint_row_button(
+    painter: &egui::Painter,
+    shared: &mut RenderShared,
+    r: Rect,
+    label: &str,
+    fill: Color32,
+    bg: Color32,
+    resp: &Response,
+) {
+    let hot = resp.hovered() || resp.is_pointer_button_down_on();
+    let fill = if hot { fill } else { fill.gamma_multiply(0.85) };
+    let cw_pt = shared.cell_size(painter.ctx().pixels_per_point()).x;
+    painter.rect_filled(r, 3.0, bg);
+    painter.rect_filled(r.shrink2(Vec2::new(0.0, 1.0)), 4.0, fill);
+    let text_at = Pos2::new(r.min.x + cw_pt, r.min.y);
+    shared.paint_text(painter, text_at, label, bg);
+}
+
 /// Visible row count for the current geometry.
-fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
+pub(crate) fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
     (rect.height() * ppp / m.cell_h as f32).floor() as i32
 }
 
@@ -1340,7 +1575,7 @@ fn drawn_span(orders: &[(u16, RowOrder)], line: u16, start: u16, len: u16) -> (u
 }
 
 /// Pointer position → 0-based viewport cell + cell side.
-fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
+pub(crate) fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
     let x_px = ((pos.x - rect.min.x) * ppp).max(0.0);
     let y_px = ((pos.y - rect.min.y) * ppp).max(0.0);
     let col = (x_px / m.cell_w as f32).floor() as u16;

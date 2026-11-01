@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use giverny_claude::attach;
 use giverny_claude::hooks::{self, RelayMsg};
 use giverny_claude::jobs::{self, Job};
 use giverny_claude::profiles::{self, Profile};
@@ -16,6 +17,8 @@ use giverny_claude::registry;
 use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
+
+use crate::management_live::ManagementLive;
 
 pub use giverny_core::agent::AgentState as ClaudeState;
 
@@ -30,17 +33,37 @@ pub struct ClaudeTab {
     /// at its prompt. Not a working state — marked, never animated.
     pub background: bool,
     /// Work this session delegated — subagents, a workflow, teammates, a
-    /// cloud session — was still running when its last turn ended, and the
-    /// registry has not said since that it stopped: the agent is free to
-    /// talk while its workers go on. Set by the `Stop` hook's
-    /// `background_tasks`, kept while the registry says `busy` (which, with
-    /// the turn over, is that work: Claude Code counts it as working), and
-    /// cleared by the first scan that does not, or by the next turn.
+    /// cloud session — still runs: the agent is free to talk while its
+    /// workers go on. What [`ClaudeTab::subagents`] and
+    /// `agents_unnamed` add up to, kept in step by
+    /// [`ClaudeTab::sync_agents`].
     pub agents: bool,
+    /// The delegated work, by task id, this session's turns left running
+    /// and nothing has said since has ended. A `Stop`'s
+    /// `background_tasks` adds what it lists; it is no word on the rest:
+    /// Claude Code drops a subagent from the list once it waits on
+    /// background work of its own, while it still lives. Ended by the
+    /// worker's hand-back, the `<task-notification>` that says it finished,
+    /// a `TaskStop`, the registry back at plain `idle`, or the session's
+    /// end. A worker heard working while the session is at its prompt is
+    /// running in the background, so it is added too.
+    subagents: HashSet<String>,
+    /// The last `Stop` listed delegated work without an id: kept as the
+    /// whole flag was before ids were read, until the next turn or the
+    /// registry's `idle`.
+    agents_unnamed: bool,
+    /// When each worker that ended was told to (`emitted_at`): a call of its
+    /// relayed later than its hand-back is no sign it lives on.
+    ended: HashMap<String, u64>,
     /// What the tab was when a compaction began: Busy for one Claude Code
     /// started mid-turn, whatever the last turn left for a `/compact`. The
     /// compaction's `SessionStart` puts it back.
     before_compact: Option<ClaudeState>,
+    /// The last turn ended on an API error: a `StopFailure` in place of the
+    /// `Stop` (rate limit, overload, a model not found, …), which the rail
+    /// marks with a ✕ instead of the tick. Anything after it
+    /// that says the session works again, or a turn ending well, clears it.
+    failed: bool,
     /// The user's prompts in this session, oldest first, in full (at most
     /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
     /// from the transcript for a session adopted mid-way or resumed.
@@ -54,6 +77,8 @@ pub struct ClaudeTab {
     /// what a registry entry's `statusUpdatedAt` is told apart by, older
     /// than what the hooks said or newer.
     heard_at_ms: u64,
+    /// The newest `emitted_at` among the hook messages this tab has applied.
+    last_applied: Option<u64>,
     seen_in_scan: bool,
 }
 
@@ -84,9 +109,37 @@ fn cap_history(prompts: &mut Vec<String>) {
 impl ClaudeTab {
     /// Something this session started still works while the agent waits at
     /// its prompt: a background shell or delegated work. What the rail's
-    /// three dots say.
+    /// three-dot wave says.
     pub fn working_in_background(&self) -> bool {
         self.background || self.agents
+    }
+
+    /// `agents` from what still runs.
+    fn sync_agents(&mut self) {
+        self.agents = self.agents_unnamed || !self.subagents.is_empty();
+    }
+
+    /// Nothing delegated runs any more.
+    fn clear_agents(&mut self) {
+        self.subagents.clear();
+        self.agents_unnamed = false;
+        self.sync_agents();
+    }
+
+    /// The worker `id` has ended, as told by a message stamped `at`.
+    fn agent_ended(&mut self, id: &str, at: Option<u64>) {
+        self.subagents.remove(id);
+        self.ended.insert(id.to_string(), at.unwrap_or(u64::MAX));
+        self.sync_agents();
+    }
+
+    /// Is a claude running in this tab now: seen in the last scan, or heard
+    /// from in the last few seconds.
+    fn has_claude(&self) -> bool {
+        self.seen_in_scan
+            || self
+                .last_hook
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
     }
 
     /// The conversation this tab holds. A different one — `/clear`, a
@@ -364,7 +417,23 @@ pub struct ClaudeWatch {
     cache_dirty: Arc<AtomicBool>,
     pub tabs: HashMap<TabId, ClaudeTab>,
     /// Background agents across every account — the Claudes with no tab.
+    /// One a tab shows is left out ([`ClaudeWatch::shown_in_a_tab`]).
     pub jobs: Vec<Job>,
+    /// The job each tab's claude parked on (`parkedJobId`), from the last
+    /// registry scan: that claude is a client of the background daemon.
+    parked: HashMap<TabId, String>,
+    /// The session of each tab's parked claude itself — the client, not
+    /// the job — from the same scan.
+    parked_by: HashMap<TabId, String>,
+    /// Every job of the last jobs scan, shown or not.
+    all_jobs: Vec<Job>,
+    /// What each tab's `claude attach` names (an id, a conversation, a
+    /// name), from the last process scan: that claude shows the job and
+    /// writes no registry entry to say so.
+    attached: HashMap<TabId, String>,
+    /// Which tab shows each background job now, by the job's short id
+    /// ([`jobs_on_screen`]). A job's hooks carry its id, not a tab's.
+    viewing: HashMap<String, TabId>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
@@ -397,9 +466,22 @@ pub struct ClaudeWatch {
     last_look: Instant,
     late_in_flight: Arc<AtomicFlag>,
     extra_dirs: Vec<PathBuf>,
+    /// Each tab's subagents, from relayed `subagentStatusLine` ticks — what
+    /// the management panel draws. See [`ManagementLive::tracker`].
+    pub agents: ManagementLive,
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
+    /// The feed directory, where `names/on` is the session-names switch
+    /// ([`giverny_claude::names`]).
+    feeds: PathBuf,
+    /// The sessions whose place the rail wants: `None` while
+    /// `rail.place_titles` is off, else the ones the tabs hold, set by
+    /// the app. Each scan looks their places up, with every tab's live
+    /// session's, off the UI thread.
+    pub place_sessions: Option<Vec<String>>,
+    /// What the last scan found for them: `Rotem's Workshop`, by session id.
+    pub places: HashMap<String, String>,
     /// When the link was last checked for a target that is gone.
     #[cfg(unix)]
     last_link_check: Instant,
@@ -469,21 +551,33 @@ pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 /// Is this a side instance that must leave every account's Claude config
 /// alone?
 ///
-/// Each account's `settings.json` names Giverny's link for its hooks and
-/// status line, and every Giverny points that link at itself and adopts the
-/// accounts it finds. A second Giverny started to test a build therefore
-/// re-points every session's hooks at the test binary, which `cargo clean`
-/// can then delete out from under them.
+/// Each account's `settings.json` names Giverny's link for its hooks,
+/// status lines and plugin, and every Giverny points that link at itself
+/// and adopts the accounts it finds, following *its own* `management_panel`
+/// setting. A second Giverny started to test a build — even with a config
+/// and runtime dir of its own — therefore re-points every session's hooks at
+/// the test binary, which `cargo clean` can then delete out from under them,
+/// or strips the subagent line and the plugin (and
+/// `plugins/known_marketplaces.json`) out from under the live instance.
 ///
 /// `GIVERNY_NO_ACCOUNT_SETUP=1` turns all of that off: the link, hooks,
-/// status lines and auto mode are read but never written, at startup or
-/// from the UI. Set and not empty or `0` counts as on.
+/// status lines, auto mode, the subagent line and the plugin are read but
+/// never written, at startup or from the UI. Set and not empty or `0` counts
+/// as on. This is the one switch: everything that asks whether this is a
+/// side instance asks it here, through [`side_instance`].
 ///
 /// An explicit switch rather than a guess: a test build differs from the
 /// installed one only in its path, which is exactly what a real reinstall
-/// (`cargo install`, a moved build) also changes.
+/// (`cargo install`, a moved build) also changes, and the path refresh
+/// exists to follow that.
 pub fn leaves_accounts_alone(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Is this Giverny a side instance? [`leaves_accounts_alone`] of
+/// [`NO_ACCOUNT_SETUP_ENV`] as this process was started with.
+pub fn side_instance() -> bool {
+    leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref())
 }
 
 /// What a write refused by a side instance reports, for the UI's log line.
@@ -577,8 +671,8 @@ fn merge_registry(
     // no hook to clear the one it raised, and a turn that ended before this
     // one left a tick behind that "finished" no longer describes. Not while
     // its subagents run on: that `busy` is theirs, and the tick for the turn
-    // they outlived stays. Not a `busy` older than the hook that raised the
-    // flag, either: that is the turn the flag ended.
+    // they outlived stays. Not a `busy` older than the hook
+    // that raised the flag, either: that is the turn the flag ended.
     if live.busy()
         && news
         && !agents
@@ -612,16 +706,95 @@ fn merge_registry(
     }
 }
 
+/// `GIVERNY_HOOK_TRACE=<file>`: one line per hook message a Claude tab
+/// applies, and per registry scan that moves a tab's state or wave — what
+/// the tab was told, when it was stamped, and what it is after, to pin down
+/// an order the relay delivers things in. Off unless set.
+fn trace(tab: TabId, what: &str, emitted_at: Option<u64>, detail: &str, tab_now: &ClaudeTab) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("GIVERNY_HOOK_TRACE").filter(|p| !p.is_empty())?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    });
+    let Some(file) = file else { return };
+    let line = format!(
+        "{} tab={} {what} emitted_at={} {detail} -> state={:?} agents={} subagents={:?} last_applied={}\n",
+        now_ms(),
+        tab.0,
+        emitted_at.map_or("-".into(), |t| t.to_string()),
+        tab_now.state,
+        tab_now.agents,
+        tab_now.subagents,
+        tab_now.last_applied.map_or("-".into(), |t| t.to_string()),
+    );
+    if let Ok(mut f) = file.lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// What [`trace`] says of a hook message beyond its event.
+fn trace_detail(msg: &RelayMsg) -> String {
+    let field = |k: &str| msg.event.get(k).and_then(|v| v.as_str()).unwrap_or("-");
+    let tasks: Vec<String> = msg
+        .event
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let mut t = t.clone();
+            if let Some(o) = t.as_object_mut() {
+                o.remove("description");
+                o.remove("output_file");
+            }
+            t.to_string()
+        })
+        .collect();
+    format!(
+        "session={} agent_id={} tool={} kind={} background_tasks=[{}]",
+        field("session_id"),
+        field("agent_id"),
+        field("tool_name"),
+        field("notification_type"),
+        tasks.join(",")
+    )
+}
+
 /// Now, by the wall clock, in milliseconds since the epoch: what Claude Code
 /// dates a registry status by.
 fn now_ms() -> u64 {
     u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0)
 }
 
+/// The place each of `sessions` is titled after, for those
+/// with one: none at all while names are off.
+fn session_places(feeds: &Path, sessions: &[String]) -> HashMap<String, String> {
+    if sessions.is_empty() || !giverny_claude::names::is_on(feeds) {
+        return HashMap::new();
+    }
+    sessions
+        .iter()
+        .filter_map(|s| Some((s.clone(), giverny_claude::names::place(feeds, s)?)))
+        .collect()
+}
+
 /// One pass over the session registries, done on a worker.
 #[derive(Default)]
 struct ScanResult {
     live: Vec<registry::LiveSession>,
+    /// What each tab's `claude attach` names, for a tab running one
+    /// ([`attach::under`]).
+    attached: HashMap<TabId, String>,
+    /// The place each session asked for is titled after, by session id
+    /// ([`giverny_claude::names::place`]): none asked, or names
+    /// off, none.
+    places: HashMap<String, String>,
 }
 
 /// When one rate-limit window resets, out of a statusline push.
@@ -654,6 +827,50 @@ fn reset_time(window: &serde_json::Value) -> Option<jiff::Timestamp> {
     None
 }
 
+/// Which tab shows each background job, by the job's short id.
+///
+/// A claude parked on a job (`parked`, by tab) is a client of the daemon,
+/// and Claude Code's agents view switches it between jobs without saying so
+/// anywhere on disk: `parkedJobId` keeps naming the first. What does follow
+/// the switch is the tab's title, which Claude Code sets to the shown
+/// session's name. So: the one live job named as the title says, else the
+/// parked one; of several by that name, the parked one or else the most
+/// recently active. A placeholder (`placeholders`) is never the fallback: a
+/// tab whose title names no job shows none.
+pub fn jobs_on_screen(
+    parked: &HashMap<TabId, String>,
+    titles: &HashMap<TabId, String>,
+    jobs: &[Job],
+    placeholders: &HashSet<String>,
+) -> HashMap<String, TabId> {
+    let mut out = HashMap::new();
+    for (&tab, parked_on) in parked {
+        let title = titles.get(&tab).map(|t| bare_title(t)).unwrap_or_default();
+        let named: Vec<&Job> = jobs
+            .iter()
+            .filter(|j| j.live && !title.is_empty() && j.name == title)
+            .collect();
+        let shown = named
+            .iter()
+            .find(|j| &j.id == parked_on)
+            .or(named.first())
+            .map(|j| j.id.clone())
+            .or_else(|| (!placeholders.contains(parked_on)).then(|| parked_on.clone()));
+        if let Some(shown) = shown {
+            out.insert(shown, tab);
+        }
+    }
+    out
+}
+
+/// A tab title without the status glyph Claude Code puts before the
+/// session's name (`✳`, `◐`, a braille spinner).
+fn bare_title(title: &str) -> &str {
+    title
+        .trim_start_matches(|c: char| c.is_whitespace() || (!c.is_ascii() && !c.is_alphanumeric()))
+        .trim_end()
+}
+
 impl ClaudeWatch {
     pub fn new(
         spool: &Path,
@@ -679,8 +896,7 @@ impl ClaudeWatch {
             }
         };
 
-        let leave_accounts =
-            leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref());
+        let leave_accounts = side_instance();
         if leave_accounts {
             tracing::info!("{LEFT_ALONE}");
         } else {
@@ -689,10 +905,10 @@ impl ClaudeWatch {
             if let Err(err) = hooks::point_link() {
                 tracing::warn!("giverny link not pointed here: {err}");
             }
-            // Reads nothing from Giverny's config, so a config that does not
-            // parse is no reason to skip it.
-            Self::adopt_statusline_where_hooked(&profiles);
         }
+        // Reads nothing from Giverny's config, so a config that does not
+        // parse is no reason to skip it; a side instance skips it all.
+        Self::adopt_statusline_where_hooked(&profiles, leave_accounts);
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
@@ -701,6 +917,11 @@ impl ClaudeWatch {
             profiles,
             tabs: HashMap::new(),
             jobs: Vec::new(),
+            parked: HashMap::new(),
+            parked_by: HashMap::new(),
+            all_jobs: Vec::new(),
+            attached: HashMap::new(),
+            viewing: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
             relay_holder,
@@ -718,7 +939,17 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
+            // Beside the spool: Giverny's own state dir.
+            agents: ManagementLive::load(
+                spool
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("agents.json"),
+            ),
             leave_accounts,
+            feeds: giverny_claude::feed::feed_dir(),
+            place_sessions: None,
+            places: HashMap::new(),
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
@@ -729,6 +960,10 @@ impl ClaudeWatch {
             listening: Instant::now(),
             prompts_found: crossbeam_channel::unbounded(),
         };
+        // Before any tab is restored: a tab holding a running job's
+        // conversation attaches to the job, which takes knowing the jobs
+        // ([`ClaudeWatch::live_job_holding`]).
+        watch.all_jobs = jobs::scan(watch.profiles.iter().map(|p| p.config_dir.clone()));
         watch.refresh_usage();
         (watch, spooled)
     }
@@ -783,7 +1018,10 @@ impl ClaudeWatch {
     /// Profiles that already have our hooks get the live-usage statusline
     /// too: installing hooks is the consent boundary, and without this the
     /// usage panel silently shows day-old numbers.
-    fn adopt_statusline_where_hooked(profiles: &[Profile]) {
+    fn adopt_statusline_where_hooked(profiles: &[Profile], leave_accounts: bool) {
+        if leave_accounts {
+            return;
+        }
         for p in profiles {
             let settings = p.config_dir.join("settings.json");
             if !hooks::installed_in(&settings) {
@@ -826,6 +1064,50 @@ impl ClaudeWatch {
         raw.strip_prefix("giverny-")?.parse::<u64>().ok().map(TabId)
     }
 
+    /// The tab a message is for: the one it names, or the one showing the
+    /// background job it came from.
+    pub fn tab_of(&self, msg: &RelayMsg) -> Option<TabId> {
+        Self::tab_id_of(msg).or_else(|| self.viewing.get(msg.job.as_deref()?).copied())
+    }
+
+    /// The job each tab shows, by what runs in it: a claude parked on one
+    /// (`parkedJobId`), a `claude attach` (its argument resolved against
+    /// `jobs`, as Claude Code resolves it), or — for a tab opened from
+    /// BACKGROUND (`opened`, its `bg_job`) with no claude seen in it yet —
+    /// the job it was opened for. [`jobs_on_screen`] then follows the title.
+    fn jobs_by_tab(&self, opened: &HashMap<TabId, String>, jobs: &[Job]) -> HashMap<TabId, String> {
+        let mut on = self.parked.clone();
+        for (&tab, target) in &self.attached {
+            if let Some(job) = attach::resolve(target, jobs) {
+                on.insert(tab, job.id.clone());
+            }
+        }
+        for (&tab, job) in opened {
+            if !self.tabs.get(&tab).is_some_and(|t| t.seen_in_scan) {
+                on.entry(tab).or_insert_with(|| job.clone());
+            }
+        }
+        on
+    }
+
+    /// Does a tab show this background job — viewing it, or holding its
+    /// conversation? Then it is the tab's, not one more agent in the
+    /// background list.
+    ///
+    /// Only a tab with a claude in it now holds a conversation: one that
+    /// detached from the job keeps the id it last held, and the job is back
+    /// in the background.
+    fn shown_in_a_tab(&self, job: &Job) -> bool {
+        self.viewing.contains_key(&job.id)
+            || self.tabs.values().any(|tab| {
+                tab.has_claude()
+                    && tab.session_id.as_deref().is_some_and(|sid| {
+                        job.session_id.as_deref() == Some(sid)
+                            || job.resume_session_id.as_deref() == Some(sid)
+                    })
+            })
+    }
+
     fn account_of(&self, config_dir: Option<&Path>) -> Option<String> {
         let dir = config_dir?;
         profiles::find(&self.profiles, dir).map(|p| p.name.clone())
@@ -858,7 +1140,23 @@ impl ClaudeWatch {
             self.apply_statusline(msg);
             return;
         }
-        let Some(tab_id) = Self::tab_id_of(msg) else {
+        // Subagent-line ticks carry a tab's live workers, not its state.
+        if msg.hook_event() == Some(hooks::SUBAGENT_LINE_EVENT) {
+            if let Some(tab_id) = self.tab_of(msg) {
+                let config_dir = self.canonical_dir(msg.config_dir.as_deref());
+                self.agents.apply_live(tab_id, config_dir, &msg.event);
+            }
+            return;
+        }
+        // `giverny manage clear-done`: the tab's Done rows, cleared by hand.
+        if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
+            if let Some(tab_id) = self.tab_of(msg) {
+                let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
+                self.agents.clear_done(tab_id, at);
+            }
+            return;
+        }
+        let Some(tab_id) = self.tab_of(msg) else {
             return;
         };
         let config_dir = self.canonical_dir(msg.config_dir.as_deref());
@@ -870,6 +1168,21 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // The relay hooks run async, each its own process: a message can
+        // reach Giverny after one the session sent after it. One stamped
+        // before the newest of the session's own already applied is old
+        // news, and must not undo it — a turn's last tool call landing after
+        // its `Stop` re-opened the turn it closed. Only the
+        // session's own messages set the bar: its workers' run beside it.
+        let stale = msg
+            .emitted_at
+            .zip(entry.last_applied)
+            .is_some_and(|(at, last)| at < last);
+        if !msg.from_subagent()
+            && let Some(at) = msg.emitted_at
+        {
+            entry.last_applied = Some(entry.last_applied.map_or(at, |last| last.max(at)));
+        }
 
         match msg.hook_event() {
             // A compaction is the same session carrying on: the turn it
@@ -881,9 +1194,16 @@ impl ClaudeWatch {
                 if let Some(was) = entry.before_compact.take() {
                     entry.state = was;
                 }
+                entry.failed = false;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
+                );
+                self.agents.session_started(
+                    tab_id,
+                    Some("compact"),
+                    msg.session_id(),
+                    config_dir.clone(),
                 );
                 effects
                     .captured
@@ -891,23 +1211,39 @@ impl ClaudeWatch {
             }
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
-                entry.agents = false;
+                entry.failed = false;
+                entry.clear_agents();
+                entry.ended.clear();
                 entry.before_compact = None;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
+                );
+                self.agents.session_started(
+                    tab_id,
+                    msg.event.get("source").and_then(|v| v.as_str()),
+                    msg.session_id(),
+                    config_dir.clone(),
                 );
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
             }
             Some("UserPromptSubmit") => {
-                entry.state = ClaudeState::Busy;
-                // A compaction cancelled with Esc says nothing more.
-                entry.before_compact = None;
-                // A turn is running: whatever it leaves behind, its `Stop`
-                // says.
-                entry.agents = false;
+                if !stale {
+                    entry.state = ClaudeState::Busy;
+                    entry.failed = false;
+                    // A compaction cancelled with Esc says nothing more.
+                    entry.before_compact = None;
+                    // A turn is running: what it leaves behind without an
+                    // id, its `Stop` says.
+                    entry.agents_unnamed = false;
+                }
+                // A turn Claude Code starts to say a task ended.
+                for id in msg.prompt().map(hooks::ended_tasks).unwrap_or_default() {
+                    entry.agent_ended(id, msg.emitted_at);
+                }
+                entry.sync_agents();
                 // The hook fires for every turn, also the ones Claude Code or
                 // another agent sends (a finished background task, a
                 // subagent's hand-back, another session's message): those
@@ -929,29 +1265,60 @@ impl ClaudeWatch {
                     entry.cap_prompts();
                 }
             }
-            // A tool call is work happening now, whoever asked for it. It is
-            // what tells a tab apart from the turn that ended before it: a
-            // session carrying on after a permission was granted, or an agent
+            // A subagent's tool call says the subagent works, not the
+            // session: it arrives under the parent's `session_id` with its
+            // own `agent_id`. A session free at its prompt while its workers
+            // run stays free, with the wave its `Stop` gave it, and one
+            // mid-turn keeps its spinner anyway.
+            Some("PostToolUse") if msg.from_subagent() => {
+                if let Some(id) = msg.handed_back() {
+                    entry.agent_ended(id, msg.emitted_at);
+                } else if let Some(id) = msg.agent_id()
+                    && !stale
+                    && entry.state != ClaudeState::Busy
+                    && entry
+                        .ended
+                        .get(id)
+                        .is_none_or(|&end| msg.emitted_at.is_some_and(|at| at > end))
+                {
+                    // Working while the session is at its prompt: a
+                    // background worker, alive whatever the last `Stop`
+                    // listed.
+                    entry.ended.remove(id);
+                    entry.subagents.insert(id.to_string());
+                    entry.sync_agents();
+                }
+            }
+            // The session's own tool call is work happening now. It is what
+            // tells a tab apart from the turn that ended before it: a session
+            // carrying on after a permission was granted, or an agent
             // continuing by itself, emits nothing else.
-            // Except a subagent's once the turn has ended with it running:
-            // it arrives under this session with its `agent_id`, and is the
-            // delegated work the dots already show, not the session busy.
-            Some("PostToolUse") if entry.agents && msg.agent_id().is_some() => {}
             Some("PostToolUse") => {
-                entry.state = ClaudeState::Busy;
-                entry.agents = false;
+                if let Some(id) = msg.stopped_task() {
+                    entry.agent_ended(id, msg.emitted_at);
+                }
+                if !stale {
+                    entry.state = ClaudeState::Busy;
+                    entry.failed = false;
+                }
             }
             // A subagent compacting its own context is its work, as its
             // tool calls are.
-            Some("PreCompact") if msg.agent_id().is_some() => {}
+            Some("PreCompact") if msg.from_subagent() => {}
             // Compacting is work, and nothing else says so: `/compact` sends
             // no `UserPromptSubmit`.
+            Some("PreCompact") if stale => {}
             Some("PreCompact") => {
                 entry.before_compact.get_or_insert(entry.state);
                 entry.state = ClaudeState::Busy;
+                entry.failed = false;
             }
+            // A `Stop` older than what the session has said since ended a
+            // turn that is not the one running now.
+            Some("Stop") if stale => {}
             Some("Stop") => {
                 entry.before_compact = None;
+                entry.failed = false;
                 entry.state = if is_active {
                     ClaudeState::Idle
                 } else {
@@ -960,10 +1327,36 @@ impl ClaudeWatch {
                 // The turn is over; are its subagents? The hook says so
                 // exactly as the turn ends, where the registry's `busy`
                 // cannot yet tell them from the turn itself.
-                entry.agents = msg.delegated_work_running();
+                // What it lists runs; what it leaves out may be waiting on
+                // work of its own, and runs on until something says it ended.
+                let (ids, unnamed) = msg.delegated_ids();
+                for id in ids {
+                    entry.ended.remove(id);
+                    entry.subagents.insert(id.to_string());
+                }
+                entry.agents_unnamed = unnamed;
+                entry.sync_agents();
             }
+            // The turn ended on an API error, in place of its `Stop`:
+            // over all the same, unseen or not, and marked
+            // as failed. Its payload lists no background work, so what the
+            // last `Stop` left running is left as it is.
+            Some("StopFailure") if stale => {}
+            Some("StopFailure") => {
+                entry.before_compact = None;
+                entry.failed = true;
+                entry.state = if is_active {
+                    ClaudeState::Idle
+                } else {
+                    ClaudeState::DoneUnseen
+                };
+            }
+            Some("Notification") if stale => {}
             Some("Notification") => {
                 if let Some(kind) = msg.notification_type() {
+                    // Whoever asks — the session or one of its subagents —
+                    // the person owes it an answer, so a subagent's prompt
+                    // flags the tab too.
                     if needs_you(kind) {
                         entry.state = ClaudeState::NeedsYou;
                         effects.notify.push((
@@ -990,8 +1383,11 @@ impl ClaudeWatch {
                 }
             }
             Some("SessionEnd") => {
+                self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
-                entry.agents = false;
+                entry.failed = false;
+                entry.clear_agents();
+                entry.ended.clear();
                 entry.before_compact = None;
                 entry.set_session(None, &mut self.prompts_asked);
                 entry.session_name = None;
@@ -999,6 +1395,18 @@ impl ClaudeWatch {
             }
             _ => {}
         }
+        let what = msg.hook_event().unwrap_or("?");
+        trace(
+            tab_id,
+            &if stale {
+                format!("{what}(stale)")
+            } else {
+                what.to_string()
+            },
+            msg.emitted_at,
+            &trace_detail(msg),
+            entry,
+        );
     }
 
     /// Periodic merge: hook stream + registry scan + usage refresh.
@@ -1008,6 +1416,7 @@ impl ClaudeWatch {
         shell_pids: &HashMap<TabId, u32>,
         active: Option<TabId>,
         titles: &HashMap<TabId, String>,
+        opened: &HashMap<TabId, String>,
     ) -> WatchEffects {
         let mut effects = WatchEffects::default();
         self.remember_peaks();
@@ -1021,20 +1430,27 @@ impl ClaudeWatch {
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
         for msg in &msgs {
-            let title = Self::tab_id_of(msg)
+            let title = self
+                .tab_of(msg)
                 .and_then(|id| titles.get(&id).cloned())
                 .unwrap_or_else(|| "tab".into());
             self.handle_msg(msg, active, &title, &mut effects);
         }
         self.hooks_drained = drained;
+        // An empty title map is a workspace not built yet, not one with no
+        // tabs: keep every tracker until there is something to compare with.
+        if !titles.is_empty() {
+            self.agents.tick(|id| titles.contains_key(&id));
+        }
 
         self.apply_found_prompts();
 
         // Registry scan: baseline busy/idle + identity, ~1 Hz, off-thread.
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok(mut result) => {
                     self.scan_rx = None;
+                    self.places = std::mem::take(&mut result.places);
                     self.scanned = result;
                     let live = &self.scanned.live;
                     self.predate_hooks.retain(|(dir, pid)| {
@@ -1050,12 +1466,32 @@ impl ClaudeWatch {
         if self.scan_rx.is_none() && self.last_scan.elapsed() >= Duration::from_secs(1) {
             self.last_scan = Instant::now();
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+            let shells = shell_pids.clone();
+            // The places asked for, with each tab's live session (a tab's
+            // recorded one can lag a `/clear` by a hook): a few small reads,
+            // here rather than on every frame the rail is drawn.
+            let mut place_ids = self.place_sessions.clone().unwrap_or_default();
+            if self.place_sessions.is_some() {
+                place_ids.extend(self.tabs.values().filter_map(|t| t.session_id.clone()));
+                place_ids.sort();
+                place_ids.dedup();
+            }
+            let feeds = self.feeds.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             if std::thread::Builder::new()
                 .name("giverny session scan".into())
                 .spawn(move || {
                     let live = registry::scan(dirs);
-                    let _ = tx.send(ScanResult { live });
+                    let attached = shells
+                        .into_iter()
+                        .filter_map(|(tab, shell)| Some((tab, attach::under(shell)?)))
+                        .collect();
+                    let places = session_places(&feeds, &place_ids);
+                    let _ = tx.send(ScanResult {
+                        live,
+                        attached,
+                        places,
+                    });
                 })
                 .is_ok()
             {
@@ -1085,10 +1521,8 @@ impl ClaudeWatch {
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
             // Finished agents drop off: the list is what still wants
             // watching, not a record of everything that ever ran.
-            self.jobs = jobs::scan(dirs)
-                .into_iter()
-                .filter(|job| job.worth_watching())
-                .collect();
+            let jobs = jobs::scan(dirs);
+            self.apply_jobs(jobs, titles, opened, &mut effects);
         }
 
         // Re-read the caches when the file says so, when a refresh we asked
@@ -1107,6 +1541,92 @@ impl ClaudeWatch {
         }
 
         effects
+    }
+
+    /// Fold a jobs scan in: which tab shows which job, what those tabs
+    /// hold, and what is left for BACKGROUND.
+    fn apply_jobs(
+        &mut self,
+        jobs: Vec<Job>,
+        titles: &HashMap<TabId, String>,
+        opened: &HashMap<TabId, String>,
+        effects: &mut WatchEffects,
+    ) {
+        let on = self.jobs_by_tab(opened, &jobs);
+        let placeholders = self.placeholders(&jobs);
+        let before: HashSet<TabId> = self.viewing.values().copied().collect();
+        self.viewing = jobs_on_screen(&on, titles, &jobs, &placeholders);
+        // A tab that stopped showing a job, with no claude of its own in it
+        // now: its pane goes, as at a `SessionEnd`.
+        for tab in before {
+            if !self.viewing.values().any(|&t| t == tab)
+                && !self.tabs.get(&tab).is_some_and(ClaudeTab::has_claude)
+            {
+                self.agents.session_ended(tab);
+            }
+        }
+        // A tab showing a job holds the conversation the job holds now,
+        // whatever hooks it missed: its pane follows it, and a restart
+        // resumes it, which attaches to the job.
+        for job in &jobs {
+            let (Some(&tab), Some(sid)) = (self.viewing.get(&job.id), job.resume_target()) else {
+                continue;
+            };
+            self.agents.job_holds(
+                tab,
+                sid,
+                job.forked_from.as_deref(),
+                Some(job.config_dir.clone()),
+            );
+            let entry = self.tabs.entry(tab).or_default();
+            if entry.session_id.as_deref() != Some(sid) {
+                entry.set_session(Some(sid.to_string()), &mut self.prompts_asked);
+                effects
+                    .captured
+                    .push((tab, Some(sid.to_string()), Some(job.config_dir.clone())));
+            }
+        }
+        self.jobs = jobs
+            .iter()
+            .filter(|job| {
+                job.worth_watching() && !self.shown_in_a_tab(job) && !placeholders.contains(&job.id)
+            })
+            .cloned()
+            .collect();
+        self.all_jobs = jobs;
+    }
+
+    /// The jobs a tab's claude parked on only as a placeholder: untouched
+    /// (no name, no intent) and forked from that very claude's own session.
+    /// A `claude --resume` of a job's conversation does this — Claude Code
+    /// makes the client's fresh session a job, parks on it and shows the
+    /// other one — and the placeholder is neither an agent to list under
+    /// BACKGROUND nor what the tab shows.
+    fn placeholders(&self, jobs: &[Job]) -> HashSet<String> {
+        self.parked
+            .iter()
+            .filter_map(|(tab, id)| {
+                let job = jobs.iter().find(|j| &j.id == id)?;
+                let client = self.parked_by.get(tab)?;
+                (job.untouched && job.forked_from.as_deref() == Some(client.as_str()))
+                    .then(|| job.id.clone())
+            })
+            .collect()
+    }
+
+    /// The running background job whose conversation `session` is — the one
+    /// it holds now, or its own — from the last jobs scan.
+    pub fn live_job_holding(&self, session: &str) -> Option<&Job> {
+        self.all_jobs.iter().find(|j| {
+            j.live
+                && (j.resume_session_id.as_deref() == Some(session)
+                    || j.session_id.as_deref() == Some(session))
+        })
+    }
+
+    /// Job `id` as the last jobs scan found it, shown or not.
+    pub fn job(&self, id: &str) -> Option<&Job> {
+        self.all_jobs.iter().find(|j| j.id == id)
     }
 
     /// Fold the last scan into per-tab state.
@@ -1132,6 +1652,14 @@ impl ClaudeWatch {
             .iter()
             .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
             .collect();
+        self.parked.clear();
+        self.parked_by.clear();
+        self.attached = self.scanned.attached.clone();
+        for &tab in self.attached.keys() {
+            // A claude is there, showing a job: the job's hooks own its
+            // state, as a parked one's would.
+            self.tabs.entry(tab).or_default().seen_in_scan = true;
+        }
         // One session per tab. Two can sit under one tab's shell (a `claude`
         // started from a `!` command in another), and taking each in turn
         // switched the tab's session twice a scan: its prompts cleared and
@@ -1140,6 +1668,11 @@ impl ClaudeWatch {
         // one comes back when it ends.
         let mut shown: Vec<(TabId, registry::LiveSession)> = Vec::new();
         for live in self.scanned.live.clone() {
+            // A job's worker is the daemon's; the tab showing the job is
+            // found by its attach or its park, not by the conversation.
+            if live.entry.job_worker() {
+                continue;
+            }
             let Some(tab_id) = shell_pids
                 .iter()
                 .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
@@ -1164,6 +1697,10 @@ impl ClaudeWatch {
         let mut ask_prompts: Vec<(String, PathBuf, u64)> = Vec::new();
         {
             for (tab_id, live) in shown {
+                if let Some(job) = &live.entry.parked_job_id {
+                    self.parked.insert(tab_id, job.clone());
+                    self.parked_by.insert(tab_id, live.entry.session_id.clone());
+                }
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
                 entry.seen_in_scan = true;
@@ -1173,14 +1710,21 @@ impl ClaudeWatch {
                 // for sessions that started *after* they were installed —
                 // every older session would otherwise be lost on restart
                 // despite the registry naming it the whole time.
-                if entry.session_id.as_deref() != Some(live.entry.session_id.as_str()) {
-                    effects.captured.push((
-                        tab_id,
-                        Some(live.entry.session_id.clone()),
-                        Some(live.config_dir.clone()),
-                    ));
+                //
+                // Not for a claude parked on a background job: the id it
+                // registered is the conversation it handed over, and
+                // resuming that forks it into another job. The tab holds
+                // what the job it shows holds, set by the jobs pass.
+                if live.entry.parked_job_id.is_none() {
+                    if entry.session_id.as_deref() != Some(live.entry.session_id.as_str()) {
+                        effects.captured.push((
+                            tab_id,
+                            Some(live.entry.session_id.clone()),
+                            Some(live.config_dir.clone()),
+                        ));
+                    }
+                    entry.set_session(Some(live.entry.session_id.clone()), &mut self.prompts_asked);
                 }
-                entry.set_session(Some(live.entry.session_id.clone()), &mut self.prompts_asked);
                 entry.session_name = live.entry.name.clone();
 
                 if account.is_some() {
@@ -1214,12 +1758,31 @@ impl ClaudeWatch {
                 {
                     entry.state = ClaudeState::Idle;
                 }
-                // Delegated work the last `Stop` reported runs for as long as
-                // the registry says `busy`; the first scan that says
-                // otherwise is its end, and the dots go with it.
-                // A session without hooks never sets it: its
-                // `busy` is a spinner, as it cannot tell the two apart.
-                entry.agents &= hooks_own && live.entry.busy();
+                let had_agents = entry.agents;
+                // Plain `idle`, written after the last hook, is nothing
+                // running at all; `busy` and `shell` are not the end of it:
+                // a worker waiting on a background shell of its own makes the
+                // registry say `shell` while it lives. A
+                // session without hooks never sets it: its `busy` is a
+                // spinner, as it cannot tell the two apart.
+                let news = heard.is_none_or(|heard| {
+                    live.entry.status_updated_at == 0 || live.entry.status_updated_at > heard
+                });
+                if !hooks_own || (live.entry.status == "idle" && news) {
+                    entry.clear_agents();
+                }
+                if entry.state != was || entry.agents != had_agents {
+                    trace(
+                        tab_id,
+                        "scan",
+                        None,
+                        &format!(
+                            "registry={} updated_at={} heard={heard:?} was={was:?}",
+                            live.entry.status, live.entry.status_updated_at
+                        ),
+                        entry,
+                    );
+                }
                 // A session new to the tab has its earlier turns read back
                 // from the transcript, once: adopted mid-way, resumed after a
                 // restart, or resumed with a prompt on the command line
@@ -1240,14 +1803,17 @@ impl ClaudeWatch {
                 }
             }
             // Sessions gone from the registry: clear unless hooks spoke recently.
-            for tab in self.tabs.values_mut() {
+            for (&tab_id, tab) in self.tabs.iter_mut() {
                 let hook_recent = tab
                     .last_hook
                     .is_some_and(|t| t.elapsed() < Duration::from_secs(5));
                 if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
+                    if tab.state != ClaudeState::None || tab.agents {
+                        trace(tab_id, "gone", None, "not in the registry", tab);
+                    }
                     tab.state = ClaudeState::None;
                     tab.background = false;
-                    tab.agents = false;
+                    tab.clear_agents();
                     tab.session_name = None;
                     // The session is gone — its hook evidence goes with it, so
                     // a future claude (with or without hooks) starts fresh.
@@ -1677,6 +2243,91 @@ impl ClaudeWatch {
         }
     }
 
+    /// Follow the `claude.management_panel` setting in every account: on installs
+    /// `subagentStatusLine` (`giverny relay --subagent-line`), which feeds the
+    /// pane and hides Claude Code's own subagent panel; off removes it, and
+    /// Claude Code draws its panel natively again. Called at startup too, so
+    /// an account added since, or a moved binary, is brought in line. An
+    /// account with a `subagentStatusLine` of its own is left alone.
+    ///
+    /// Claude Code watches its settings files, so this reaches running
+    /// sessions without a restart.
+    ///
+    /// The same switch carries the `giverny` plugin: on, its
+    /// marketplace is written under `base` (Giverny's config dir) and each
+    /// account's `settings.json` gains the two keys that load it; off, the
+    /// keys go and so does the directory. Off Unix the plugin is always
+    /// off ([`giverny_claude::plugin::SUPPORTED`]). `skill` is
+    /// `management_panel.manage_skill`: off, the plugin is written without
+    /// its manage skill. `names` is `management_panel.ask_names`:
+    /// on (with the pane), `<feeds>/names/on` tells the
+    /// plugin's hooks to give each tab's session a name and the status line
+    /// to show it; off, neither. The plugin's hooks are the same
+    /// either way, as Claude Code loads them only when a claude starts.
+    ///
+    /// The setting is on by default, so it is not consent by itself: the
+    /// keys are written only into an account that already holds our hooks
+    /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
+    /// it is for the live-usage statusline. Every other account is left
+    /// byte-identical. Off removes only what is ours, wherever it is.
+    pub fn set_management_panel(&mut self, enable: bool, skill: bool, names: bool, base: &Path) {
+        if self.leave_accounts {
+            return;
+        }
+        match giverny_claude::names::set_on(&self.feeds, enable && names) {
+            Ok(true) => tracing::info!(
+                "session names {}",
+                if enable && names { "on" } else { "off" }
+            ),
+            Ok(false) => {}
+            Err(err) => tracing::warn!("session names switch not written: {err}"),
+        }
+        let dir = giverny_claude::plugin::marketplace_dir(base);
+        // Unix only: its launchers are shell scripts.
+        let plugin = enable && giverny_claude::plugin::SUPPORTED;
+        if plugin {
+            match giverny_claude::plugin::sync(
+                &dir,
+                &giverny_claude::plugin::exe_candidates(),
+                skill,
+            ) {
+                Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("giverny plugin not written: {err}"),
+            }
+        }
+        for p in &self.profiles {
+            let settings = p.config_dir.join("settings.json");
+            let enable = enable && hooks::partly_installed_in(&settings);
+            match hooks::set_subagent_line(&settings, enable) {
+                Ok(true) => tracing::info!(
+                    "subagentStatusLine {} for {}",
+                    if enable { "installed" } else { "removed" },
+                    p.name
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
+            }
+            let keys = enable && giverny_claude::plugin::SUPPORTED;
+            match giverny_claude::plugin::set_plugin(&settings, &dir, keys) {
+                Ok(true) => tracing::info!(
+                    "giverny plugin {} for {}",
+                    if keys { "enabled" } else { "removed" },
+                    p.name
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::info!("giverny plugin skipped for {}: {err}", p.name),
+            }
+        }
+        if !plugin {
+            match giverny_claude::plugin::remove_dir(&dir) {
+                Ok(true) => tracing::info!("giverny plugin removed from {}", dir.display()),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("giverny plugin dir not removed: {err}"),
+            }
+        }
+    }
+
     /// Do all profiles have the live-usage statusline?
     pub fn statusline_on(&self) -> bool {
         !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
@@ -1837,8 +2488,22 @@ impl ClaudeWatch {
         }
     }
 
+    /// `tab` was stopped from the rail: nothing of the Claude
+    /// that ran there is live any more, as for a tab restored after a
+    /// restart, and its pane's workers ended with it. The conversation it
+    /// resumes is the workspace's (`Tab::claude_session`), not this.
+    pub fn stopped(&mut self, tab: TabId) {
+        self.agents.stopped(tab);
+        self.tabs.remove(&tab);
+    }
+
     pub fn state_of(&self, tab: TabId) -> ClaudeState {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
+    }
+
+    /// Whether this tab's last turn ended on an API error.
+    pub fn turn_failed(&self, tab: TabId) -> bool {
+        self.tabs.get(&tab).is_some_and(|t| t.failed)
     }
 
     /// The prompt to pin above this tab: its last one, while Claude runs.
@@ -1940,6 +2605,11 @@ impl ClaudeWatch {
             profiles: Vec::new(),
             tabs: HashMap::new(),
             jobs: Vec::new(),
+            parked: HashMap::new(),
+            parked_by: HashMap::new(),
+            all_jobs: Vec::new(),
+            attached: HashMap::new(),
+            viewing: HashMap::new(),
             accounts: Vec::new(),
             hooks_installed: true,
             hook_rx: None,
@@ -1958,7 +2628,6 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: Vec::new(),
-            leave_accounts: false,
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
@@ -1971,6 +2640,16 @@ impl ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),
+            agents: ManagementLive::in_memory(),
+            leave_accounts: false,
+            // Never the real feeds: a test's switch is its own.
+            feeds: std::env::temp_dir().join(format!(
+                "giverny-watch-feeds-{}-{}",
+                std::process::id(),
+                jiff::Timestamp::now().as_nanosecond()
+            )),
+            place_sessions: None,
+            places: HashMap::new(),
         }
     }
 
@@ -2474,6 +3153,7 @@ mod tests {
                 entry: live,
                 config_dir: dir.clone(),
             }],
+            ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
         let read_back = |w: &mut ClaudeWatch| {
@@ -2535,6 +3215,7 @@ mod tests {
                     entry: live,
                     config_dir: dir.clone(),
                 }],
+                ..ScanResult::default()
             };
             feed(&mut w, &hook("SessionStart", ""), Some(TAB));
             feed(
@@ -2581,6 +3262,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         w.scanned = ScanResult {
             live: vec![live("s-1", 1), live("s-2", 2)],
+            ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
         w.merge_scan(&shells, None, &mut WatchEffects::default());
@@ -2652,6 +3334,7 @@ mod tests {
                 entry: live,
                 config_dir: dir.clone(),
             }],
+            ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
         w.merge_scan(&shells, None, &mut WatchEffects::default());
@@ -2794,11 +3477,11 @@ mod tests {
         );
     }
 
-    /// The race: a scan reads `busy` an instant before a background tab's
-    /// `Stop`, and is merged an instant after it. The tab keeps its tick,
-    /// and the `idle` Claude Code then writes changes nothing. Without that
-    /// `Stop` the same `idle` ends the turn, and in the tab you look at it
-    /// ends it seen.
+    /// A race: a scan reads `busy` an instant before a
+    /// background tab's `Stop`, and is merged an instant after it. The tab
+    /// keeps its tick, and the `idle` Claude Code then writes changes
+    /// nothing. Without that `Stop` the same `idle` ends the turn, and in
+    /// the tab you look at it ends it seen.
     #[test]
     fn a_stale_busy_does_not_reopen_a_finished_turn() {
         let mut w = ClaudeWatch::for_tests();
@@ -2810,8 +3493,9 @@ mod tests {
             w.scanned = ScanResult {
                 live: vec![registry::LiveSession {
                     entry: live,
-                    config_dir: PathBuf::from("/tmp/giverny-nowhere-stale-busy"),
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-443"),
                 }],
+                ..ScanResult::default()
             };
             w.merge_scan(&shells, active, &mut WatchEffects::default());
         };
@@ -2850,7 +3534,6 @@ mod tests {
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
         scan(&mut w, "idle", now_ms() + 1, Some(TAB));
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
-
         // A `/compact` in the background whose `idle` comes before its
         // `SessionStart`: the tab is given back as it was, not ticked.
         feed(&mut w, &hook("PreCompact", r#","trigger":"manual""#), None);
@@ -2901,9 +3584,9 @@ mod tests {
 
     /// A turn that ends with its subagents still at work leaves the agent
     /// free to talk while they run: Idle, and working in the background —
-    /// the rail's three dots — until the registry stops saying `busy`, which
-    /// is how Claude Code says the last of them is done. It was a hollow
-    /// ring for as long as its workers ran.
+    /// the rail's wave — until the registry stops saying `busy`, which is
+    /// how Claude Code says the last of them is done (a manager's tab
+    /// showed a hollow ring while its worker ran).
     #[test]
     fn subagents_outliving_the_turn_are_background_work_until_they_end() {
         let mut w = ClaudeWatch::for_tests();
@@ -2915,13 +3598,14 @@ mod tests {
             w.scanned = ScanResult {
                 live: vec![registry::LiveSession {
                     entry: live,
-                    config_dir: PathBuf::from("/tmp/giverny-nowhere-subagents"),
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-363"),
                 }],
+                ..ScanResult::default()
             };
             w.merge_scan(&shells, None, &mut WatchEffects::default());
         };
         let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
-        let dots = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
 
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
@@ -2932,18 +3616,7 @@ mod tests {
         feed(&mut w, &hook("Stop", agent), Some(TAB));
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
-        assert!(dots(&w), "Idle with its worker running: the dots");
-
-        // The worker's own tool calls come under this session, named by its
-        // `agent_id`: still the dots, not a spinner.
-        feed(
-            &mut w,
-            &hook("PostToolUse", r#","agent_id":"a1","tool_name":"Bash""#),
-            Some(TAB),
-        );
-        scan(&mut w, "busy");
-        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
-        assert!(dots(&w), "a worker's tool call keeps the dots");
+        assert!(waves(&w), "Idle with its worker running: the wave");
 
         // Asked something meanwhile, it is working again, workers or not:
         // the spinner, and the next `Stop` says what still runs.
@@ -2952,12 +3625,12 @@ mod tests {
         assert_eq!(w.state_of(TAB), ClaudeState::Busy);
         feed(&mut w, &hook("Stop", agent), Some(TAB));
         scan(&mut w, "busy");
-        assert!(dots(&w));
+        assert!(waves(&w));
 
         // The last worker is done: the registry's next word is `idle`.
         scan(&mut w, "idle");
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
-        assert!(!dots(&w), "nothing runs: the ring");
+        assert!(!waves(&w), "nothing runs: the ring");
 
         // A turn that leaves nothing behind is not mistaken for one that
         // did by a registry not yet rewritten at its end.
@@ -2969,14 +3642,17 @@ mod tests {
         );
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
-        assert!(!dots(&w));
+        assert!(!waves(&w));
 
-        // Workers done but a background shell left: still the dots, now
-        // the shell's.
+        // A background shell running: the wave, whoever's it is. It is no
+        // word that the worker ended: one waiting on a shell of its own
+        // makes the registry say `shell` while it lives.
         feed(&mut w, &hook("Stop", agent), Some(TAB));
         scan(&mut w, "shell");
-        assert!(!w.tabs[&TAB].agents);
-        assert!(dots(&w));
+        assert!(w.tabs[&TAB].agents, "the worker may be waiting on it");
+        assert!(waves(&w));
+        scan(&mut w, "idle");
+        assert!(!waves(&w));
 
         // In a tab you are not looking at, the turn stays unseen while its
         // workers keep the registry `busy`: that is not a new turn. The
@@ -2985,14 +3661,14 @@ mod tests {
         feed(&mut w, &hook("Stop", agent), None);
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
-        assert!(dots(&w));
+        assert!(waves(&w));
     }
 
     /// A turn that ends with work still running is not done: the tab waves
     /// for it, seen or unseen, and is left holding what the turn left —
     /// unseen, the tick; seen, the ring — once the last of it ends. Nothing
     /// on the way may drop an unseen turn to `Idle`, or the tick would never
-    /// show (a manager's tab ticked while its worker built).
+    /// show (the manager's tab ticked while its worker built).
     #[test]
     fn a_turn_whose_work_runs_on_waves_and_ticks_only_once_it_ends() {
         let me = std::process::id();
@@ -3003,8 +3679,9 @@ mod tests {
             w.scanned = ScanResult {
                 live: vec![registry::LiveSession {
                     entry: live,
-                    config_dir: PathBuf::from("/tmp/giverny-nowhere-unseen"),
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-381"),
                 }],
+                ..ScanResult::default()
             };
             w.merge_scan(&shells, None, &mut WatchEffects::default());
         };
@@ -3441,9 +4118,9 @@ mod tests {
         assert_eq!(shown(&w), 3.0);
     }
 
-    /// One account as an early reset found it: its cache, and what each of its
+    /// One account as a reset of the usage limit found it: its cache, and what each of its
     /// sessions' status lines relays, in Claude Code's own payload shape.
-    struct EarlyReset {
+    struct Reset347 {
         w: ClaudeWatch,
         now: jiff::Timestamp,
         /// The five-hour window before the reset, and the one after it.
@@ -3453,8 +4130,8 @@ mod tests {
         week: jiff::Timestamp,
     }
 
-    impl EarlyReset {
-        const DIR: &str = "/tmp/giverny-test-early-reset";
+    impl Reset347 {
+        const DIR: &str = "/tmp/giverny-test-347";
 
         /// `cache`: (5h %, 7d %, minutes since `/usage` fetched it), the 5h
         /// window being the pre-reset one.
@@ -3462,7 +4139,7 @@ mod tests {
             use giverny_claude::usage::AccountUsage;
             let now = jiff::Timestamp::now();
             let at = |mins: i64| jiff::Timestamp::from_second(now.as_second() + mins * 60).unwrap();
-            let mut t = EarlyReset {
+            let mut t = Reset347 {
                 w: ClaudeWatch::for_tests(),
                 now,
                 old_5h: at(40),
@@ -3550,7 +4227,7 @@ mod tests {
     #[test]
     fn an_early_reset_sticks_however_many_idle_sessions_remember_before() {
         // Before the reset: two sessions, the cache saying the same.
-        let mut t = EarlyReset::new(60, 99, 10);
+        let mut t = Reset347::new(60, 99, 10);
         let old = t.old_5h;
         for _ in 0..3 {
             t.push("idle", (60, old), 99);
@@ -3595,7 +4272,7 @@ mod tests {
     /// since the reset, is what says which are current.
     #[test]
     fn after_a_reset_a_fresh_cache_outweighs_sessions_of_unknown_age() {
-        let mut t = EarlyReset::new(0, 0, 0);
+        let mut t = Reset347::new(0, 0, 0);
         let (old, new) = (t.old_5h, t.new_5h);
         t.cache(2, new, 0, 1);
         // Ticks ran before the first push arrived.
@@ -3620,7 +4297,7 @@ mod tests {
         assert_eq!(seen.last(), Some(&(2.0, 3.0)));
     }
 
-    /// The mark's rules one reading at a time, on the numbers of that early reset.
+    /// The mark's rules one reading at a time, on the numbers of one real reading.
     #[test]
     fn a_window_mark_takes_what_is_newer_and_nothing_older() {
         let now = jiff::Timestamp::now();
@@ -3830,14 +4507,166 @@ mod tests {
         ));
     }
 
+    /// A side instance writes nothing into an account — not at
+    /// startup, not from the UI — while the same calls on the installed
+    /// instance do rewrite it (so this test would see a write).
     #[test]
-    fn a_side_instance_is_asked_for_explicitly() {
+    fn a_side_instance_leaves_the_account_alone() {
         use std::ffi::OsStr;
         assert!(!leaves_accounts_alone(None));
         assert!(!leaves_accounts_alone(Some(OsStr::new(""))));
         assert!(!leaves_accounts_alone(Some(OsStr::new("0"))));
         assert!(leaves_accounts_alone(Some(OsStr::new("1"))));
         assert!(leaves_accounts_alone(Some(OsStr::new("yes"))));
+
+        let root = std::env::temp_dir().join(format!(
+            "giverny-side-instance-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        let base = root.join("giverny");
+        std::fs::create_dir_all(account.join("plugins")).unwrap();
+        let settings = account.join("settings.json");
+        let known = account.join("plugins/known_marketplaces.json");
+        // Hooks that point at some other Giverny: exactly what a side
+        // instance would otherwise "refresh" to its own executable.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/elsewhere/giverny relay"}]}]},"statusLine":{"type":"command","command":"/elsewhere/giverny relay --statusline"},"extraKnownMarketplaces":{"giverny":{"source":{"source":"directory","path":"/elsewhere/plugin"}}},"enabledPlugins":{"giverny@giverny":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &known,
+            r#"{"giverny":{"source":{"source":"directory","path":"/elsewhere/plugin"}}}"#,
+        )
+        .unwrap();
+        let before = (
+            std::fs::read(&settings).unwrap(),
+            std::fs::read(&known).unwrap(),
+        );
+        let profile = Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        };
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![profile.clone()];
+        w.leave_accounts = true;
+        ClaudeWatch::adopt_statusline_where_hooked(&w.profiles, true);
+        assert!(w.install_hooks().is_err());
+        assert!(w.set_statusline(true).is_err());
+        assert!(w.set_statusline(false).is_err());
+        w.set_auto_mode(true);
+        w.ensure_auto_mode();
+        w.set_management_panel(true, true, false, &base);
+        w.set_management_panel(false, true, false, &base);
+        let after = (
+            std::fs::read(&settings).unwrap(),
+            std::fs::read(&known).unwrap(),
+        );
+        assert!(before == after, "a side instance rewrote the account");
+        assert!(!base.exists(), "a side instance wrote a plugin dir");
+
+        // The installed instance, same calls: the account does change.
+        w.leave_accounts = false;
+        w.set_management_panel(false, true, false, &base);
+        w.set_auto_mode(true);
+        assert_ne!(std::fs::read(&settings).unwrap(), before.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pane is on by default, so the setting alone is not consent: an
+    /// account without our hooks is left byte-identical, and one with them
+    /// gets the pane's keys, which go again when the pane goes off. Unix
+    /// only: elsewhere there is no plugin to write.
+    #[cfg(unix)]
+    #[test]
+    fn the_pane_writes_only_where_the_hooks_are() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-pane-consent-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let base = root.join("giverny");
+        let profile = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            Profile {
+                name: name.into(),
+                config_dir: dir,
+                email: None,
+                account_uuid: None,
+            }
+        };
+        let (plain, hooked) = (profile("plain"), profile("hooked"));
+        let plain_settings = plain.config_dir.join("settings.json");
+        let hooked_settings = hooked.config_dir.join("settings.json");
+        let text = "{\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&plain_settings, text).unwrap();
+        std::fs::write(&hooked_settings, text).unwrap();
+        hooks::install_into(&hooked_settings).unwrap();
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![plain.clone(), hooked.clone()];
+        w.leave_accounts = false;
+        w.set_management_panel(true, true, false, &base);
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(
+            !plain.config_dir.join("settings.json.giverny-bak").exists(),
+            "no backup for a write that never happened"
+        );
+        assert!(hooks::subagent_line_installed_in(&hooked_settings));
+        assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+        // Its launchers run without a permission prompt.
+        let allow = |settings: &Path| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(settings).unwrap()).unwrap()
+                ["permissions"]["allow"]
+                .clone()
+        };
+        assert_eq!(
+            allow(&hooked_settings),
+            serde_json::json!(giverny_claude::plugin::ALLOW_RULES)
+        );
+        let skill =
+            giverny_claude::plugin::marketplace_dir(&base).join(giverny_claude::plugin::SKILL_PATH);
+        assert!(skill.exists());
+
+        // The skill off: only the skill goes; the plugin and the pane's
+        // keys stay, and the plain account is still untouched.
+        w.set_management_panel(true, false, false, &base);
+        assert!(!skill.exists());
+        assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+        assert!(hooks::subagent_line_installed_in(&hooked_settings));
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        w.set_management_panel(true, true, false, &base);
+        assert!(skill.exists());
+        // Names: off by default; on with the pane, the switch
+        // file the status line reads is there, and it goes with the pane.
+        w.feeds = root.join("feeds");
+        let feeds = w.feeds.clone();
+        let on = || giverny_claude::names::is_on(&feeds);
+        assert!(!on());
+        w.set_management_panel(true, true, true, &base);
+        assert!(on());
+        w.set_management_panel(true, true, false, &base);
+        assert!(!on());
+        w.set_management_panel(true, true, true, &base);
+
+        w.set_management_panel(false, true, true, &base);
+        assert!(!on(), "no pane, no names");
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(!hooks::subagent_line_installed_in(&hooked_settings));
+        assert!(!giverny_claude::plugin::installed_in(&hooked_settings));
+        assert!(
+            allow(&hooked_settings).is_null(),
+            "the rules go with the pane"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn scratch_account(name: &str) -> (PathBuf, Profile) {
@@ -3854,25 +4683,6 @@ mod tests {
             account_uuid: None,
         };
         (dir, profile)
-    }
-
-    /// A side instance writes no account, whichever way it is asked to.
-    #[test]
-    fn a_side_instance_leaves_the_accounts_alone() {
-        let (dir, profile) = scratch_account("side");
-        let settings = dir.join("settings.json");
-        let before = r#"{"theme":"dark"}"#;
-        std::fs::write(&settings, before).unwrap();
-        let mut w = ClaudeWatch::for_tests();
-        w.profiles = vec![profile];
-        w.leave_accounts = true;
-
-        assert!(w.install_hooks().is_err());
-        assert!(w.set_statusline(true).is_err());
-        w.set_auto_mode(true);
-        w.ensure_auto_mode();
-        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Sessions running when hooks are first installed never loaded them:
@@ -3902,10 +4712,11 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(ScanResult {
             live: vec![live(12), live(13)],
+            ..ScanResult::default()
         })
         .unwrap();
         w.scan_rx = Some(rx);
-        w.tick(&HashMap::new(), None, &HashMap::new());
+        w.tick(&HashMap::new(), None, &HashMap::new(), &HashMap::new());
         assert_eq!(w.sessions_without_hooks(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

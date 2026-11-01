@@ -18,6 +18,161 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
     pub update: UpdateConfig,
+    pub manager: ManagerConfig,
+    pub management_panel: ManagementPanelConfig,
+}
+
+/// `[management_panel]`: the rest of Settings → Management panel. The pane's own
+/// switch stays `claude.management_panel` and the machine's budget
+/// `[manager.limits]`, where they always were. Every default is the
+/// behaviour from before these keys existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagementPanelConfig {
+    /// Ship the `/giverny:manage` skill in the plugin the pane
+    /// installs. Off, the plugin keeps its hook and `giverny-manage`; only
+    /// the skill goes.
+    pub manage_skill: bool,
+    /// Give every session in a Giverny tab a name at its start, and show
+    /// the full name on its status line. Off by default: no
+    /// session is named, managers included, and no name shows.
+    pub ask_names: bool,
+    /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
+    /// newest [`Self::done_last`]).
+    pub done_rows: String,
+    /// How many Done rows `done_rows = "last"` keeps.
+    pub done_last: u32,
+    /// One switch per pane column.
+    pub columns: PaneColumns,
+    /// What a task gets when nothing says otherwise.
+    pub lease: DefaultLease,
+}
+
+impl Default for ManagementPanelConfig {
+    fn default() -> Self {
+        ManagementPanelConfig {
+            manage_skill: true,
+            ask_names: false,
+            done_rows: "all".into(),
+            done_last: 5,
+            columns: PaneColumns::default(),
+            lease: DefaultLease::default(),
+        }
+    }
+}
+
+/// Which Done rows the management panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneRows {
+    All,
+    Hide,
+    /// The newest this many.
+    Last(usize),
+}
+
+impl ManagementPanelConfig {
+    /// `done_rows` and `done_last` as one value; an unknown word shows all.
+    pub fn done(&self) -> DoneRows {
+        match self.done_rows.trim().to_ascii_lowercase().as_str() {
+            "hide" | "none" => DoneRows::Hide,
+            "last" => DoneRows::Last(self.done_last as usize),
+            _ => DoneRows::All,
+        }
+    }
+}
+
+/// `[management_panel.columns]`: the pane's columns, every one on by default.
+/// A column switched off takes no width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneColumns {
+    pub stage: bool,
+    pub id: bool,
+    pub title: bool,
+    pub usage: bool,
+    pub elapsed: bool,
+    pub eta: bool,
+    pub now: bool,
+    pub tokens: bool,
+}
+
+impl Default for PaneColumns {
+    fn default() -> Self {
+        PaneColumns {
+            stage: true,
+            id: true,
+            title: true,
+            usage: true,
+            elapsed: true,
+            eta: true,
+            now: true,
+            tokens: true,
+        }
+    }
+}
+
+/// `[management_panel.lease]`: the RAM a task's lease holds when nothing
+/// says otherwise — what `giverny manage run` claims for a task that holds
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefaultLease {
+    /// Read so a file that has it still parses, and counts
+    /// for nothing: a lease reserves RAM only, CPU is shared and measured.
+    pub cpu_cores: u32,
+    pub ram: crate::limits::Mem,
+    /// Minutes a grant made on another session's ledger call waits for its
+    /// own manager to take it up (`claim`, `start` or `run`) before it
+    /// lapses and the queue moves past it.
+    pub uncollected_min: u64,
+}
+
+impl Default for DefaultLease {
+    fn default() -> Self {
+        DefaultLease {
+            cpu_cores: 3,
+            ram: crate::limits::Mem::gb(3),
+            uncollected_min: 10,
+        }
+    }
+}
+
+impl DefaultLease {
+    /// `[management_panel.lease]` from a `config.toml`'s text; the defaults when
+    /// the table is absent or does not read (a lease is never refused over
+    /// a typo elsewhere, nor over one here: the default stands in).
+    pub fn from_config_str(text: &str) -> DefaultLease {
+        let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+            return DefaultLease::default();
+        };
+        doc.get("management_panel")
+            .and_then(|a| a.get("lease"))
+            .and_then(|l| l.clone().try_into::<DefaultLease>().ok())
+            .map(|l| DefaultLease {
+                cpu_cores: l.cpu_cores.max(1),
+                ram: l.ram,
+                uncollected_min: l.uncollected_min.max(1),
+            })
+            .unwrap_or_default()
+    }
+
+    /// The default lease in Giverny's own `config.toml`.
+    pub fn load() -> DefaultLease {
+        std::fs::read_to_string(crate::limits::default_config_path())
+            .map(|t| DefaultLease::from_config_str(&t))
+            .unwrap_or_default()
+    }
+}
+
+/// `[manager]`: what manager sessions (`/giverny:manage`) on
+/// this machine share. Only the limits so far; `claude.management_panel`, shown
+/// beside them in the settings screen, stays under `[claude]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagerConfig {
+    /// `[manager.limits]`, read by the resource ledger on every claim
+    /// (`giverny_claude::resources`), so an edit applies to the next one.
+    pub limits: crate::limits::Limits,
 }
 
 /// Automatically discovered Codex integration. Authentication stays in Codex.
@@ -45,7 +200,7 @@ impl Default for CodexConfig {
 }
 
 /// How Claude Code itself is launched in a tab.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
     /// Start every session in auto mode, by setting `permissions.defaultMode`
@@ -56,6 +211,20 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
+    /// Show the tab's subagents in a table under the terminal. On by
+    /// default.
+    pub management_panel: bool,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        ClaudeConfig {
+            auto_mode: false,
+            skip_resume_summary: false,
+            resume_after_limit: false,
+            management_panel: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,16 +453,31 @@ pub struct RailConfig {
     /// pulse on one that wants you. Off, no spinner is drawn, the flag does
     /// not pulse, and the rail asks for no frames of its own.
     pub animate: bool,
+    /// Show each tab's CPU and memory at its row's right edge, and a
+    /// collapsed group's summed. Off, none is drawn and the title, sub-line
+    /// and group name take the room. The sampler runs either way.
+    pub tab_figures: bool,
+    /// Show the total line under the account bars: what Giverny runs now,
+    /// summed (`23% CPU  2.0G RAM`). The sampler runs either way.
+    pub total_line: bool,
     /// A working tab breathes a slow dot in its colour instead of spinning.
     /// With `animate` off the dot holds still, full.
     pub calm_busy: bool,
+    /// Title a Claude tab after its session's name, as a place: `Rotem's
+    /// Workshop`. Only while sessions are named
+    /// (`management_panel.ask_names`); Claude's own title moves to the
+    /// tab's hover, and a title you typed still wins.
+    pub place_titles: bool,
 }
 
 impl Default for RailConfig {
     fn default() -> Self {
         RailConfig {
             animate: true,
+            tab_figures: true,
+            total_line: true,
             calm_busy: true,
+            place_titles: false,
         }
     }
 }
@@ -743,7 +927,7 @@ mod tests {
     const ONE_BAD_VALUE: &str = "[font]\nsize = \"big\"\nfamily = \"Iosevka\"\n\
         [theme]\nname = \"ink\"\n\
         [behavior]\nscrollback_lines = 500\nnotifications = false\n\
-        [claude]\nresume_after_limit = false\nauto_mode = true\n";
+        [claude]\nmanagement_panel = false\nauto_mode = true\n";
 
     /// One value of the wrong type costs that value, not the file: every
     /// other key, in its section and in the others, still applies, and the
@@ -757,7 +941,7 @@ mod tests {
         assert_eq!(cfg.theme.name, "ink");
         assert_eq!(cfg.behavior.scrollback_lines, 500);
         assert!(!cfg.behavior.notifications);
-        assert!(!cfg.claude.resume_after_limit);
+        assert!(!cfg.claude.management_panel);
         assert!(cfg.claude.auto_mode);
         let names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, ["font.size"]);
@@ -782,21 +966,22 @@ mod tests {
         assert_eq!(reloaded.theme.name, "ink");
     }
 
-    /// A whole section of the wrong shape, and a bad value inside a table,
-    /// are each narrowed to what is wrong.
+    /// A whole section of the wrong shape, and a bad value deep in a nested
+    /// table, are each narrowed to what is wrong.
     #[test]
     fn bad_values_are_found_at_any_depth() {
         let text = "titles = 5\n[font]\nsize = 15.0\n\
-            [usage]\nrefresh_minutes = \"lots\"\n[update]\ncheck = false\n";
+            [manager.limits]\nram = \"lots\"\ncpu_cores = 3\n";
         let parsed = parse_over(text, &Config::default()).unwrap();
         let mut names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["titles", "usage.refresh_minutes"]);
+        assert_eq!(names, ["manager.limits.ram", "titles"]);
         assert_eq!(parsed.config.font.size, 15.0);
-        assert!(!parsed.config.update.check);
         assert_eq!(
-            parsed.config.usage.refresh_minutes,
-            UsageConfig::default().refresh_minutes
+            parsed.config.manager.limits.cpu_cores,
+            crate::limits::Limits::from_config_str("[manager.limits]\ncpu_cores = 3\n")
+                .unwrap()
+                .cpu_cores
         );
         assert!(parsed.config.titles.strip_host_prefix, "default kept");
     }
@@ -941,12 +1126,37 @@ mod tests {
     #[test]
     fn unknown_keys_keep_the_known_ones() {
         let (cfg, unknown) = parse(
-            "[claude]\nauto_mode = true\nfuture_key = 1\n[future_section]\nx = 2\n[font]\nsize = 20.0\n",
+            "[claude]\nauto_mode = true\nfuture_key = 1\n[manager]\nx = 2\n[font]\nsize = 20.0\n",
         )
         .unwrap();
         assert!(cfg.claude.auto_mode);
         assert_eq!(cfg.font.size, 20.0);
-        assert_eq!(unknown, ["claude.future_key", "future_section"]);
+        assert_eq!(unknown, ["claude.future_key", "manager.x"]);
+    }
+
+    #[test]
+    fn a_config_with_a_dropped_key_still_loads_whole() {
+        // A key this build no longer has (`claude.retired_switch`): a file
+        // that still sets it keeps every other setting, the old key just ignored.
+        let text = "[font]\nsize = 15.0\n[claude]\nauto_mode = true\nmanagement_panel = false\n\
+                    retired_switch = true\nresume_after_limit = true\n";
+        let (cfg, unknown) = parse(text).unwrap();
+        assert_eq!(unknown, ["claude.retired_switch"]);
+        assert_eq!(cfg.font.size, 15.0);
+        assert!(cfg.claude.auto_mode);
+        assert!(cfg.claude.resume_after_limit);
+        assert!(!cfg.claude.management_panel, "an explicit off stays off");
+        // The same through a live reload, over a running config.
+        let dir = scratch("dropped-key");
+        std::fs::write(config_path(&dir), text).unwrap();
+        let cfg = load_or(&dir, &Config::default());
+        assert_eq!(cfg.font.size, 15.0);
+        assert!(!cfg.claude.management_panel);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unset, the management panel is on.
+        let (cfg, _) = parse("[claude]\nauto_mode = true\n").unwrap();
+        assert!(cfg.claude.management_panel);
+        assert!(Config::default().claude.management_panel);
     }
 
     #[test]
@@ -963,13 +1173,13 @@ mod tests {
         // the file still applies.
         std::fs::write(
             config_path(&dir),
-            "[font]\nsize = \"big\"\n[claude]\nauto_mode = true\nresume_after_limit = false\n",
+            "[font]\nsize = \"big\"\n[claude]\nauto_mode = true\nmanagement_panel = false\n",
         )
         .unwrap();
         let kept = load_or(&dir, &prev);
         assert_eq!(kept.font.size, 31.0);
         assert!(kept.claude.auto_mode);
-        assert!(!kept.claude.resume_after_limit);
+        assert!(!kept.claude.management_panel);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use crate::config::{self, Config};
+use crate::limits::{self, Auto, GpuLimit, Mem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Section {
@@ -23,6 +24,7 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
+    ManagementPanel,
     Codex,
     Keys,
     Updates,
@@ -37,6 +39,7 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
+        Section::ManagementPanel,
         Section::Codex,
         Section::Keys,
         Section::Updates,
@@ -50,6 +53,7 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
+            Section::ManagementPanel => "management panel",
             Section::Codex => "codex",
             Section::Keys => "keys",
             Section::Updates => "updates",
@@ -91,6 +95,31 @@ pub enum Kind {
         /// `None` = empty by default; `Some` supplies a non-empty default.
         default: Option<fn() -> Vec<String>>,
     },
+    /// One of `[manager.limits]`: `"auto"` by default, else a figure.
+    /// Carried as [`Value::Text`] in the form the file holds — `"auto"`,
+    /// `"8"`, `"16G"`, or for GPUs a TOML array (`[]`,
+    /// `[{ index = 0, vram = "20G" }]`) — and written back as the TOML type
+    /// the ledger reads (an integer for cores, a string for RAM, an array
+    /// of tables for GPUs).
+    Limit {
+        field: LimitField,
+    },
+    /// One of `[management_panel.lease]`: a figure, never `auto`. Carried as
+    /// [`Value::Text`] (`"3"`, `"3G"`) and written back as the ledger reads
+    /// it: an integer for cores, a size string for RAM. `field` is
+    /// [`LimitField::Cores`] or [`LimitField::Ram`].
+    Lease {
+        field: LimitField,
+        default: &'static str,
+    },
+}
+
+/// Which of `[manager.limits]` a [`Kind::Limit`] row edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitField {
+    Cores,
+    Ram,
+    Gpus,
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +146,9 @@ impl SettingDef {
         self.key.split('.')
     }
 
+    /// Everything above the leaf: `font`, or `manager.limits`.
     pub fn table(&self) -> &str {
-        self.key.split('.').next().unwrap_or(self.key)
+        self.key.rsplit_once('.').map_or(self.key, |(t, _)| t)
     }
 
     pub fn leaf(&self) -> &str {
@@ -133,6 +163,8 @@ impl SettingDef {
             Kind::Text { default, .. } => Value::Text((*default).into()),
             Kind::Choice { default, .. } => Value::Text((*default).into()),
             Kind::StringList { default } => Value::List(default.map(|f| f()).unwrap_or_default()),
+            Kind::Limit { .. } => Value::Text("auto".into()),
+            Kind::Lease { default, .. } => Value::Text((*default).into()),
         }
     }
 }
@@ -325,7 +357,48 @@ pub const SETTINGS: &[SettingDef] = &[
             "One breath every three seconds, everywhere the spinner would be:",
             "tab rows, category headers, background agents. Still a different",
             "thing from the amber flag of a tab that wants you, in shape,",
-            "colour and pace.",
+            "colour and pace. With \"animate the rail\" off the dot holds",
+            "still, full.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.tab_figures",
+        label: "tab CPU/mem figures",
+        section: Section::Titles,
+        doc: "Each tab's CPU and memory in the rail, and a collapsed group's sum.",
+        note: &[
+            "Off, no row or group header draws figures, and the title,",
+            "sub-line and group name take the room they held. The status",
+            "line and the management panel still read them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.place_titles",
+        label: "name Claude tabs after their session",
+        section: Section::Titles,
+        doc: "Title a Claude tab after its session's name, as a place: Rotem's Workshop.",
+        note: &[
+            "Only for a session that has a name (management panel → name",
+            "every session); the room is drawn once per",
+            "session and kept across resumes. Claude's own title moves to",
+            "the tab's hover. A title you typed yourself still wins.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
+        key: "rail.total_line",
+        label: "total CPU/mem line",
+        section: Section::Appearance,
+        doc: "The summed CPU and memory line under the account bars.",
+        note: &[
+            "What Giverny runs now, summed: `23% CPU  2.0G RAM`. Off, the",
+            "bars end the rail's bottom panel. The status line and the",
+            "management panel still read the figures.",
         ],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -547,6 +620,28 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "claude.management_panel",
+        label: "management panel",
+        // Shown at the top of Management panel; the key stays under
+        // [claude], where it always was.
+        section: Section::ManagementPanel,
+        doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
+        note: &[
+            "Running and Done come from Claude Code's own files and need no",
+            "setup. On, in each account you installed Giverny's hooks in, it",
+            "adds a subagentStatusLine (giverny relay --subagent-line) and the",
+            "giverny Claude Code plugin to that account's settings.json, never",
+            "over a line of your own: /giverny:manage runs a team of",
+            "subagents and adds Planned rows, titles, ETAs and landings",
+            "(docs/management-panel.md). Off removes both again.",
+            "Done rows stay until /clear or a fresh claude in the tab. The",
+            "pane appears only in a tab whose session has spawned a",
+            "subagent; off, nothing is read or drawn.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "claude.resume_after_limit",
         label: "resume after a limit",
         section: Section::Claude,
@@ -577,6 +672,172 @@ pub const SETTINGS: &[SettingDef] = &[
             default: 10,
             min: 0,
             max: 1440,
+        },
+    },
+    SettingDef {
+        key: "management_panel.manage_skill",
+        label: "manage skill",
+        section: Section::ManagementPanel,
+        doc: "Ship the /giverny:manage skill with the plugin the management panel installs.",
+        note: &[
+            "Written only where the management panel's plugin is (accounts holding",
+            "Giverny's hooks, with claude.management_panel on). Off removes only the",
+            "skill: the plugin keeps giverny-manage, its hook and /giverny:clear-done.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.ask_names",
+        label: "name every session",
+        section: Section::ManagementPanel,
+        doc: "Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line.",
+        note: &[
+            "Giverny draws the first name; the surname is the tab's category",
+            "(else its repo): `Opus 5.5 (Rotem Giverny)`.",
+            "A session has it before its first turn; `giverny-manage name` reads",
+            "it back. Off, no session is named, managers included, and no name",
+            "shows on any status line.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    // The columns, in the order the management panel draws them: Settings shows
+    // their switches in this order, and the pane's test
+    // `the_settings_list_the_columns_in_the_panes_order` keeps the two in step.
+    // `management_panel.done_rows` / `done_last` have no row here; the pane still
+    // honours them when set by hand.
+    SettingDef {
+        key: "management_panel.columns.stage",
+        label: "stage",
+        section: Section::ManagementPanel,
+        doc: "STAGE: Running, Next up or Done.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.id",
+        label: "task id",
+        section: Section::ManagementPanel,
+        doc: "The task's id (a feed row's key, a subagent's name).",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.title",
+        label: "title",
+        section: Section::ManagementPanel,
+        doc: "The task's title, or a subagent's description: the column that takes the room left.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.elapsed",
+        label: "elapsed",
+        section: Section::ManagementPanel,
+        doc: "How long the row has worked: a stopwatch while it runs.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.eta",
+        label: "ETA",
+        section: Section::ManagementPanel,
+        doc: "Time left on a Running row, the estimate of a Next up one, how late or early a Done one landed.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.now",
+        label: "now",
+        section: Section::ManagementPanel,
+        doc: "What the row is doing now: its last tool call, a wait, a queue place.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.tokens",
+        label: "tokens",
+        section: Section::ManagementPanel,
+        doc: "The tokens the row has used.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "management_panel.columns.usage",
+        label: "CPU / RAM",
+        section: Section::ManagementPanel,
+        doc: "What the row uses: on a Running row, live CPU and memory of its `giverny manage run` commands, else of its worker's own processes; on a Done row, the measured memory peak.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    // No `management_panel.lease.cpu_cores` row: a lease
+    // reserves RAM only (CPU is shared and measured), so the key, still
+    // read where a file has it, counts for nothing.
+    SettingDef {
+        key: "management_panel.lease.ram",
+        label: "RAM",
+        section: Section::ManagementPanel,
+        doc: "Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`. A lease reserves RAM only: CPU is shared and measured.",
+        note: &[
+            "A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it.",
+            "What `giverny manage run` claims for a task that holds no lease;",
+            "it also sets the run's CARGO_BUILD_JOBS (a job a GiB).",
+        ],
+        needs_restart: false,
+        kind: Kind::Lease {
+            field: LimitField::Ram,
+            default: "3G",
+        },
+    },
+    SettingDef {
+        key: "manager.limits.cpu_cores",
+        label: "CPU cores",
+        section: Section::ManagementPanel,
+        doc: "The hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, a duty cycle on the busy commands). Cores are shared, never leased: a claim waits only while they are measured busy. auto = all but 2.",
+        note: &[
+            "The resource ledger (`giverny manage claim`) grants workers RAM",
+            "and GPUs out of these limits, across every manager on this",
+            "machine, and reads them on each claim: an edit applies to the",
+            "next one. A number, or \"auto\" (cores - 2, at least 1).",
+        ],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Cores,
+        },
+    },
+    SettingDef {
+        key: "manager.limits.ram",
+        label: "RAM",
+        section: Section::ManagementPanel,
+        doc: "Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, which kills the biggest command over it). auto = 70 %.",
+        note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Ram,
+        },
+    },
+    SettingDef {
+        key: "manager.limits.gpus",
+        label: "GPUs",
+        section: Section::ManagementPanel,
+        doc: "GPUs and VRAM manager sessions may use. auto = 90 % of each GPU's VRAM.",
+        note: &[
+            "GPUs are found with nvidia-smi; without it there are none. A list",
+            "like [{ index = 0, vram = \"20G\" }] names the GPUs and how much of",
+            "each; [] gives managers none.",
+        ],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Gpus,
         },
     },
     SettingDef {
@@ -612,6 +873,12 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
     for part in def.path() {
         node = node.get(part)?;
     }
+    if let Kind::Limit { field } = def.kind {
+        return limit_text(field, node).map(Value::Text);
+    }
+    if let Kind::Lease { field, .. } = def.kind {
+        return lease_text(field, node).map(Value::Text);
+    }
     Some(match (node, &def.kind) {
         (toml::Value::Boolean(b), _) => Value::Bool(*b),
         (toml::Value::Float(f), _) => Value::Float(*f),
@@ -628,6 +895,79 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
         ),
         _ => return None,
     })
+}
+
+/// A `[manager.limits]` value in the form [`Kind::Limit`] carries it:
+/// read with the ledger's own types, so the screen shows what the ledger
+/// would grant from.
+fn limit_text(field: LimitField, node: &toml::Value) -> Option<String> {
+    let node = node.clone();
+    Some(match field {
+        LimitField::Cores => match node.try_into::<Auto<u32>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(n) => n.to_string(),
+        },
+        LimitField::Ram => match node.try_into::<Auto<Mem>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(m) => limits::mem_text(m),
+        },
+        LimitField::Gpus => match node.try_into::<Auto<Vec<GpuLimit>>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(g) => limits::gpus_text(&g),
+        },
+    })
+}
+
+/// A `[management_panel.lease]` value in the form [`Kind::Lease`] carries it.
+fn lease_text(field: LimitField, node: &toml::Value) -> Option<String> {
+    let node = node.clone();
+    Some(match field {
+        LimitField::Ram => limits::mem_text(node.try_into::<Mem>().ok()?),
+        _ => node.try_into::<u32>().ok()?.to_string(),
+    })
+}
+
+/// A [`Kind::Lease`] value as the TOML the ledger reads; `None` when the
+/// text is not one.
+fn lease_toml(field: LimitField, text: &str) -> Option<toml_edit::Value> {
+    let t = text.trim();
+    match field {
+        LimitField::Ram => Mem::parse(t)
+            .filter(|m| m.0 > 0)
+            .map(|m| limits::mem_text(m).into()),
+        _ => t.parse::<i64>().ok().filter(|n| *n > 0).map(Into::into),
+    }
+}
+
+/// A [`Kind::Limit`] value as the TOML the ledger reads. `None` when the
+/// text is not one (the screen validates before it gets here).
+fn limit_toml(field: LimitField, text: &str) -> Option<toml_edit::Value> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Some("auto".into());
+    }
+    match field {
+        LimitField::Cores => t.parse::<i64>().ok().filter(|n| *n > 0).map(Into::into),
+        LimitField::Ram => Mem::parse(t).map(|m| limits::mem_text(m).into()),
+        LimitField::Gpus => {
+            let v: toml_edit::Value = t.parse().ok()?;
+            // Only what the ledger can read back.
+            let probe: toml::Value = toml::from_str(&format!("g = {t}")).ok()?;
+            probe.get("g")?.clone().try_into::<Vec<GpuLimit>>().ok()?;
+            Some(v)
+        }
+    }
+}
+
+/// The TOML for `value` as option `def` stores it.
+fn encode(def: &SettingDef, value: &Value) -> anyhow::Result<toml_edit::Value> {
+    match (&def.kind, value) {
+        (Kind::Limit { field }, Value::Text(t)) => limit_toml(*field, t)
+            .ok_or_else(|| anyhow::anyhow!("{}: `{t}` is not a limit", def.key)),
+        (Kind::Lease { field, .. }, Value::Text(t)) => lease_toml(*field, t)
+            .ok_or_else(|| anyhow::anyhow!("{}: `{t}` is not a lease", def.key)),
+        _ => Ok(toml_edit_value(value)),
+    }
 }
 
 /// Is this option still at its default?
@@ -672,10 +1012,13 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     // Walk (creating) the tables above the leaf.
     let mut node = doc.as_table_mut();
     let parts: Vec<&str> = def.path().collect();
-    for part in &parts[..parts.len() - 1] {
+    let parents = parts.len() - 1;
+    for (i, part) in parts[..parents].iter().enumerate() {
         if !node.contains_key(part) {
             let mut table = toml_edit::Table::new();
-            table.set_implicit(false);
+            // `[manager.limits]` alone, not an empty `[manager]`
+            // above it.
+            table.set_implicit(i + 1 < parents);
             node.insert(part, toml_edit::Item::Table(table));
         }
         node = node
@@ -685,6 +1028,7 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     }
 
     let leaf = parts[parts.len() - 1];
+    let encoded = encode(def, value)?;
     match node.get_mut(leaf) {
         Some(item) => {
             let slot = item.as_value_mut().ok_or_else(|| {
@@ -694,11 +1038,11 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
             // `size = 11.0  # deliberately small`. Replacing the value alone
             // would take the user's note with it.
             let decor = slot.decor().clone();
-            *slot = toml_edit_value(value);
+            *slot = encoded;
             *slot.decor_mut() = decor;
         }
         None => {
-            node.insert(leaf, toml_edit::Item::Value(toml_edit_value(value)));
+            node.insert(leaf, toml_edit::Item::Value(encoded));
         }
     }
 
@@ -717,6 +1061,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 fn render_value(value: &Value) -> String {
     toml_edit_value(value).to_string().trim().to_string()
+}
+
+/// The default as the file holds it: a lease's cores as an integer, not
+/// the text the screen carries.
+fn render_default(def: &SettingDef) -> String {
+    let default = def.default_value();
+    encode(def, &default)
+        .map(|v| v.to_string().trim().to_string())
+        .unwrap_or_else(|_| render_value(&default))
 }
 
 /// The commented `config.toml` written on first run, generated from the table
@@ -757,7 +1110,7 @@ pub fn template() -> String {
                     render_value(&example)
                 ));
             }
-            _ => out.push_str(&format!("{} = {}\n", def.leaf(), render_value(&default))),
+            _ => out.push_str(&format!("{} = {}\n", def.leaf(), render_default(def))),
         }
     }
     out
@@ -778,7 +1131,7 @@ pub fn markdown() -> String {
     for def in SETTINGS {
         let default = match def.default_value() {
             Value::List(items) if items.len() > 6 => format!("{} programs", items.len()),
-            other => format!("`{}`", render_value(&other)),
+            _ => format!("`{}`", render_default(def)),
         };
         let mut doc = def.doc.replace('|', "\\|");
         if let Kind::Choice { options, .. } = &def.kind {
@@ -826,6 +1179,16 @@ mod tests {
         );
         assert_eq!(parsed.usage.refresh_minutes, defaults.usage.refresh_minutes);
         assert_eq!(parsed.update.check, defaults.update.check);
+        assert_eq!(parsed.manager, defaults.manager);
+        assert_eq!(parsed.management_panel, defaults.management_panel);
+        assert!(
+            text.contains("\n[management_panel.lease]\n") && !text.contains("\ncpu_cores = 3\n"),
+            "the lease is RAM only:\n{text}"
+        );
+        assert!(
+            text.contains("\n[manager.limits]\n"),
+            "limits get their own table:\n{text}"
+        );
     }
 
     #[test]
@@ -895,7 +1258,10 @@ mod tests {
     }
 
     /// The rail's two motion options sit with the title glyph toggle in tabs
-    /// & titles, right after it, though their keys stay in `[rail]`.
+    /// & titles, right after it, though their keys stay in `[rail]`; the
+    /// tab CPU/mem figures, drawn on the tab rows too, follow them.
+    /// The total line is under the account bars, not on a
+    /// tab, and stays in appearance.
     #[test]
     fn rail_motion_options_follow_the_title_glyph() {
         let titles: Vec<&str> = in_section(Section::Titles).map(|d| d.key).collect();
@@ -904,8 +1270,19 @@ mod tests {
             .position(|k| *k == "titles.strip_claude_glyph")
             .expect("glyph toggle is in tabs & titles");
         assert_eq!(
-            titles[glyph + 1..glyph + 3],
-            ["rail.animate", "rail.calm_busy"]
+            titles[glyph + 1..glyph + 4],
+            ["rail.animate", "rail.calm_busy", "rail.tab_figures"]
+        );
+        // Tabs titled after their session's place, next to the figures,
+        // off unless asked for: upstream's rail unchanged.
+        assert_eq!(titles.get(glyph + 4), Some(&"rail.place_titles"));
+        assert!(matches!(
+            by_key("rail.place_titles").unwrap().kind,
+            Kind::Bool { default: false }
+        ));
+        assert_eq!(
+            by_key("rail.total_line").unwrap().section,
+            Section::Appearance
         );
     }
 
@@ -1008,6 +1385,22 @@ mod tests {
         let cfg: Config =
             toml::from_str(&std::fs::read_to_string(config::config_path(&dir)).unwrap()).unwrap();
         assert_eq!(cfg.usage.refresh_minutes, 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_limit_written_into_a_file_without_the_table_gets_only_that_table() {
+        let dir = scratch("limits-new");
+        std::fs::write(config::config_path(&dir), "[font]\nsize = 13.0\n").unwrap();
+        write(
+            &dir,
+            by_key("manager.limits.cpu_cores").unwrap(),
+            &Value::Text("4".into()),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(config::config_path(&dir)).unwrap();
+        assert!(!text.contains("[manager]\n"), "{text}");
+        assert!(text.contains("[manager.limits]\ncpu_cores = 4"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

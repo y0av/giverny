@@ -1,5 +1,5 @@
-//! Overlay windows: the fuzzy tab palette (Ctrl+Shift+P) and the past-session
-//! picker (right-click a tab → sessions…).
+//! Overlay windows: the fuzzy tab palette (Ctrl+Shift+P), the past-session
+//! picker (right-click a tab → sessions…), and the stop's confirm.
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, RichText};
 use giverny_claude::registry::PastSession;
@@ -90,7 +90,7 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 .as_deref()
                 .map(|p| giverny_core::short_path(p, 28))
                 .unwrap_or_default();
-            let title = t.display_title(&app.cfg.titles);
+            let title = app.shown_title(t);
             let label = format!("{cat} › {title}   {cwd}");
             fuzzy_score(&st.query, &label).map(|s| {
                 // Matched as written, drawn as read.
@@ -262,6 +262,103 @@ fn humanize(d: std::time::Duration) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
+}
+
+/// The stop's confirm, while one is asked: what would die,
+/// one line each, and `stop` / `cancel`. Enter stops (the button has the
+/// keyboard); Esc or a click beside it cancels.
+pub fn stop_confirm_ui(app: &App, ctx: &egui::Context) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let Some(asked) = &app.stop_confirm else {
+        return actions;
+    };
+    let c = app.chrome;
+    // Read here, as the palette reads its keys: a focused button's own
+    // Enter did not reach it in a real window.
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+        actions.push(Action::ConfirmStop(true));
+    }
+    let shown = egui::Modal::new(egui::Id::new("stop-confirm"))
+        .frame(
+            egui::Frame::popup(&ctx.global_style())
+                .fill(c.panel)
+                .inner_margin(14.0),
+        )
+        .show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(RichText::new("stopping ends").color(c.fg));
+            ui.add_space(4.0);
+            for line in &asked.lines {
+                ui.label(RichText::new(format!("· {line}")).monospace().color(c.fg));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let stop = ui.button("stop");
+                let cancel = ui.button("cancel");
+                let mine = ui
+                    .ctx()
+                    .memory(|m| m.focused())
+                    .is_some_and(|f| f == stop.id || f == cancel.id);
+                if !mine {
+                    stop.request_focus();
+                }
+                if stop.clicked() {
+                    actions.push(Action::ConfirmStop(true));
+                }
+                if cancel.clicked() {
+                    actions.push(Action::ConfirmStop(false));
+                }
+            });
+        });
+    if actions.is_empty() && shown.should_close() {
+        actions.push(Action::ConfirmStop(false));
+    }
+    actions
+}
+
+/// Copy-on-select for egui's own labels, the terminal's
+/// behaviour: when a drag that began in `rect` ends with label text
+/// selected, the frame gets a `Copy` event, so the labels drawn after this
+/// call put their selection on the clipboard as the pointer comes up. Call
+/// after the terminal has read the frame's input and before the labels.
+/// `key` names the surface; its press origin is kept under it.
+pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
+    let (pressed_at, released, dragging) = ctx.input(|i| {
+        (
+            i.pointer
+                .primary_pressed()
+                .then(|| i.pointer.press_origin())
+                .flatten(),
+            i.pointer.primary_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+    let id = key.with("copy-on-release");
+    if let Some(p) = pressed_at {
+        ctx.data_mut(|d| d.insert_temp(id, p));
+    }
+    if !released {
+        return;
+    }
+    let origin: Option<egui::Pos2> = ctx.data_mut(|d| d.remove_temp(id));
+    let selected = ctx
+        .plugin_opt::<egui::text_selection::LabelSelectionState>()
+        .is_some_and(|p| p.lock().has_selection());
+    if dragging && selected && origin.is_some_and(|o| rect.contains(o)) {
+        ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+    }
+}
+
+/// The Review line a clicked row's header shows: a Done row's `review`
+/// text from the feed (what `giverny manage land --review` writes), trimmed.
+/// Nothing for any other row, or for a blank line; nothing is looked up
+/// anywhere else.
+pub fn review_line(stage: giverny_claude::feed::Stage, review: Option<&str>) -> Option<String> {
+    (stage == giverny_claude::feed::Stage::Done)
+        .then_some(review?)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
 }
 
 #[cfg(test)]

@@ -133,6 +133,20 @@ if [ -n "$__giverny_hf" ]; then
         PROMPT_COMMAND='${__giverny_hf:+__giverny_history}'
     fi
 fi
+# Tell the tab where each command starts and how it ended, which bash sends
+# no terminal by itself (OSC 133 C, and D with the exit code): C as the
+# command runs (PS0), D first thing at the next prompt, ahead of the rest of
+# PROMPT_COMMAND so it reads the command's own $?, which it hands on. Both
+# go where bash writes its prompts.
+__giverny_mark_done() {
+    local s=$?
+    builtin printf '\e]133;D;%s\a' "$s" >&2
+    return "$s"
+}
+if [ -n "$__giverny_hf" ]; then
+    PS0+='${__giverny_hf:+\e]133;C\a}'
+    PROMPT_COMMAND='${__giverny_hf:+__giverny_mark_done}'$'\n'"$PROMPT_COMMAND"
+fi
 "#;
 
 /// zsh's `.zshenv` under the `ZDOTDIR` Giverny starts it with: put the
@@ -336,7 +350,9 @@ mod tests {
     /// Run `shell` interactively, steered, with `HOME` at `home` and nothing
     /// else of this process's environment, feeding it `input`.
     #[cfg(unix)]
-    fn run_steered(shell: &Path, steer: &Steer, home: &Path, input: &str) {
+    /// What the shell wrote to its stderr, where an interactive shell puts
+    /// its prompts.
+    fn run_steered(shell: &Path, steer: &Steer, home: &Path, input: &str) -> String {
         use std::io::Write;
         let mut cmd = std::process::Command::new(shell);
         cmd.args(&steer.args)
@@ -347,15 +363,16 @@ mod tests {
             .envs(steer.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         child
             .stdin
-            .as_mut()
+            .take()
             .unwrap()
             .write_all(input.as_bytes())
             .unwrap();
-        let _ = child.wait();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
     /// The history variables in an `env` dump.

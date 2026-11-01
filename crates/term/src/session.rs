@@ -179,6 +179,19 @@ impl TermSession {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Tell the program the terminal is one column narrower (`narrow`), or
+    /// its real size again, without touching the grid. A
+    /// width change is what makes Claude Code run its `subagentStatusLine`
+    /// at once rather than on its five-second tick; the grid is left alone
+    /// because the program repaints it when the real width comes back.
+    pub fn nudge_width(&self, narrow: bool) {
+        let mut size = self.size;
+        if narrow {
+            size.cols = size.cols.saturating_sub(1).max(2);
+        }
+        let _ = self.sender.send(Msg::Resize(size.into()));
+    }
+
     pub fn size(&self) -> GridSize {
         self.size
     }
@@ -319,6 +332,45 @@ impl TermSession {
             for col in 0..grid.columns() {
                 let point = Point::new(Line(line as i32), Column(col));
                 row.push(grid[point].c);
+            }
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The live screen row the cursor is on, while the program shows it
+    /// (`DECTCEM`); `None` while it is hidden. Claude Code shows it only
+    /// while its prompt has the keyboard, which is how a walk tells the
+    /// prompt's focus from the strip's or a footer pill's.
+    pub fn cursor_row(&self) -> Option<usize> {
+        let term = self.term.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) {
+            return None;
+        }
+        usize::try_from(term.grid().cursor.point.line.0).ok()
+    }
+
+    /// [`Session::screen_text`] with every dim cell blanked: what a program
+    /// drew at full strength. A prompt's placeholder is drawn dim, so this is
+    /// how "the prompt has a draft in it" is told from "the prompt shows its
+    /// hint" (the management panel's attach, `agent_open`).
+    pub fn screen_text_undimmed(&self) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let mut out = String::new();
+        for line in 0..grid.screen_lines() {
+            let mut row = String::new();
+            for col in 0..grid.columns() {
+                let cell = &grid[Point::new(Line(line as i32), Column(col))];
+                row.push(if cell.flags.contains(Flags::DIM) {
+                    ' '
+                } else {
+                    cell.c
+                });
             }
             out.push_str(row.trim_end());
             out.push('\n');

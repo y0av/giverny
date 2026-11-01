@@ -10,7 +10,10 @@ use giverny_core::tabs::{CategoryId, TabId};
 use giverny_term::render::bidi::egui_line;
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
+use crate::job_end::Ending;
 use crate::{Action, App, RenameTarget};
+use giverny_claude::jobs::End;
+use giverny_claude::use_reading::Use;
 
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
@@ -29,7 +32,7 @@ const ANIM_STEP: f64 = giverny_term::pace::STEP_FOCUSED.as_secs_f64();
 /// The animation clock, snapped to whole steps: every glyph drawn in one
 /// frame is on the same step, and a repaint that happens for some other
 /// reason (terminal output, the pointer) does not nudge them in between.
-fn anim_time() -> f64 {
+pub(crate) fn anim_time() -> f64 {
     giverny_term::pace::anim_time()
 }
 
@@ -37,7 +40,7 @@ fn anim_time() -> f64 {
 /// a frame by [`show`]. Off, no spinner, ring or pulse is drawn at all (their
 /// place stays blank, so nothing beside them moves), and nothing here asks
 /// for a frame.
-fn animating(ui: &Ui) -> bool {
+pub(crate) fn animating(ui: &Ui) -> bool {
     ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(ANIMATE_ID)))
         .unwrap_or(true)
@@ -48,7 +51,7 @@ const ANIMATE_ID: &str = "rail-animate";
 /// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
 /// but only while it is on screen. A row scrolled out of the rail, or a
 /// spinner nobody can see, costs nothing.
-fn keep_animating(ui: &Ui, rect: Rect) {
+pub(crate) fn keep_animating(ui: &Ui, rect: Rect) {
     if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
@@ -98,8 +101,6 @@ fn keep_spinning(ui: &Ui, rect: Rect) {
         .request_repaint_after(giverny_term::pace::until_next_spin(focused, predicted_dt));
 }
 
-/// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
-/// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
 /// One breath every two seconds, from 0.3 to 1, sampled at the animation
 /// step: how something that is waiting on the user asks for them.
 fn breath(time: f64) -> f32 {
@@ -124,14 +125,15 @@ impl BusyMark {
     }
 }
 
-/// One calm breath, in seconds.
-const CALM_PERIOD: f64 = 3.0;
+/// One calm breath, in seconds ([`calm_breath`]): out and back in. The
+/// management panel's newly done rows breathe on it too.
+pub(crate) const CALM_PERIOD: f64 = 3.0;
 
 /// How far in the calm mark's breath is, 0 out to 1 in: one slow breath
 /// every three seconds, against the amber flag's two (see [`breath`]), so
 /// "working" and "wants you" never fall into step. `None` is a rail that
 /// does not move: the dot holds still, full.
-fn calm_breath(time: Option<f64>) -> f32 {
+pub(crate) fn calm_breath(time: Option<f64>) -> f32 {
     match time {
         Some(t) => (0.5 - 0.5 * (t * std::f64::consts::TAU / CALM_PERIOD).cos()) as f32,
         None => 1.0,
@@ -166,8 +168,8 @@ const RING_R: f32 = 4.0;
 
 /// The small filled dot's radius: Claude idle at its prompt in the
 /// category's colour, and a restored Claude tab not started yet in gray.
-/// A touch bigger than it was (2.5) so it reads as round beside the small
-/// square at a glance, still well inside the ring.
+/// A touch bigger than it was (2.5) so it reads as round
+/// beside the small square at a glance, still well inside the ring.
 const DOT_R: f32 = 3.0;
 
 /// The open ring's stroke, from [`RING_R`] outwards.
@@ -175,16 +177,16 @@ const RING_STROKE: f32 = 1.4;
 
 /// The hollow square a running command's square breathes out to, across,
 /// and holds at with `rail.animate` off: about as big to the eye as
-/// Claude's ring at the top of its breath (was 7.0, which looked small
-/// beside it). A square reads larger than a circle as wide, so it stays
-/// narrower than the ring's outer edge.
+/// Claude's ring at the top of its breath (was 7.0, which
+/// looked small beside it). A square reads larger than a circle as wide,
+/// so it stays narrower than the ring's outer edge.
 const SQUARE_SIDE: f32 = 9.5;
 
 /// The small filled square, across: a shell at its prompt in the
 /// category's colour, as idle Claude is the small dot; a restored shell tab
 /// not started yet, in gray; and the size a running command's square
-/// breathes in to. Was 4.0; a little bigger so it reads as square beside
-/// the dot ([`DOT_R`]), still well inside [`SQUARE_SIDE`].
+/// breathes in to. Was 4.0; a little bigger so it reads as
+/// square beside the dot ([`DOT_R`]), still well inside [`SQUARE_SIDE`].
 const SMALL_SQUARE: f32 = 5.0;
 
 /// How many sides [`annulus`] gives its circles: rounder than the 16 egui
@@ -269,12 +271,13 @@ fn annulus_ink(r: f32, outer: f32, inner: f32, px: f32) -> f32 {
     edge.min(hole).clamp(0.0, 1.0)
 }
 
-/// Claude's calm busy mark (`rail.calm_busy`): its idle dot breathing out to
-/// the open ring and back. At `breath` 0 it is the idle dot ([`DOT_R`],
-/// filled); as it breathes out its edge grows to the ring's and a hole opens
-/// in its middle, until at 1 it is the hollow ring of [`RING_R`], as with
-/// `rail.animate` off. It is one shape throughout, its edge and its hole
-/// moving together, so it morphs and never jumps between filled and stroked.
+/// Claude's calm busy mark (`rail.calm_busy`): its idle dot breathing out
+/// to the open ring and back. At `breath` 0 it
+/// is the idle dot ([`DOT_R`], filled); as it breathes out its edge grows
+/// to the ring's and a hole opens in its middle, until at 1 it is the
+/// hollow ring of [`RING_R`], as with `rail.animate` off. It is one shape
+/// throughout, its edge and its hole moving together, so it morphs and
+/// never jumps between filled and stroked.
 fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     let breath = breath.clamp(0.0, 1.0);
     let outer = DOT_R + (RING_R + RING_STROKE - DOT_R) * breath;
@@ -282,9 +285,10 @@ fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     annulus(p, at, outer, inner, color);
 }
 
-/// A shell running a command: its prompt's small filled square
-/// ([`SMALL_SQUARE`]) breathing out to the hollow square ([`SQUARE_SIDE`])
-/// and back, on the calm mark's slow breath, as Claude's busy dot breathes to its ring
+/// A shell running a command: its prompt's
+/// small filled square ([`SMALL_SQUARE`]) breathing out to the hollow
+/// square ([`SQUARE_SIDE`]) and back, on the calm
+/// mark's slow breath, as Claude's busy dot breathes to its ring
 /// ([`calm_ring`]). Its edge grows and a hole opens in its middle together,
 /// so it morphs and never jumps between filled and hollow. Kept moving on
 /// the animation clock while `rect` is on screen; with `rail.animate` off
@@ -358,6 +362,8 @@ fn shell_dots(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) 
 /// still read as the tab's colour and not as gray.
 const WAVE_REST: f32 = 0.35;
 
+/// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
+/// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
 fn braille(turns: f64) -> String {
     let step = if giverny_term::pace::cheap_frames() {
         (turns * SPINNER.len() as f64) as usize
@@ -373,6 +379,9 @@ fn braille(turns: f64) -> String {
 struct RowData {
     id: TabId,
     title: String,
+    /// What the pointer on the row says: Claude's own title, when the row
+    /// is titled after its session's place instead.
+    hover: Option<String>,
     sub: String,
     active: bool,
     exited: bool,
@@ -380,15 +389,15 @@ struct RowData {
     /// none until it is first focused.
     started: bool,
     /// Started, it comes back as Claude: it recorded a conversation to
-    /// resume, or a `claude --resume` it was last running (what
-    /// `queue_resume` acts on). What tells a not-started Claude tab from a
-    /// not-started shell.
+    /// resume, a `claude --resume` it was last running, or a background
+    /// job it attaches to (what `queue_resume` acts on). What tells a
+    /// not-started Claude tab from a not-started shell.
     resumes_claude: bool,
     color: Color32,
     claude: ClaudeState,
     /// Something Claude started still works — a background shell, or
-    /// subagents it handed work to — while Claude itself waits at its
-    /// prompt, free to talk.
+    /// subagents it handed work to — while Claude itself waits
+    /// at its prompt, free to talk.
     background: bool,
     /// A plain shell with a command in front: seen by the foreground poll,
     /// or between the shell's OSC 133 `C` and `D`.
@@ -397,6 +406,14 @@ struct RowData {
     /// not looked since: a Claude turn, or a shell's command.
     /// Outlives Claude's `DoneUnseen`, which a new turn replaces.
     unseen: bool,
+    /// That unseen finish failed: a turn that died on an API error, a
+    /// command that exited non-zero. The tick is a ✕ then,
+    /// alone or as the badge, by the same rules.
+    failed: bool,
+    /// Its shell's CPU and memory now, with everything under it (Claude
+    /// Code or not), from the reading the sidebar shows;
+    /// `None` for a tab with no shell running.
+    used: Option<Use>,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -422,10 +439,35 @@ struct GroupData {
     count: usize,
     busy: usize,
     needs: usize,
+    /// Its tabs' readings summed, drawn on its header while it is
+    /// collapsed; `None` when none of them has one.
+    used: Option<Use>,
     /// A tab in it shows the tick, alone or as a badge: something finished
     /// there while you were elsewhere.
     unseen: bool,
+    /// Every one of those finishes failed: the header's tick is a ✕.
+    /// One tick among them and the header ticks.
+    failed: bool,
     rows: Vec<RowData>,
+}
+
+/// The place a tab is titled after, when it is one: with
+/// `rail.place_titles` `on`, no title typed on the tab (`custom`, which
+/// always wins), and a place found for the session it holds (`live`, the
+/// claude running there now, else `recorded`, the one it resumes) among
+/// `places` ([`giverny_claude::names::place`]: none while names are off or
+/// the session is unnamed). Else none, and the tab keeps Claude's title.
+pub(crate) fn place_title<'a>(
+    on: bool,
+    custom: Option<&str>,
+    live: Option<&str>,
+    recorded: Option<&str>,
+    places: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    if !on || custom.is_some_and(|c| !c.is_empty()) {
+        return None;
+    }
+    places.get(live.or(recorded)?).map(String::as_str)
 }
 
 /// One tab's row.
@@ -493,14 +535,21 @@ fn row_data(
             format!("{sub} · Codex")
         };
     }
+    let own = t.display_title(&app.cfg.titles);
+    let (title, hover) = match app.tab_place(t) {
+        Some(place) => (place.to_string(), Some(own)),
+        None => (own, None),
+    };
     RowData {
         id: t.id,
-        title: t.display_title(&app.cfg.titles),
+        title,
+        hover,
         sub,
         active: app.ws.active == Some(t.id),
         exited: t.exited,
         started: app.rt.contains_key(&t.id),
         resumes_claude: t.claude_session.is_some()
+            || t.bg_job.is_some()
             || t.agent_session.is_some()
             || t.foreground
                 .as_deref()
@@ -510,8 +559,20 @@ fn row_data(
         claude: app.agent_state(t.id),
         background: ct.is_some_and(|c| c.working_in_background()),
         running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
-        unseen: app.unseen_done.contains(&t.id)
+        unseen: app.unseen_done.contains_key(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
+        failed: match app.unseen_done.get(&t.id) {
+            Some(&failed) => failed,
+            None => app.claude.turn_failed(t.id),
+        },
+        // Off (`rail.tab_figures`), a row has no figures, so
+        // nothing reserves room for them and no group sums them.
+        used: app
+            .rt
+            .get(&t.id)
+            .filter(|_| app.cfg.rail.tab_figures)
+            .and_then(|rt| rt.session.as_ref()?.child_pid)
+            .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
     }
 }
 
@@ -519,12 +580,12 @@ fn row_data(
 ///
 /// Working is every tab whose mark says something runs — the agent itself
 /// ([`Mark::Busy`]), what it left humming at its prompt ([`Mark::Wave`]:
-/// subagents, a background shell, seen or unseen), or a plain shell running a
-/// command ([`Mark::Running`]). Counting only the busy state let the header's
-/// breathing dot go still while a tab still showed the wave; it should stop
-/// only once nothing in the group runs, collapsed or not. A tab not started
-/// this run has nothing running, whatever state lingers for it, so it is not
-/// counted.
+/// subagents, a background shell, seen or unseen), or a plain shell running
+/// a command ([`Mark::Running`]). Counting only the busy
+/// state let the header's breathing dot go still while a tab still showed
+/// the wave; it should stop only once nothing in the group
+/// runs, collapsed or not. A tab not started this run has nothing running,
+/// whatever state lingers for it, so it is not counted.
 fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     (
         rows.len(),
@@ -537,15 +598,46 @@ fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     )
 }
 
+/// What a group's tabs use together: the sum of each figure,
+/// a GPU one where any tab has it; `None` when no tab has a reading.
+fn summed<'a>(uses: impl IntoIterator<Item = &'a Use>) -> Option<Use> {
+    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+    uses.into_iter().fold(None, |sum: Option<Use>, u| {
+        let Some(s) = sum else { return Some(*u) };
+        Some(Use {
+            cpu_pct: s.cpu_pct + u.cpu_pct,
+            mem_mb: s.mem_mb + u.mem_mb,
+            gpu_mb: add(s.gpu_mb, u.gpu_mb),
+            gpu_pct: add(s.gpu_pct.map(u64::from), u.gpu_pct.map(u64::from))
+                .map(|p| p.min(100) as u32),
+        })
+    })
+}
+
 /// Whether a group has a finish you have not seen: a row wearing the tick,
 /// alone ([`Mark::Tick`]) or beside what runs after it ([`Mark::badged`]).
 /// Asked of the rows' marks, so the header ticks exactly when a row under
 /// it does — not for a tab not started this run, nor an exited shell.
 fn ticks(rows: &[RowData]) -> bool {
-    rows.iter().any(|r| {
-        let mark = Mark::of(r);
-        mark == Mark::Tick || mark.badged(r)
-    })
+    rows.iter().any(shows_finish)
+}
+
+/// Whether a group's tick is a ✕: every row under it that
+/// wears an unseen finish wears the ✕. One tick among them wins: good news
+/// under the header is not hidden behind bad.
+fn fails(rows: &[RowData]) -> bool {
+    let mut shown = rows.iter().filter(|r| shows_finish(r)).peekable();
+    shown.peek().is_some() && shown.all(|r| r.failed)
+}
+
+/// Whether `row` wears its unseen finish, the tick or the ✕, alone or as
+/// a badge.
+fn shows_finish(row: &RowData) -> bool {
+    let mark = Mark::of(row);
+    mark == Mark::Tick || mark.badged(row)
 }
 
 /// A repository always gets the same colour, whichever order the groups come
@@ -574,6 +666,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                 let rows: Vec<RowData> = app
                     .ws
                     .tabs_in(c.id)
+                    .filter(|t| t.bg_job.is_none())
                     .map(|t| row_data(app, t, color, None))
                     .collect();
                 let (count, busy, needs) = tallies(&rows);
@@ -587,7 +680,9 @@ fn groups(app: &App) -> Vec<GroupData> {
                     count,
                     busy,
                     needs,
+                    used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                     unseen: ticks(&rows),
+                    failed: fails(&rows),
                     rows,
                 }
             })
@@ -597,7 +692,7 @@ fn groups(app: &App) -> Vec<GroupData> {
             // order: by name, with the tabs that are in no repository last —
             // they are the leftovers, not a place.
             let mut keys: Vec<Option<PathBuf>> = Vec::new();
-            for t in &app.ws.tabs {
+            for t in app.ws.tabs.iter().filter(|t| t.bg_job.is_none()) {
                 if !keys.contains(&t.git_repo) {
                     keys.push(t.git_repo.clone());
                 }
@@ -618,7 +713,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         .ws
                         .tabs
                         .iter()
-                        .filter(|t| t.git_repo == key)
+                        .filter(|t| t.bg_job.is_none() && t.git_repo == key)
                         .map(|t| row_data(app, t, color, key.as_deref()))
                         .collect();
                     let (count, busy, needs) = tallies(&rows);
@@ -641,7 +736,9 @@ fn groups(app: &App) -> Vec<GroupData> {
                         count,
                         busy,
                         needs,
+                        used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                         unseen: ticks(&rows),
+                        failed: fails(&rows),
                         rows,
                     }
                 })
@@ -671,15 +768,24 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let fg = app.chrome.fg;
 
     // Bottom section first (panel-inside-panel): hooks banner + usage meters.
-    egui::Panel::bottom("rail-bottom")
+    let bottom = egui::Panel::bottom("rail-bottom")
         .resizable(false)
         .show_separator_line(true)
         .show(ui, |ui| {
             wslg_banner(app, ui, &mut actions);
             update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
-            usage_panel(app, ui, dim, &mut actions);
+            usage_panel(app, ui, dim, &mut actions)
         });
+    // The line over the load row: the one the panel draws over itself,
+    // with the same painter, stroke and span.
+    if let Some(y) = bottom.inner {
+        ui.painter().hline(
+            bottom.response.rect.x_range(),
+            y,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
 
     view_switch(app, ui, &mut actions);
 
@@ -744,8 +850,8 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                 ui.add_space(6.0);
             }
             // One more header's height, in the categories' own rhythm: the
-            // next category, not yet named. A repository group is not made
-            // by hand, so the repos view has none.
+            // next category, not yet named. A repository group
+            // is not made by hand, so the repos view has none.
             if arrangeable {
                 new_category_row(app, ui, &mut actions);
             }
@@ -866,20 +972,64 @@ fn view_switch(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     ui.add_space(2.0);
 }
 
+const STOP_TIP: &str =
+    "stop this agent: `claude stop` — its conversation is kept, `claude attach` brings it back";
+
+/// The menu items that end a background job, for its BACKGROUND row and
+/// for the tab opened on it: stop, and delete behind a confirm.
+fn end_job_items(ui: &mut Ui, id: &str, stopping: bool, actions: &mut Vec<Action>) {
+    ui.separator();
+    if ui
+        .add_enabled(!stopping, egui::Button::new("stop agent"))
+        .on_hover_text(STOP_TIP)
+        .clicked()
+    {
+        actions.push(Action::EndJob(id.to_string(), End::Stop));
+        ui.close();
+    }
+    ui.add_enabled_ui(!stopping, |ui| {
+        ui.menu_button("delete agent…", |ui| {
+            ui.label("`claude rm`: deletes the agent and\nits worktree. It cannot be undone.");
+            if ui.button("delete").clicked() {
+                actions.push(Action::EndJob(id.to_string(), End::Delete));
+                ui.close();
+            }
+        });
+    });
+}
+
 /// Background agents, above the categories. Same grammar as tabs — spinner
 /// while working, flag when it wants you — because it is the same question.
-fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+///
+/// An agent opened from here keeps its place: its tab is drawn here, as its
+/// row, a tab like any other (selected, closed, dragged into a category to
+/// keep), instead of turning up under a category.
+fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
     use giverny_claude::jobs::JobState;
-    if app.claude.jobs.is_empty() {
-        return;
-    }
     let c = app.chrome;
-    let needs: usize = app
+    let tabs: Vec<RowData> = app
+        .ws
+        .tabs
+        .iter()
+        .filter(|t| t.bg_job.is_some())
+        .map(|t| row_data(app, t, c.accent, None))
+        .collect();
+    let opened = |id: &str| app.ws.tabs.iter().any(|t| t.bg_job.as_deref() == Some(id));
+    let jobs: Vec<giverny_claude::jobs::Job> = app
         .claude
         .jobs
         .iter()
-        .filter(|j| j.state.needs_you())
-        .count();
+        .filter(|j| !opened(&j.id) && !app.job_ends.hides(&j.id))
+        .cloned()
+        .collect();
+    if tabs.is_empty() && jobs.is_empty() {
+        return;
+    }
+    let needs: usize = jobs.iter().filter(|j| j.state.needs_you()).count()
+        + tabs
+            .iter()
+            .filter(|r| r.claude == ClaudeState::NeedsYou)
+            .count();
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -890,7 +1040,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .color(dim),
         );
         ui.label(
-            egui::RichText::new(format!("{}", app.claude.jobs.len()))
+            egui::RichText::new(format!("{}", tabs.len() + jobs.len()))
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
@@ -904,10 +1054,15 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         }
     });
 
+    for row in &tabs {
+        tab_row(app, ui, row, fg, dim, actions);
+    }
     let turns = spin_turns(ui);
     let animate = animating(ui);
     let mark = BusyMark::of(&app.cfg.rail);
-    for job in &app.claude.jobs {
+    for job in &jobs {
+        let ending = app.job_ends.get(&job.id).cloned();
+        let stopping = matches!(ending, Some(Ending::Running(_)));
         let working = job.live && job.state == JobState::Working;
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
@@ -921,18 +1076,25 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
             }
             JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
-            // The section's colour, as its working and finished marks are:
-            // the tab rows' flags no longer wear amber either.
+            // The section's colour, the one its tab rows wear, so a job's
+            // flag and tick match the tabs' beside it.
             JobState::Blocked => ("⚑".into(), c.accent),
             JobState::Done => ("✓".into(), c.accent),
             JobState::Unknown => ("·".into(), dim),
         };
+        // The whole row is the button: its text is not selectable, or each
+        // label takes the click for itself and only the gaps between the
+        // letters reach the row.
         let resp = ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.add_space(8.0);
-            let glyph = ui.label(
-                egui::RichText::new(glyph)
-                    .font(FontId::monospace(11.0))
-                    .color(color),
+            let glyph = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(glyph)
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                )
+                .selectable(false),
             );
             if working && mark == BusyMark::Breath {
                 calm_ring(
@@ -943,10 +1105,13 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 );
             }
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(egui_line(&truncate_chars(&job.name, 22), None))
-                        .font(FontId::monospace(11.5))
-                        .color(if job.live { fg } else { dim }),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(egui_line(&truncate_chars(&job.name, 22), None))
+                            .font(FontId::monospace(11.5))
+                            .color(if job.live { fg } else { dim }),
+                    )
+                    .selectable(false),
                 );
                 let mut sub = match job.state {
                     JobState::Working if job.live && job.tasks > 0 => {
@@ -968,11 +1133,29 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                         format!("{sub} · {detail}")
                     };
                 }
+                // Ending it outranks whatever it was doing.
+                let mut sub_color = dim;
+                match &ending {
+                    Some(Ending::Running(how)) => {
+                        sub = match how {
+                            End::Stop => "stopping…".into(),
+                            End::Delete => "deleting…".into(),
+                        };
+                    }
+                    Some(Ending::Failed(how, _)) => {
+                        sub = format!("{} failed", how.verb());
+                        sub_color = c.amber;
+                    }
+                    _ => {}
+                }
                 if !sub.is_empty() {
-                    ui.label(
-                        egui::RichText::new(egui_line(&truncate_chars(&sub, 30), None))
-                            .font(FontId::monospace(9.5))
-                            .color(dim),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(egui_line(&truncate_chars(&sub, 30), None))
+                                .font(FontId::monospace(9.5))
+                                .color(sub_color),
+                        )
+                        .selectable(false),
                     );
                 }
             });
@@ -983,23 +1166,66 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 BusyMark::Breath => keep_animating(ui, resp.response.rect),
             }
         }
+        let rect = resp.response.rect;
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        let hover = match job.resume_target() {
-            Some(_) => "open a tab attached to this agent",
-            None => "no conversation recorded for this agent",
+        let hover = if job.live {
+            "open a tab attached to this agent"
+        } else {
+            "this agent is not running"
         };
-        let resp = resp.on_hover_text(format!(
+        let mut tip = format!(
             "{}\n{}",
             job.cwd
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             hover
-        ));
-        if resp.clicked() && job.resume_target().is_some() {
+        );
+        if let Some(Ending::Failed(how, said)) = &ending {
+            tip.push_str(&format!("\n\n{} failed: {said}", how.verb()));
+        }
+        let resp = resp.on_hover_text(tip);
+        // Stop on hover, where a tab has its close. Drawn
+        // after the row, so it is the one the click lands on.
+        if !stopping && ui.rect_contains_pointer(rect) {
+            let close_rect = Rect::from_min_size(
+                Pos2::new(rect.max.x - 24.0, rect.min.y + 2.0),
+                Vec2::splat(18.0),
+            );
+            let close = ui
+                .interact(
+                    close_rect,
+                    ui.id().with(("job-stop", job.id.as_str())),
+                    Sense::click(),
+                )
+                .on_hover_text(STOP_TIP);
+            ui.painter().text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::monospace(13.0),
+                if close.hovered() {
+                    Color32::from_rgb(0xd9, 0x7f, 0x70)
+                } else {
+                    dim
+                },
+            );
+            if close.clicked() {
+                actions.push(Action::EndJob(job.id.clone(), End::Stop));
+                continue;
+            }
+        }
+        resp.context_menu(|ui| {
+            if job.live && ui.button("open").clicked() {
+                actions.push(Action::AttachJob(Box::new(job.clone())));
+                ui.close();
+            }
+            end_job_items(ui, &job.id, stopping, actions);
+        });
+        if resp.clicked() && job.live {
             actions.push(Action::AttachJob(Box::new(job.clone())));
         }
     }
@@ -1078,6 +1304,17 @@ fn category_header(
             });
             ui.close();
         }
+        // Every started tab here, kept for next time.
+        let started: Vec<TabId> = cat
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .filter(|&id| app.stoppable(id))
+            .collect();
+        if !started.is_empty() && ui.button("stop all").clicked() {
+            actions.push(Action::StopTabs(started));
+            ui.close();
+        }
         let Some(id) = as_category else { return };
         ui.menu_button("account", |ui| {
             if ui.button("(inherit)").clicked() {
@@ -1119,21 +1356,41 @@ fn category_header(
         FontId::monospace(10.0),
         cat.color,
     );
+    // A collapsed group's tabs' use, summed, at the right edge as on a tab
+    // row. While the pointer is on the header the "+" takes
+    // the corner, as a tab's close button does, and the sum steps left of
+    // it rather than hiding. Its counts sit left of where it
+    // goes then, so nothing else moves on hover.
+    let hovered = ui.rect_contains_pointer(rect);
+    let used = cat.used.filter(|_| cat.collapsed);
+    let badge_x = match &used {
+        Some(u) => {
+            let y = rect.center().y;
+            let right = if hovered {
+                rect.max.x - 26.0
+            } else {
+                rect.max.x - 8.0
+            };
+            readout(&p, right, [y - 6.0, y + 6.0], u, c);
+            rect.max.x - 26.0 - readout_width(u) - 4.0
+        }
+        None => rect.max.x - 26.0,
+    };
     // The working dot breathes, so the header asks for frames while it shows
     // (a collapsed group draws no tab rows that would).
     if cat.busy > 0 && cat.needs == 0 {
         keep_animating(ui, rect);
     }
     let breath = calm_breath(animating(ui).then(anim_time));
-    let name_end = header_badges(&p, rect.center().y, rect.max.x - 26.0, cat, dim, breath);
-    // The name, cut to what fits before them (the rail is monospace), right
-    // after the fold triangle: no dot between them, the name's own colour is
-    // the category's.
+    let name_end = header_badges(&p, rect.center().y, badge_x, cat, dim, breath);
+    // The name, cut to what fits before them (the rail is monospace).
     let name_font = FontId::monospace(11.5);
     let char_w = ui
         .ctx()
         .fonts_mut(|f| f.glyph_width(&name_font, 'M'))
         .max(1.0);
+    // Right after the fold triangle: no dot between them, the
+    // name's own colour is the category's.
     let name_x = rect.min.x + 20.0;
     let char_budget = ((name_end - 6.0 - name_x) / char_w).max(4.0) as usize;
     p.text(
@@ -1154,13 +1411,15 @@ fn category_header(
         ui.id().with(("cat-plus", &cat.name, cat.category.0)),
         Sense::click(),
     );
-    p.text(
-        plus_rect.center(),
-        Align2::CENTER_CENTER,
-        "+",
-        FontId::monospace(13.0),
-        if plus.hovered() { cat.color } else { dim },
-    );
+    if used.is_none() || hovered {
+        p.text(
+            plus_rect.center(),
+            Align2::CENTER_CENTER,
+            "+",
+            FontId::monospace(13.0),
+            if plus.hovered() { cat.color } else { dim },
+        );
+    }
     // Dragging a header reorders categories; a repository group is where its
     // tabs are and cannot be moved by hand.
     if let Some(id) = as_category {
@@ -1210,8 +1469,8 @@ fn category_header(
 /// Every mark is the group's colour: the flag
 /// and its count were amber, which matched nothing else in the header. The
 /// working mark is a dot that goes from empty to full and back on the calm
-/// breath (`breath`, [`calm_breath`]): a fixed outline of [`HEADER_DOT_R`],
-/// always drawn, whose centre fades in from nothing at 0
+/// breath (`breath`, [`calm_breath`]): a fixed outline of
+/// [`HEADER_DOT_R`], always drawn, whose centre fades in from nothing at 0
 /// to the outline's colour at 1, where it holds with `rail.animate` off.
 /// It never changes size. Its caller keeps the frames coming.
 fn header_badges(
@@ -1268,7 +1527,7 @@ fn header_badges(
     if !cat.unseen {
         return end;
     }
-    badge_tick(p, Pos2::new(tick_x, y), cat.color);
+    badge_tick(p, Pos2::new(tick_x, y), cat.failed, cat.color);
     tick_x - HEADER_TICK_GAP
 }
 
@@ -1371,9 +1630,10 @@ fn flag(p: &egui::Painter, at: Pos2, color: Color32) {
     ));
 }
 
-/// A tick: finished while you were elsewhere.
-fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    tick_scaled(p, at, 1.0, 1.8, color);
+/// A tick: finished while you were elsewhere. `failed`, a ✕ in its place:
+/// it finished, and the news is bad.
+fn tick(p: &egui::Painter, at: Pos2, failed: bool, color: Color32) {
+    tick_scaled(p, at, 1.0, 1.8, failed, color);
 }
 
 /// How far left of a tab's mark the badge tick sits: clear of the widest
@@ -1384,17 +1644,28 @@ const BADGE_OFFSET: f32 = 13.0;
 /// The tick as a badge beside a mark that is still running:
 /// three quarters the size and a touch thinner, so it reads as a note on
 /// the mark and not a second mark.
-fn badge_tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    tick_scaled(p, at, 0.75, 1.5, color);
+fn badge_tick(p: &egui::Painter, at: Pos2, failed: bool, color: Color32) {
+    tick_scaled(p, at, 0.75, 1.5, failed, color);
 }
 
-/// A tick at `at`, `scale` times the full one, stroked `width` wide.
-fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, color: Color32) {
+/// A tick at `at`, `scale` times the full one, stroked `width` wide; with
+/// `failed`, the ✕: two strokes of the tick's weight, as
+/// tall as the tick and a touch narrower, so the two read as one size.
+fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, failed: bool, color: Color32) {
     let stroke = Stroke::new(width, color);
     let at_ = |x: f32, y: f32| at + Vec2::new(x, y) * scale;
+    if failed {
+        p.line_segment([at_(-CROSS, -CROSS), at_(CROSS, CROSS)], stroke);
+        p.line_segment([at_(-CROSS, CROSS), at_(CROSS, -CROSS)], stroke);
+        return;
+    }
     p.line_segment([at_(-4.5, 0.0), at_(-1.5, 3.5)], stroke);
     p.line_segment([at_(-1.5, 3.5), at_(4.5, -4.0)], stroke);
 }
+
+/// Half the ✕'s side at full size: its arms end where the tick's do, up
+/// and down, inside the tick's width.
+const CROSS: f32 = 3.5;
 
 /// A plain shell's mark at `at`: a square `side` points
 /// across, filled or hollow. Every Claude mark is round or drawn — spinner,
@@ -1467,19 +1738,19 @@ enum Mark {
     /// Something finished while you were elsewhere, and nothing runs after
     /// it: the tick. A Claude turn that ended with its subagents or a
     /// background shell still running is not done yet, seen or unseen, so
-    /// it wears [`Mark::Wave`] until they end, with the tick beside it
-    /// while unseen. A shell whose command ended
+    /// it wears [`Mark::Wave`] until they end, with the tick
+    /// beside it while unseen. A shell whose command ended
     /// on another tab ticks the same.
     Tick,
     /// Claude idle at its prompt, seen: a small filled dot in the
     /// category's colour, the size of a not-started Claude tab's gray one.
     Idle,
     /// Claude at its prompt, free to talk, while something it started
-    /// hums on — a background shell or its subagents: the three-dot wave,
-    /// whether or not you have seen the turn that left them running. The
-    /// agent itself working, which it cannot talk through, is
-    /// [`Mark::Busy`], and wins; it asking for you is [`Mark::Flag`], and
-    /// wins too.
+    /// hums on — a background shell or its subagents:
+    /// the three-dot wave, whether or not you have seen the
+    /// turn that left them running. The agent itself working,
+    /// which it cannot talk through, is [`Mark::Busy`], and wins; it asking
+    /// for you is [`Mark::Flag`], and wins too.
     Wave,
     /// A plain shell running a command: [`Mark::Prompt`]'s small filled
     /// square breathing out to the hollow square and back.
@@ -1522,9 +1793,9 @@ impl Mark {
             ClaudeState::Busy => Mark::Busy,
             ClaudeState::NeedsYou => Mark::Flag,
             // Unseen or not, a turn whose work still runs is not done: the
-            // wave says so, the state staying `DoneUnseen` until you look (a
-            // manager's tab ticked while its worker built), and the tick
-            // waits beside it ([`Mark::badged`]).
+            // wave says so, the state staying `DoneUnseen` until you look
+            // (the manager's tab ticked while its worker
+            // built), and the tick waits beside it ([`Mark::badged`]).
             ClaudeState::DoneUnseen | ClaudeState::Idle if row.background => Mark::Wave,
             ClaudeState::DoneUnseen => Mark::Tick,
             ClaudeState::Idle => Mark::Idle,
@@ -1560,6 +1831,32 @@ impl Mark {
     }
 }
 
+/// How far left of the close the pause button sits, and the room a title
+/// leaves it.
+const PAUSE_W: f32 = 18.0;
+
+/// Whether a row shows the pause button on hover: something
+/// runs in it — a live Claude or Codex, whatever it left running, or a
+/// shell running a command. Never an idle shell, an exited one, or a tab
+/// not started.
+fn pausable(row: &RowData) -> bool {
+    row.started && !row.exited && (row.claude != ClaudeState::None || row.background || row.running)
+}
+
+/// The pause glyph, two upright strokes the size of the close's × beside
+/// it: six pixels tall on the ×'s own line (it sits a pixel below the
+/// button's centre), a pixel wide each, two apart. On the half pixel, so
+/// each stroke covers one column whole rather than two by halves.
+fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    for dx in [-1.5, 1.5] {
+        p.line_segment(
+            [center + Vec2::new(dx, -2.0), center + Vec2::new(dx, 4.0)],
+            stroke,
+        );
+    }
+}
+
 fn tab_row(
     app: &mut App,
     ui: &mut Ui,
@@ -1571,6 +1868,12 @@ fn tab_row(
     let c = app.chrome;
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click_and_drag());
+    // A row titled after its session's place keeps Claude's own title, what
+    // the session is about, under the pointer.
+    let resp = match &row.hover {
+        Some(own) => resp.on_hover_text(egui_line(own, None)),
+        None => resp,
+    };
     let p = ui.painter_at(rect);
     // Geometry-based hover: `resp.hovered()` flickers when the close button
     // overlays the row in the hit-test stack.
@@ -1645,7 +1948,7 @@ fn tab_row(
         }
         // Still: finished, nothing owed. The flag above is the one that
         // wants something; the two differ in shape and movement.
-        Mark::Tick => tick(&p, dot, color),
+        Mark::Tick => tick(&p, dot, row.failed, color),
         // A background shell or its subagents keep running while Claude
         // waits at its prompt. Worth showing — it is why a directory is
         // still churning — but it is not the agent working: it can take a
@@ -1659,8 +1962,9 @@ fn tab_row(
         // A plain shell, which most tabs are most of the time: a small
         // filled square at its prompt, breathing out to the hollow square
         // and back while a command runs, and the small square hollow and in
-        // gray once the shell has exited. Squares read larger than circles
-        // of the same width, so each is a touch narrower than its round twin.
+        // gray once the shell has exited. Squares read
+        // larger than circles of the same width, so each is a touch
+        // narrower than its round twin.
         Mark::Running => breathing_square(ui, &p, rect, dot, color),
         Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
             if let Some((side, filled)) = mark.still_square() {
@@ -1677,7 +1981,7 @@ fn tab_row(
     // smaller, in the gutter left of the mark, so the mark keeps its place
     // and the title never moves as the badge comes and goes.
     if mark.badged(row) {
-        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
+        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
     }
 
     // Inline rename?
@@ -1707,8 +2011,32 @@ fn tab_row(
         return rect;
     }
 
+    // Its shell's CPU over its memory at the right edge, as the account
+    // bars' numbers are drawn, each coloured by its share of the whole
+    // machine. While the pointer is on the row the close button takes the
+    // corner and the figures fold onto the second line, CPU left of memory:
+    // they stay in sight, and the sub line gives way.
+    let sub_y = rect.min.y + 29.0;
+    let mut sub_end = rect.max.x - 8.0;
+    if let Some(u) = &row.used {
+        if hovered {
+            sub_end = readout_inline(&p, rect.max.x - 8.0, sub_y, u, c) - 6.0;
+        } else {
+            readout(&p, rect.max.x - 8.0, [rect.min.y + 13.0, sub_y], u, c);
+        }
+    }
+
+    // The pause button left of the close: on a hovered row
+    // with something running, and a title with no figures to keep it clear
+    // stops short of it.
+    let pause = hovered && pausable(row) && app.stoppable(row.id);
+
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
+    let mut reserved = row.used.as_ref().map_or(0.0, readout_width);
+    if pause {
+        reserved = reserved.max(PAUSE_W);
+    }
+    let char_budget = ((width - 68.0 - reserved) / 7.2).max(4.0) as usize;
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
@@ -1721,11 +2049,21 @@ fn tab_row(
         },
     );
     if !row.sub.is_empty() {
+        let sub_font = FontId::monospace(10.0);
+        let sub_budget = if hovered && row.used.is_some() {
+            let char_w = ui
+                .ctx()
+                .fonts_mut(|f| f.glyph_width(&sub_font, 'M'))
+                .max(1.0);
+            ((sub_end - (rect.min.x + 44.0)) / char_w).max(1.0) as usize
+        } else {
+            char_budget + 2
+        };
         p.text(
-            Pos2::new(rect.min.x + 44.0, rect.min.y + 29.0),
+            Pos2::new(rect.min.x + 44.0, sub_y),
             Align2::LEFT_CENTER,
-            truncate_chars(&row.sub, char_budget + 2),
-            FontId::monospace(10.0),
+            truncate_chars(&row.sub, sub_budget),
+            sub_font,
             dim,
         );
     }
@@ -1757,6 +2095,31 @@ fn tab_row(
             return rect;
         }
     }
+    // Pause on hover, just left of the close and drawn as it is: dim, lit
+    // the close's red under the pointer. Two strokes, not a typed ‖, which
+    // a font may lack. It stops the tab as right-click "stop" does, with
+    // no confirm.
+    if pause {
+        let pause_rect = Rect::from_min_size(
+            Pos2::new(rect.max.x - 24.0 - PAUSE_W, rect.min.y + 4.0),
+            Vec2::splat(18.0),
+        );
+        let button = ui.interact(
+            pause_rect,
+            ui.id().with(("tab-pause", row.id.0)),
+            Sense::click(),
+        );
+        let color = if button.hovered() {
+            Color32::from_rgb(0xd9, 0x7f, 0x70)
+        } else {
+            dim
+        };
+        pause_mark(&p, pause_rect.center(), color);
+        if button.clicked() {
+            actions.push(Action::StopTabNow(row.id));
+            return rect;
+        }
+    }
 
     // Right-click: tab management.
     resp.context_menu(|ui| {
@@ -1783,9 +2146,26 @@ fn tab_row(
             }
         });
         ui.separator();
+        // Ends what runs here and keeps the tab for next time.
+        if row.started && app.stoppable(row.id) && ui.button("stop").clicked() {
+            actions.push(Action::StopTabs(vec![row.id]));
+            ui.close();
+        }
         if ui.button("close").clicked() {
             actions.push(Action::CloseTab(row.id));
             ui.close();
+        }
+        // A tab opened from BACKGROUND: closing it sends the job back
+        // there; these end it.
+        if let Some(job) = app
+            .ws
+            .tabs
+            .iter()
+            .find(|t| t.id == row.id)
+            .and_then(|t| t.bg_job.clone())
+        {
+            let stopping = matches!(app.job_ends.get(&job), Some(Ending::Running(_)));
+            end_job_items(ui, &job, stopping, actions);
         }
     });
 
@@ -1908,11 +2288,15 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     let version = app.update.as_ref().map(|u| u.version.as_str());
     // The installer has already replaced the binary: the only thing left is
     // handing over to it, and that offer outlives any dismissal. It breathes
-    // toward the foreground, opaque throughout, so its ink stays readable.
+    // toward the foreground, opaque throughout, so its ink stays readable;
+    // with the rail's animation off, it holds still in plain amber.
     if app.update_installed {
-        let fill = c
-            .amber
-            .lerp_to_gamma(c.fg, (1.0 - breath(anim_time())) * 0.35);
+        let lift = if animating(ui) {
+            breath(anim_time())
+        } else {
+            1.0
+        };
+        let fill = c.amber.lerp_to_gamma(c.fg, (1.0 - lift) * 0.35);
         let rect = banner_button(
             ui,
             &match version {
@@ -2216,7 +2600,8 @@ fn codex_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     }
 }
 
-fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) {
+/// Returns where the line over the load row goes, when there is one.
+fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) -> Option<f32> {
     let c = app.chrome;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -2228,6 +2613,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) 
         );
         let spinning = app.claude.refresh_in_flight()
             || (app.cfg.codex.enabled && app.codex.accounts.iter().any(|a| a.refreshing));
+        // Off, no spinner: the refresh mark stays, lit while it runs.
         let label = if spinning && animating(ui) {
             braille(spin_turns(ui))
         } else {
@@ -2274,8 +2660,18 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) 
                 .font(FontId::monospace(10.0))
                 .color(dim),
         );
+        ui.add_space(6.0);
+        return None;
     }
     ui.add_space(6.0);
+    // This frame's reading, the sampler's newest (`App::use_now`); the
+    // status line no longer shows use.
+    // Off (`rail.total_line`), no line and no rule over it.
+    if !app.cfg.rail.total_line {
+        return None;
+    }
+    let r = app.use_now.clone()?;
+    Some(sessions_load_row(ui, &r, app.chrome))
 }
 
 /// A rotated label interrupts the left category line; its height comes from
@@ -2434,6 +2830,55 @@ fn claude_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
 }
 
+/// Under the account bars: what Giverny runs now, summed —
+/// `23% CPU  2.0G RAM  40% GPU`, centred, in the bars' lettering. Hovering says
+/// what is counted. Returns where the line above it goes.
+fn sessions_load_row(
+    ui: &mut Ui,
+    r: &giverny_claude::use_reading::Reading,
+    c: crate::chrome::Chrome,
+) -> f32 {
+    let dim = c.dim;
+    let y = ui.cursor().min.y + 0.5;
+    ui.add_space(5.0);
+    let width = ui.available_width();
+    let (mut rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    // A wide row (a banner, a button) can stretch the panel's layout past
+    // what is shown: the figures end at the visible edge.
+    rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
+    // Each figure coloured by its share of the whole machine, as a tab's
+    // are.
+    let mut job = egui::text::LayoutJob::default();
+    let ram = crate::sessions_load::machine_ram_mb();
+    for (text, share) in crate::sessions_load::figure_parts(&r.total, ram) {
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat::simple(FontId::monospace(9.5), machine_color(share, c)),
+        );
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter_at(rect).galley(at, galley, dim);
+    ui.add_space(5.0);
+    let gpu = match (r.total.gpu_pct, r.total.gpu_mb) {
+        (Some(_), _) => ", the GPUs' compute it uses",
+        (None, Some(_)) => ", GPU memory (this GPU reports no per-process utilisation)",
+        (None, None) => "",
+    };
+    resp.on_hover_text(format!(
+        "Everything Giverny runs now: the app and every tab, Claude or not —\n\
+         {} Claude Code session{} with all they started (commands, builds,\n\
+         `manage run` scopes). CPU as a share of the whole machine, the memory\n\
+         it really uses (shared pages split){gpu}.\n\
+         The management panel's rows and each session's status line are parts of\n\
+         this same reading.",
+        r.sessions.len(),
+        if r.sessions.len() == 1 { "" } else { "s" },
+    ));
+    y
+}
+
 #[allow(clippy::too_many_arguments)]
 fn usage_bar(
     ui: &mut Ui,
@@ -2449,13 +2894,7 @@ fn usage_bar(
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
     let p = ui.painter_at(rect);
-    let color = if read.critical {
-        c.poppy
-    } else if pct >= 80.0 {
-        c.amber
-    } else {
-        c.dim
-    };
+    let color = level_color(pct, read.critical, c);
 
     // Label.
     p.text(
@@ -2497,6 +2936,97 @@ fn usage_bar(
     );
 }
 
+/// A readout's column: four or five 9px monospace figures and some air.
+const READOUT_COL: f32 = 34.0;
+
+/// How wide [`readout`] draws `u`: a column, two with a GPU.
+fn readout_width(u: &Use) -> f32 {
+    if u.gpu_pct.is_some() || u.gpu_mb.is_some() {
+        2.0 * READOUT_COL
+    } else {
+        READOUT_COL
+    }
+}
+
+/// A tab's (or a collapsed group's) use, right-aligned to `right`: CPU at
+/// `ys[0]` over memory at `ys[1]` and, with a GPU, its compute over its
+/// memory in a column to their left, each figure coloured by its share of
+/// the whole machine ([`machine_color`]; GPU memory, whose total is not
+/// known here, stays dim).
+fn readout(p: &egui::Painter, right: f32, ys: [f32; 2], u: &Use, c: crate::chrome::Chrome) {
+    use giverny_claude::session_use::gb;
+    let (cpu, mem) =
+        crate::sessions_load::machine_shares(u, crate::sessions_load::machine_ram_mb());
+    let gpu_x = right - READOUT_COL;
+    let figures = [
+        Some((right, ys[0], format!("{}%", u.cpu_pct.min(100)), cpu)),
+        Some((right, ys[1], gb(u.mem_mb), mem)),
+        u.gpu_pct
+            .map(|g| (gpu_x, ys[0], format!("g{}%", g.min(100)), f64::from(g))),
+        u.gpu_mb.map(|m| (gpu_x, ys[1], format!("g{}", gb(m)), 0.0)),
+    ];
+    for (x, y, text, share) in figures.into_iter().flatten() {
+        p.text(
+            Pos2::new(x, y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::monospace(9.0),
+            machine_color(share, c),
+        );
+    }
+}
+
+/// [`readout`] folded onto one line for a hovered tab row:
+/// `g40% g1.2G  23%  1.2G`, right-aligned to `right` at `y`, coloured as
+/// there. Returns where it starts.
+fn readout_inline(p: &egui::Painter, right: f32, y: f32, u: &Use, c: crate::chrome::Chrome) -> f32 {
+    use giverny_claude::session_use::gb;
+    let (cpu, mem) =
+        crate::sessions_load::machine_shares(u, crate::sessions_load::machine_ram_mb());
+    // Right to left, each with the gap to draw before the next one.
+    let figures = [
+        Some((gb(u.mem_mb), mem, 10.0)),
+        Some((format!("{}%", u.cpu_pct.min(100)), cpu, 10.0)),
+        u.gpu_mb.map(|m| (format!("g{}", gb(m)), 0.0, 4.0)),
+        u.gpu_pct
+            .map(|g| (format!("g{}%", g.min(100)), f64::from(g), 4.0)),
+    ];
+    let mut x = right;
+    let mut gap = 0.0;
+    for (text, share, after) in figures.into_iter().flatten() {
+        let at = p.text(
+            Pos2::new(x - gap, y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::monospace(9.0),
+            machine_color(share, c),
+        );
+        x = at.min.x;
+        gap = after;
+    }
+    x
+}
+
+/// How much of the whole machine a figure is, as the rail colours it:
+/// dim while [`Load::Light`](crate::sessions_load::Load),
+/// amber or poppy above.
+fn machine_color(share: f64, c: crate::chrome::Chrome) -> Color32 {
+    crate::sessions_load::Load::of(share).color(c.dim, c)
+}
+
+/// How full a share is, as the account bars colour it: poppy when
+/// critical (95 % and up, [`ClaudeWatch::reading`]), amber from 80 %,
+/// dim below.
+fn level_color(pct: f64, critical: bool, c: crate::chrome::Chrome) -> Color32 {
+    if critical {
+        c.poppy
+    } else if pct >= 80.0 {
+        c.amber
+    } else {
+        c.dim
+    }
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -2507,6 +3037,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// The delay the rail asks for in one frame that draws a spinner and a
@@ -2544,6 +3075,28 @@ mod tests {
         let (delay, turns) = rail_wake(&ctx, true);
         assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
         assert!(turns.is_some(), "no spinner with the switch on");
+    }
+
+    /// A collapsed group's figure is its tabs' summed; a GPU figure where
+    /// any tab has one; nothing where no tab reads.
+    #[test]
+    fn a_group_sums_its_tabs() {
+        let u = |cpu_pct, mem_mb, gpu_mb| Use {
+            cpu_pct,
+            mem_mb,
+            gpu_mb,
+            gpu_pct: None,
+        };
+        assert_eq!(summed(&[]), None);
+        assert_eq!(summed(&[u(3, 100, None)]), Some(u(3, 100, None)));
+        assert_eq!(
+            summed(&[u(3, 100, None), u(40, 2048, Some(512)), u(0, 5, None)]),
+            Some(u(43, 2153, Some(512)))
+        );
+        assert_eq!(
+            summed(&[u(1, 1, None), u(1, 1, None)]).unwrap().gpu_mb,
+            None
+        );
     }
 
     #[test]
@@ -2751,9 +3304,9 @@ mod tests {
     /// A group header's badges are all its colour, it shows one mark at
     /// most, the flag outranking the dot, and its working mark at full
     /// breath is a filled dot; the badges ask for no frame themselves
-    /// (#43). A finish unseen in it adds the badge tick, left of the dot or
-    /// alone in its place, never beside the flag. The name ends left of
-    /// whatever is there.
+    /// A finish unseen in it adds the badge tick, left
+    /// of the dot or alone in its place, never beside the flag.
+    /// The name ends left of whatever is there.
     #[test]
     fn a_header_marks_in_its_colour_and_holds_still() {
         let group = |busy, needs, unseen| GroupData {
@@ -2766,7 +3319,9 @@ mod tests {
             count: 3,
             busy,
             needs,
+            used: None,
             unseen,
+            failed: false,
             rows: Vec::new(),
         };
         // (busy, needs, unseen) -> (dots, flag, tick, where the name ends):
@@ -2849,10 +3404,9 @@ mod tests {
         }
     }
 
-    /// The header's working dot goes from empty to full: one circle whose
-    /// outline holds its size and colour while only its centre fades in,
-    /// nothing at breath 0 and the outline's colour at 1, never dropping as
-    /// the breath climbs.
+    /// The header's working dot goes from empty to full: one circle whose outline holds its size and colour while
+    /// only its centre fades in, nothing at breath 0 and the outline's
+    /// colour at 1, never dropping as the breath climbs.
     #[test]
     fn the_header_dot_fades_its_centre_from_empty_to_full() {
         let cat = GroupData {
@@ -2865,7 +3419,9 @@ mod tests {
             count: 1,
             busy: 1,
             needs: 0,
+            used: None,
             unseen: false,
+            failed: false,
             rows: Vec::new(),
         };
         let at = |breath: f32| {
@@ -2934,6 +3490,7 @@ mod tests {
         RowData {
             id: TabId(1),
             title: String::new(),
+            hover: None,
             sub: String::new(),
             active: false,
             exited: false,
@@ -2944,6 +3501,8 @@ mod tests {
             background: false,
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
+            failed: false,
+            used: None,
         }
     }
 
@@ -2976,8 +3535,9 @@ mod tests {
 
     /// The mark says whether the agent can take a message: busy, it
     /// cannot; at its prompt with subagents still working, the wave; with
-    /// nothing left running, the idle dot. A turn you have not seen waves
-    /// too while its work runs, and ticks only once it is all done.
+    /// nothing left running, the idle dot. A turn you have not
+    /// seen waves too while its work runs, and ticks only once it is all
+    /// done.
     #[test]
     fn subagents_running_after_the_turn_wave_and_a_working_agent_spins() {
         use crate::claude_watch::ClaudeTab;
@@ -3058,8 +3618,8 @@ mod tests {
 
     /// A plain shell: a command running breathes its square;
     /// one that finished on another tab ticks until you look; at its prompt,
-    /// seen, the small filled square; exited, the small hollow square in
-    /// gray. Its next command, the first still unseen, breathes with the tick beside it.
+    /// seen, the small filled square; exited, the hollow square in gray. Its next
+    /// command, the first still unseen, breathes with the tick beside it.
     #[test]
     fn a_shell_breathes_ticks_then_rests_hollow() {
         let shell = |running, unseen, exited| {
@@ -3149,10 +3709,10 @@ mod tests {
 
     /// A shell's running square morphs from its prompt's small filled
     /// square (the not-started marker's size) to the hollow square and back,
-    /// never down to a pixel: breathed in it is the small square exactly,
-    /// breathed out (and with `rail.animate` off) the hollow one, and in
-    /// between its edge and its hole each move a pixel at a time, so it
-    /// never jumps from filled to hollow.
+    /// never down to a pixel: breathed in it is the small
+    /// square exactly, breathed out (and with `rail.animate` off) the
+    /// hollow one, and in between its edge and its hole each move a pixel
+    /// at a time, so it never jumps from filled to hollow.
     #[test]
     fn the_running_square_morphs_from_the_small_square_to_the_hollow_one() {
         for ppp in [1.0, 1.25, 1.5, 2.0] {
@@ -3288,10 +3848,11 @@ mod tests {
     }
 
     /// Claude's calm busy mark morphs from the idle dot to the open ring
-    /// and back: breathed in it is the idle dot, breathed out the ring, and
-    /// all the way round the breath, at any scale, both edges move a little
-    /// at a time, the hole fading in from nothing, so there is no jump where
-    /// a filled disc turns into a stroked ring at the end of the breath.
+    /// and back: breathed in it is the idle dot, breathed out
+    /// the ring, and all the way round the breath, at any scale, both edges
+    /// move a little at a time, the hole fading in from nothing, so there
+    /// is no jump where a filled disc turns into a stroked ring (the step
+    /// once seen at the end of the clench).
     #[test]
     fn the_calm_mark_morphs_from_the_idle_dot_to_the_open_ring() {
         for ppp in [1.0, 1.25, 1.5, 2.0] {
@@ -3343,14 +3904,14 @@ mod tests {
         }
     }
 
-    /// Nothing is ever drawn inside the calm mark's hole (a disc filling a
-    /// hole too small to draw would show as a dot inside the ring just before
-    /// it closed). At every frame of a breath, at the animation clock's pace
-    /// and in fine steps between, at 1x, 1.25x and 1.5x: the mark is one
-    /// shape; where the hole is wider than its anti-aliased edge no ink falls
-    /// inside it; and from the centre out the ink only rises to the full band
-    /// and then only falls, so even a hole under a pixel is a thinning
-    /// centre, never a dot in a ring.
+    /// Nothing is ever drawn inside the calm mark's hole
+    /// (round 4: a disc filling a hole too small to draw showed as a dot
+    /// inside the ring just before it closed). At every frame of a breath,
+    /// at the animation clock's pace and in fine steps between, at 1x,
+    /// 1.25x and 1.5x: the mark is one shape; where the hole is wider than
+    /// its anti-aliased edge no ink falls inside it; and from the centre
+    /// out the ink only rises to the full band and then only falls, so even
+    /// a hole under a pixel is a thinning centre, never a dot in a ring.
     #[test]
     fn the_calm_mark_draws_nothing_inside_its_hole() {
         let paced = (0..=12).map(|k| k as f64 * 0.25);
@@ -3392,8 +3953,8 @@ mod tests {
 
     /// A header counts a tab showing the wave as working, so its breathing
     /// dot and count stay while only the tab's subagents or background shell
-    /// run, and a plain shell running a command; the tick, the idle dot and a
-    /// shell at its prompt are not working.
+    /// run, and a plain shell running a command;
+    /// the tick, the idle dot and a shell at its prompt are not working.
     #[test]
     fn a_header_counts_a_waving_tab_as_working() {
         let humming = |state| RowData {

@@ -60,6 +60,14 @@
 //! session is named and told once: `<feeds>/names/asked/<session>` marks the
 //! ones told.
 //!
+//! **A `/clear` keeps the name**. The session a `/clear` starts is a new
+//! one, but it is the same agent to the person: it takes back the name and
+//! room of the session it cleared in that tab ([`after_clear`]), found by
+//! `<feeds>/names/tabs/<GIVERNY_TAB_ID>`, which holds the id of the last
+//! session told its name there. Nothing else carries over: what is kept by
+//! session id stays with the old one. A new agent means a new tab, or a new
+//! claude in it.
+//!
 //! **`/resume` shows it**: a named session's custom title is
 //! kept `<Name> · <the text the picker would show without it>`
 //! ([`keep_title`]), one appended transcript line at a time; a title the
@@ -78,6 +86,10 @@ const ON: &str = "on";
 /// ([`tell`]), so the prompt hook's fallback ([`first_prompt`]) never tells
 /// it twice.
 const ASKED: &str = "asked";
+/// Under [`DIR`], a file per tab (named by its `GIVERNY_TAB_ID`) holding the
+/// id of the last session told its name there: who a `/clear` in that tab
+/// cleared ([`after_clear`]).
+const TABS: &str = "tabs";
 /// Under [`DIR`], the lock every rewrite of a names document is made under
 /// ([`lock`]), so two sessions drawing at once
 /// never share a first name and a room is drawn once.
@@ -712,6 +724,10 @@ fn asked_file(feeds: &Path, session: &str) -> Option<PathBuf> {
     safe(session).then(|| dir(feeds).join(ASKED).join(session))
 }
 
+fn tab_file(feeds: &Path, tab: &str) -> Option<PathBuf> {
+    safe(tab).then(|| dir(feeds).join(TABS).join(tab))
+}
+
 fn root_file(feeds: &Path, root: &str) -> Option<PathBuf> {
     safe(root).then(|| dir(feeds).join("roots").join(format!("{root}.json")))
 }
@@ -1302,15 +1318,73 @@ fn transcript_of(payload: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The name, and room, the session a `/clear` in `tab` cleared held, taken
+/// back by `session`, the one that `/clear` started: the same agent to the
+/// person, under a new id. Recorded under `session`, its root stamped in
+/// later as any start's ([`keep_root`]). None, and the session is drawn a
+/// name as ever, when the tab has no session told before it, that one has
+/// no name, or a live session other than the cleared one holds its first
+/// name meanwhile. The cleared session itself holds nothing against it,
+/// though Claude Code's registry may list it still, or its names document
+/// be fresh ([`FRESH`]).
+fn after_clear(feeds: &Path, session: &str, tab: &str, live: &Live) -> Option<String> {
+    let cleared = std::fs::read_to_string(tab_file(feeds, tab)?).ok()?;
+    let cleared = cleared.trim();
+    if cleared == session || !safe(cleared) {
+        return None;
+    }
+    let file = session_file(feeds, session)?;
+    // Checked and taken in one step.
+    let _lock = lock(feeds);
+    let doc = read_doc(&session_file(feeds, cleared)?)?;
+    let name = doc_name(&doc)?;
+    let mut held = holders(feeds, live, session, None);
+    held.extend(fresh(feeds, live, session, None, FRESH));
+    held.retain(|h| h.session != cleared);
+    if held_by(&held, &name).is_some() {
+        return None;
+    }
+    let mut taken = json!({"session": session, "name": name});
+    if let Some(room) = doc_room(&doc) {
+        taken["room"] = json!(room);
+    }
+    write_doc(&file, &taken)
+        .inspect_err(|e| eprintln!("giverny hook: naming {session}: {e}"))
+        .ok()?;
+    Some(name)
+}
+
+/// Note `session` as the one `tab` holds now, for a `/clear` there to find
+/// ([`after_clear`]).
+fn keep_tab(feeds: &Path, tab: &str, session: &str) {
+    if let Some(file) = tab_file(feeds, tab) {
+        let _ = std::fs::create_dir_all(dir(feeds).join(TABS));
+        let _ = std::fs::write(file, session);
+    }
+}
+
 /// Name `session` and say so ([`ask`]): the name it has ([`find`], else
-/// the one on its manager feed), else one drawn and recorded right here
-/// ([`draw_and_record`]) with the surname of the tab it was
-/// born in ([`surname`]), so the session has its name before
-/// its first turn. Marked as told, so it is not told again ([`ASKED`]).
+/// the one on its manager feed), else, started by a `/clear`, the name of
+/// the session it cleared in its tab ([`after_clear`]), else one drawn and
+/// recorded right here ([`draw_and_record`]) with the surname of the tab it
+/// was born in ([`surname`]), so the session has its name before its first
+/// turn. Marked as told, so it is not told again ([`ASKED`]), and noted as
+/// its tab's ([`keep_tab`]).
 fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
     let transcript = transcript_of(payload);
+    let tab = crate::lineage::giverny_var("GIVERNY_TAB_ID");
+    let tab = tab.as_deref().map(str::trim);
+    let cleared = payload.get("source").and_then(Value::as_str) == Some("clear");
     let name = find(feeds, session, transcript.as_deref())
         .or_else(|| on_feed(feeds, session))
+        .or_else(|| {
+            after_clear(
+                feeds,
+                session,
+                tab.filter(|_| cleared)?,
+                &live_sessions(None),
+            )
+        })
         .or_else(|| {
             let born = surname(feeds, cwd_of(payload).as_deref());
             draw_and_record(feeds, session, transcript.as_deref(), &born)
@@ -1320,6 +1394,9 @@ fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
     if let Some(file) = asked_file(feeds, session) {
         let _ = std::fs::create_dir_all(dir(feeds).join(ASKED));
         let _ = std::fs::write(file, "");
+    }
+    if let Some(tab) = tab.filter(|_| name.is_some()) {
+        keep_tab(feeds, tab, session);
     }
     ask(name.as_deref())
 }
@@ -1342,10 +1419,10 @@ pub fn session_start(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> O
 /// What a session start is told, naming it first ([`tell`]): only with the
 /// switch `on`, only for a top-level session (`in_tab`: a Giverny tab's own,
 /// not a background job's or a nested claude's), never a subagent's. Every
-/// start tells again (a `/clear` is a new session and draws a new name; a
-/// resume or a compaction keeps its name), and is marked so the prompt hook
-/// stays quiet ([`first_prompt`]). The text alone, for a hook reply that
-/// carries more.
+/// start tells again (a `/clear` is a new session but keeps the name the
+/// cleared one had in its tab; a resume or a compaction keeps its name),
+/// and is marked so the prompt hook stays quiet ([`first_prompt`]). The
+/// text alone, for a hook reply that carries more.
 pub fn start_context(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
     if !on || !in_tab || payload.get("agent_id").is_some() {
         return None;
@@ -1580,6 +1657,40 @@ mod tests {
             "{{\"type\":\"{kind}\",\"{key}\":{},\"sessionId\":\"s\"}}\n",
             Value::from(value)
         )
+    }
+
+    #[test]
+    fn a_clear_takes_back_the_name_the_tab_had() {
+        let feeds = scratch("clear");
+        let live = |ids: &[&str]| -> Live {
+            ids.iter()
+                .map(|i| (i.to_string(), PathBuf::new()))
+                .collect()
+        };
+        // No session told in the tab yet: nothing to take back.
+        assert_eq!(after_clear(&feeds, "s2", "giverny-7", &live(&[])), None);
+        record_among(
+            &feeds,
+            "s1",
+            "Rotem Giverny",
+            Some("r1"),
+            drawn("x"),
+            &live(&[]),
+        )
+        .unwrap();
+        let kept = room(&feeds, "s1").unwrap();
+        keep_tab(&feeds, "giverny-7", "s1");
+        // The registry may still list the cleared session, its document
+        // fresh: it holds nothing against the session that follows it.
+        let name = after_clear(&feeds, "s2", "giverny-7", &live(&["s1", "s2"]));
+        assert_eq!(name.as_deref(), Some("Rotem Giverny"));
+        assert_eq!(read(&feeds, "s2").as_deref(), Some("Rotem Giverny"));
+        assert_eq!(room(&feeds, "s2"), Some(kept));
+        // Another tab's session took the first name meanwhile: drawn anew.
+        let _ = std::fs::remove_file(session_file(&feeds, "s2").unwrap());
+        record_among(&feeds, "s9", "Rotem Ashby", None, drawn("x"), &live(&[])).unwrap();
+        assert_eq!(after_clear(&feeds, "s2", "giverny-7", &live(&["s9"])), None);
+        let _ = std::fs::remove_dir_all(&feeds);
     }
 
     #[test]

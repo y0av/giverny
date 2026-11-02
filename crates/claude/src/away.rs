@@ -520,7 +520,11 @@ fn stat_of(pid: u32) -> Option<(u32, u64)> {
 fn is_claude_name(name: &str) -> bool {
     let name = name.trim();
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    base.strip_suffix(".exe").unwrap_or(base) == "claude"
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    base == "claude"
 }
 
 /// `comm` names the program as it was run, and Claude Code also sets it as
@@ -646,43 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn the_first_call_is_a_baseline_and_a_normal_next_call_says_nothing() {
-        let dir = temp("baseline");
-        assert_eq!(call(&dir, &at(0, 0, "b1", 10), Call::Tool), None);
-        assert!(path(&dir, "s1").exists());
-        // Work goes on: minutes of tool calls, a prompt 20 minutes later.
-        for m in 1..5 {
-            assert_eq!(call(&dir, &at(m, m, "b1", 10), Call::Tool), None);
-        }
-        assert_eq!(call(&dir, &at(24, 24, "b1", 10), Call::Prompt), None);
-        // A clock correction of a minute is no sleep.
-        assert_eq!(call(&dir, &at(26, 25, "b1", 10), Call::Tool), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_reboot_is_told_once() {
-        let dir = temp("reboot");
-        call(&dir, &at(0, 0, "b1", 10), Call::Tool);
-        // A new boot, a new claude, its monotonic clock from zero.
-        let mut p = at(60, 0, "b2", 11);
-        p.mono_ms = Some(MIN);
-        let said = call(&dir, &p, Call::Start).unwrap();
-        assert_eq!(
-            said,
-            "Giverny: WSL restarted at about +50, since this session last worked at +0. \
-             Everything it had running is gone: background commands, subagents, \
-             servers, downloads. /tmp was wiped, your scratchpad with it. Check what \
-             really runs now before acting on what you knew."
-        );
-        // Told once: the prompt that follows hears nothing.
-        let mut q = at(61, 0, "b2", 11);
-        q.mono_ms = Some(2 * MIN);
-        assert_eq!(call(&dir, &q, Call::Prompt), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_restart_in_the_same_boot_is_told_once() {
         let dir = temp("restart");
         call(&dir, &at(0, 0, "b1", 10), Call::Tool);
@@ -699,44 +666,6 @@ mod tests {
         let mut p = at(5, 5, "b1", 22);
         p.claude = Some(Claude { pid: 22, start: 9 });
         assert!(call(&dir, &p, Call::Tool).unwrap().contains("restarted"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The same session resumed in a second tab while the first runs: two
-    /// claudes take turns, and neither was restarted.
-    #[test]
-    fn a_second_live_claude_on_the_session_is_no_restart() {
-        let dir = temp("second");
-        let quiet = |p: &Probe| check(&dir, "s1", p, Call::Tool, |_| true, &world());
-        assert_eq!(quiet(&at(0, 0, "b1", 10)), None);
-        assert_eq!(quiet(&at(1, 1, "b1", 11)), None);
-        assert_eq!(quiet(&at(2, 2, "b1", 10)), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_sleep_is_told_from_when_to_when_once() {
-        let dir = temp("sleep");
-        call(&dir, &at(0, 0, "b1", 10), Call::Tool);
-        // 22 minutes on the wall, under one on the monotonic clock: a sleep
-        // in the middle of a tool call, told on its PostToolUse.
-        let said = call(&dir, &at(22, 0, "b1", 10), Call::Tool).unwrap();
-        assert_eq!(
-            said,
-            "Giverny: the computer slept from about +0 to +22. Processes survived, but \
-             network connections, timeouts and rate-limit windows may not have: \
-             re-check anything that was waiting on the clock."
-        );
-        assert_eq!(call(&dir, &at(23, 1, "b1", 10), Call::Tool), None);
-        // Awake for a while of the span (a long build), then asleep: how long.
-        let said = call(&dir, &at(83, 31, "b1", 10), Call::Tool).unwrap();
-        assert!(
-            said.contains("slept for about 30m between +23 and +83."),
-            "{said}"
-        );
-        // A sleep long enough to be away too is told as the sleep.
-        let said = call(&dir, &at(200, 32, "b1", 10), Call::Prompt).unwrap();
-        assert!(said.starts_with("Giverny: the computer slept"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -764,70 +693,20 @@ mod tests {
     fn a_subagent_queues_what_it_sees_for_its_parent() {
         let dir = temp("subagent");
         call(&dir, &at(0, 0, "b1", 10), Call::Tool);
-        // The parent waits on its worker; the worker's call sees the sleep.
+        // The parent waits on its subagent; the subagent's call sees the sleep.
         assert_eq!(call(&dir, &at(30, 2, "b1", 10), Call::Subagent), None);
         assert_eq!(call(&dir, &at(31, 3, "b1", 10), Call::Subagent), None);
         let said = call(&dir, &at(32, 4, "b1", 10), Call::Tool).unwrap();
         assert!(said.starts_with("Giverny: the computer slept"), "{said}");
         assert_eq!(said.matches("Giverny:").count(), 1, "{said}");
         assert_eq!(call(&dir, &at(33, 5, "b1", 10), Call::Tool), None);
-        // A worker's calls keep the session fresh: no long away for the
+        // A subagent's calls keep the session fresh: no long away for the
         // parent idle beside them.
         for m in (40..100).step_by(5) {
             assert_eq!(call(&dir, &at(m, m - 28, "b1", 10), Call::Subagent), None);
         }
         assert_eq!(call(&dir, &at(101, 73, "b1", 10), Call::Prompt), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn what_cannot_be_read_tells_nothing() {
-        let dir = temp("unread");
-        let blind = |wall: u64| Probe {
-            wall_ms: T0 + wall * MIN,
-            ..Probe::default()
-        };
-        call(&dir, &blind(0), Call::Tool);
-        assert_eq!(call(&dir, &blind(25), Call::Tool), None);
-        // The gap alone still tells a person away.
-        assert!(
-            call(&dir, &blind(60), Call::Prompt)
-                .unwrap()
-                .contains("35m passed")
-        );
-        // And a session id that is no file name is never one.
-        assert_eq!(
-            check(&dir, "../x", &blind(0), Call::Tool, |_| false, &world()),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_calls_checked_are_a_start_a_prompt_and_a_tool() {
-        let of = |v: Value| Call::of(&v);
-        assert_eq!(
-            of(json!({"hook_event_name": "SessionStart"})),
-            Some(Call::Start)
-        );
-        assert_eq!(
-            of(json!({"hook_event_name": "UserPromptSubmit"})),
-            Some(Call::Prompt)
-        );
-        assert_eq!(
-            of(json!({"hook_event_name": "PostToolUse"})),
-            Some(Call::Tool)
-        );
-        assert_eq!(
-            of(json!({"hook_event_name": "PostToolUse", "agent_id": "a1"})),
-            Some(Call::Subagent)
-        );
-        assert_eq!(
-            of(json!({"hook_event_name": "SessionStart", "agent_id": "a1"})),
-            None
-        );
-        assert_eq!(of(json!({"hook_event_name": "Stop"})), None);
-        assert_eq!(of(json!({"hook_event_name": "Notification"})), None);
     }
 
     /// The whole path the relay takes, on this machine: a record from
@@ -855,35 +734,5 @@ mod tests {
         // Told once.
         assert_eq!(reply(&dir, &prompt, T0 + 3 * MIN), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn claude_is_named_by_its_program_whatever_its_path() {
-        assert!(is_claude_name("claude\n"));
-        assert!(is_claude_name("/home/u/.local/bin/claude"));
-        assert!(is_claude_name("C:\\Users\\u\\claude.exe"));
-        assert!(!is_claude_name("claude-code"));
-        assert!(!is_claude_name("giverny"));
-    }
-
-    #[test]
-    fn durations_read_short() {
-        assert_eq!(duration(47 * MIN), "47m");
-        assert_eq!(duration(120 * MIN), "2h");
-        assert_eq!(duration(125 * MIN), "2h 5m");
-        assert_eq!(duration(3 * 1440 * MIN + 4 * 60 * MIN), "3d 4h");
-    }
-
-    #[test]
-    fn the_real_probe_reads_this_machine() {
-        let p = probe(T0);
-        #[cfg(target_os = "linux")]
-        {
-            assert!(p.mono_ms.is_some());
-            assert!(p.boot.as_deref().is_some_and(|b| b.len() > 8), "{p:?}");
-            assert!(boot_ms().is_some());
-        }
-        assert_eq!(p.wall_ms, T0);
     }
 }

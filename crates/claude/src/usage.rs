@@ -206,6 +206,13 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
     Ok(cmd)
 }
 
+/// `claude`, ready to run under the account at `config_dir`, on either side
+/// of the WSL boundary: the refresh's command, for anything else Giverny
+/// asks Claude Code to do for an account (`jobs::end`).
+pub(crate) fn claude_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
+    refresh_command(config_dir)
+}
+
 /// Where Windows would find `claude`: `%PATH%`, then the directories Claude
 /// Code's own installers write to — for the window between installing it and
 /// whatever started Giverny picking up the new `%PATH%`.

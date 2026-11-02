@@ -1109,6 +1109,11 @@ impl ClaudeWatch {
         effects
     }
 
+    /// Background job `id`, if BACKGROUND lists it.
+    pub fn job(&self, id: &str) -> Option<&Job> {
+        self.jobs.iter().find(|j| j.id == id)
+    }
+
     /// Fold the last scan into per-tab state.
     fn merge_scan(
         &mut self,

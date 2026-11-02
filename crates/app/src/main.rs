@@ -7,6 +7,8 @@ mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
+mod management_live;
+mod management_panel;
 mod oom;
 mod overlays;
 mod paste_image;
@@ -491,6 +493,8 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      taskbar icon on Wayland)\n  \
      giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
      giverny relay      (internal) agent hook entrypoint\n  \
+     giverny relay --subagent-line\n                     \
+     (internal) Claude Code subagentStatusLine entrypoint\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
@@ -511,7 +515,14 @@ fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let panel_on = config::load(paths.base()).claude.management_panel;
+                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), panel_on);
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -1163,6 +1174,9 @@ pub struct App {
     wslg_watchdog: Option<wslg_watchdog::Handle>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
+    /// Each tab's management panel view state (`claude.management_panel`);
+    /// the rows are `claude.agents`'.
+    agent_views: management_panel::Views,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
@@ -1262,11 +1276,14 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode.
+/// Bring every account in line with the config at startup: auto mode, and
+/// the management panel's subagent line.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
-/// following those would rewrite accounts against what the user configured.
+/// following those would rewrite accounts against what the user configured:
+/// strip the management panel's subagent line from every account where it
+/// was turned on.
 /// Once the file parses again, the hot reload applies what it says. Hook
 /// paths and the status line read nothing from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
@@ -1284,6 +1301,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
+    claude.set_management_panel(cfg.claude.management_panel);
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1704,6 +1722,7 @@ impl App {
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             wslg_watchdog,
             limited: HashMap::new(),
+            agent_views: management_panel::Views::default(),
             was: HashMap::new(),
             unseen_done: HashSet::new(),
             fg_running: HashMap::new(),
@@ -1869,6 +1888,7 @@ impl App {
                 // recent stack yet. Commit the walk first, so closing the
                 // previewed tab goes back to it.
                 self.end_switch();
+                self.agent_views.forget(id);
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
@@ -1977,10 +1997,16 @@ impl App {
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => match self.claude.install_hooks() {
-                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                Err(e) => tracing::error!("hook install: {e}"),
-            },
+            Action::InstallHooks => {
+                match self.claude.install_hooks() {
+                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                    Err(e) => tracing::error!("hook install: {e}"),
+                }
+                // The hooks are the consent the management panel's line
+                // waits for.
+                self.claude
+                    .set_management_panel(self.cfg.claude.management_panel);
+            }
             Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
             Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
             Action::ConfirmCodexResume(id) => {
@@ -3025,6 +3051,10 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
+        if cfg.claude.management_panel != self.cfg.claude.management_panel {
+            self.claude
+                .set_management_panel(cfg.claude.management_panel);
+        }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
             self.shared.opacity = opacity;
@@ -3385,8 +3415,14 @@ impl App {
     }
 
     /// The user looked at tab `id`: its done-markers clear, Claude's tick and
-    /// the unseen-finish badge alike.
+    /// the unseen-finish badge alike. A look at a tab that wore the tick
+    /// flashes its management panel's rows that landed since the last one.
     fn mark_seen(&mut self, id: TabId) {
+        let ticked = self.unseen_done.contains(&id)
+            || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
+        if ticked {
+            self.agent_views.flash_new_done(id);
+        }
         self.claude.mark_viewed(id);
         self.codex.attended(id);
         self.unseen_done.remove(&id);
@@ -4221,6 +4257,25 @@ impl eframe::App for App {
                 // full-screen app worth starting again.
                 self.queue_resume(active, &ctx);
                 self.queue_app_restore(active);
+            }
+
+            // The management panel takes the bottom of the terminal's area,
+            // once the tab's session is up.
+            if self.cfg.claude.management_panel {
+                management_panel::show(
+                    &mut self.agent_views,
+                    active,
+                    self.claude.agents.shown(active),
+                    management_panel::limit_for(
+                        &self.claude,
+                        active,
+                        self.limited.get(&active).map(|w| w.reopens),
+                        jiff::Timestamp::now(),
+                    ),
+                    &self.cfg.management_panel,
+                    &mut self.shared,
+                    ui,
+                );
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {

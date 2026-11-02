@@ -1575,11 +1575,12 @@ impl Mark {
 /// leaves it.
 const PAUSE_W: f32 = 18.0;
 
-/// Whether a row shows the pause button on hover: something runs in it — a
-/// live Claude or Codex, whatever it left running, or a shell running a
-/// command. Never an idle shell, an exited one, or a tab not started.
+/// Whether a row shows the pause button on hover: its shell is live —
+/// started and not exited, an idle one at its prompt included, so a click
+/// can end it and keep the tab. Never an exited shell or a tab not started:
+/// nothing runs there to stop.
 fn pausable(row: &RowData) -> bool {
-    row.started && !row.exited && (row.claude != ClaudeState::None || row.background || row.running)
+    row.started && !row.exited
 }
 
 /// The pause glyph, two upright strokes the size of the close's × beside
@@ -1743,8 +1744,8 @@ fn tab_row(
         return rect;
     }
 
-    // The pause button left of the close: on a hovered row with something
-    // running, and the title stops short of it.
+    // The pause button left of the close: on a hovered live row, idle
+    // shell included, and the title stops short of it.
     let pause = hovered && pausable(row) && app.stoppable(row.id);
 
     // Title (char-budget truncation; the rail is monospace).
@@ -3000,11 +3001,11 @@ mod tests {
         assert!(!ticks(&[exited]));
     }
 
-    /// The pause button shows where something runs: a live Claude idle or
-    /// working, what it left running, a shell's command; never an idle or
-    /// exited shell, nor a tab not started.
+    /// The pause button shows on every live tab: a Claude idle or working,
+    /// a shell running a command or idle at its prompt; never an exited
+    /// shell, nor a tab not started.
     #[test]
-    fn the_pause_button_shows_only_where_something_runs() {
+    fn the_pause_button_shows_on_a_live_tab() {
         use super::pausable;
         assert!(pausable(&row(ClaudeState::Idle)));
         assert!(pausable(&row(ClaudeState::Busy)));
@@ -3013,7 +3014,7 @@ mod tests {
             running: true,
             ..row(ClaudeState::None)
         }));
-        assert!(!pausable(&row(ClaudeState::None)), "an idle shell");
+        assert!(pausable(&row(ClaudeState::None)), "an idle shell");
         assert!(!pausable(&RowData {
             exited: true,
             ..row(ClaudeState::None)

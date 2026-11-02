@@ -1078,6 +1078,17 @@ fn category_header(
             });
             ui.close();
         }
+        // Every started tab here, kept for next time.
+        let started: Vec<TabId> = cat
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .filter(|&id| app.stoppable(id))
+            .collect();
+        if !started.is_empty() && ui.button("stop all").clicked() {
+            actions.push(Action::StopTabs(started));
+            ui.close();
+        }
         let Some(id) = as_category else { return };
         ui.menu_button("account", |ui| {
             if ui.button("(inherit)").clicked() {
@@ -1560,6 +1571,32 @@ impl Mark {
     }
 }
 
+/// How far left of the close the pause button sits, and the room a title
+/// leaves it.
+const PAUSE_W: f32 = 18.0;
+
+/// Whether a row shows the pause button on hover: its shell is live —
+/// started and not exited, an idle one at its prompt included, so a click
+/// can end it and keep the tab. Never an exited shell or a tab not started:
+/// nothing runs there to stop.
+fn pausable(row: &RowData) -> bool {
+    row.started && !row.exited
+}
+
+/// The pause glyph, two upright strokes the size of the close's × beside
+/// it: six pixels tall on the ×'s own line (it sits a pixel below the
+/// button's centre), a pixel wide each, two apart. On the half pixel, so
+/// each stroke covers one column whole rather than two by halves.
+fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    for dx in [-1.5, 1.5] {
+        p.line_segment(
+            [center + Vec2::new(dx, -2.0), center + Vec2::new(dx, 4.0)],
+            stroke,
+        );
+    }
+}
+
 fn tab_row(
     app: &mut App,
     ui: &mut Ui,
@@ -1707,8 +1744,13 @@ fn tab_row(
         return rect;
     }
 
+    // The pause button left of the close: on a hovered live row, idle
+    // shell included, and the title stops short of it.
+    let pause = hovered && pausable(row) && app.stoppable(row.id);
+
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
+    let reserved = if pause { PAUSE_W } else { 0.0 };
+    let char_budget = ((width - 68.0 - reserved) / 7.2).max(4.0) as usize;
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
@@ -1757,6 +1799,31 @@ fn tab_row(
             return rect;
         }
     }
+    // Pause on hover, just left of the close and drawn as it is: dim, lit
+    // the close's red under the pointer. Two strokes, not a typed ‖, which
+    // a font may lack. It stops the tab as right-click "stop" does, with
+    // no confirm.
+    if pause {
+        let pause_rect = Rect::from_min_size(
+            Pos2::new(rect.max.x - 24.0 - PAUSE_W, rect.min.y + 4.0),
+            Vec2::splat(18.0),
+        );
+        let button = ui.interact(
+            pause_rect,
+            ui.id().with(("tab-pause", row.id.0)),
+            Sense::click(),
+        );
+        let color = if button.hovered() {
+            Color32::from_rgb(0xd9, 0x7f, 0x70)
+        } else {
+            dim
+        };
+        pause_mark(&p, pause_rect.center(), color);
+        if button.clicked() {
+            actions.push(Action::StopTabNow(row.id));
+            return rect;
+        }
+    }
 
     // Right-click: tab management.
     resp.context_menu(|ui| {
@@ -1783,6 +1850,11 @@ fn tab_row(
             }
         });
         ui.separator();
+        // Ends what runs here and keeps the tab for next time.
+        if row.started && app.stoppable(row.id) && ui.button("stop").clicked() {
+            actions.push(Action::StopTabs(vec![row.id]));
+            ui.close();
+        }
         if ui.button("close").clicked() {
             actions.push(Action::CloseTab(row.id));
             ui.close();
@@ -2927,6 +2999,30 @@ mod tests {
             ..unseen(row(ClaudeState::None))
         };
         assert!(!ticks(&[exited]));
+    }
+
+    /// The pause button shows on every live tab: a Claude idle or working,
+    /// a shell running a command or idle at its prompt; never an exited
+    /// shell, nor a tab not started.
+    #[test]
+    fn the_pause_button_shows_on_a_live_tab() {
+        use super::pausable;
+        assert!(pausable(&row(ClaudeState::Idle)));
+        assert!(pausable(&row(ClaudeState::Busy)));
+        assert!(pausable(&row(ClaudeState::NeedsYou)));
+        assert!(pausable(&RowData {
+            running: true,
+            ..row(ClaudeState::None)
+        }));
+        assert!(pausable(&row(ClaudeState::None)), "an idle shell");
+        assert!(!pausable(&RowData {
+            exited: true,
+            ..row(ClaudeState::None)
+        }));
+        assert!(!pausable(&RowData {
+            started: false,
+            ..row(ClaudeState::Idle)
+        }));
     }
 
     /// A row in `claude` state, started, live, in no background shell.

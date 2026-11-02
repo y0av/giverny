@@ -60,6 +60,9 @@ x11-dl = "2.21"
 # scrollback-and-state write that closing the window does.
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
+# Signalling what a stopped tab left running; the version the workspace
+# already uses.
+libc = "0.2.189"
 
 [build-dependencies]
 # Puts the icon inside the .exe, where Explorer and the taskbar look for it.

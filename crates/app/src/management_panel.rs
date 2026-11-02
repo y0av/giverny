@@ -37,9 +37,14 @@
 //! **Text is selectable**: a drag selects the pane's text the way the
 //! terminal does, as a stream of cells across rows, copies it as plain text
 //! line by line when the drag ends, and `Ctrl+Shift+C` copies it again. The
-//! next press anywhere lets it go. A click on a row opens nothing yet.
+//! next press anywhere lets it go.
+//!
+//! **Clicks** produce a [`RowClick`], which the app receives as
+//! `Action::AgentRowClicked`. What a click *does* is not decided here
+//! (`row_open`). The row of the worker the tab shows is lit as the selection.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
@@ -375,6 +380,31 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ------------------------------------------------------------- clicks ----
+
+/// What a click on a row names: everything the action behind it
+/// (`row_open`) could want, so deciding what to do never needs the pane
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowClick {
+    pub stage: Stage,
+    /// The Claude Code subagent id.
+    pub agent_id: String,
+    /// The worker's name or description, for its page's header.
+    pub name: String,
+    /// The worker's `agent-<id>.jsonl`, once known.
+    pub transcript: Option<PathBuf>,
+}
+
+impl RowClick {
+    /// Whether `other` is a click on the same row: the same worker. The
+    /// stage is left out: a row viewed while Running is still that row once
+    /// Done.
+    pub fn same_row(&self, other: &RowClick) -> bool {
+        self.agent_id == other.agent_id
+    }
+}
+
 // -------------------------------------------------------------- table ----
 
 /// One drawn row, every cell already formatted.
@@ -402,6 +432,7 @@ pub struct Line {
     /// The row's agent spawned agents of its own, drawn under it: whether
     /// they are folded away and how many there are.
     pub fold: Option<Fold>,
+    pub click: RowClick,
 }
 
 /// A row whose agent spawned agents of its own: the toggle on its row folds
@@ -792,6 +823,12 @@ fn format_row(l: &SubagentRow, now_ms: u64, clock: &Clock) -> Line {
         why,
         depth: 0,
         fold: None,
+        click: RowClick {
+            stage: l.stage,
+            agent_id: l.id.clone(),
+            name: l.display_name().to_string(),
+            transcript: l.transcript.clone(),
+        },
     }
 }
 
@@ -906,20 +943,23 @@ fn cut(s: &str, max: usize) -> String {
 // ------------------------------------------------------------ drawing ----
 
 /// Draw `tab`'s pane from `tracker`, if there are rows. Call inside the
-/// central panel, before the terminal takes the rest.
+/// central panel, before the terminal takes the rest. Returns the row
+/// clicked this frame, and the row of `shown` as the pane drew it.
 ///
 /// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
-/// while it is, the Running rows' clocks are held.
+/// while it is, the Running rows' clocks are held. `shown` is the row whose
+/// worker page the tab shows: it is lit as the selection.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     views: &mut Views,
     tab: TabId,
     tracker: Option<&Tracker>,
+    shown: Option<&RowClick>,
     limit: Option<Limit>,
     panel: &ManagementPanelConfig,
     shared: &mut RenderShared,
     ui: &mut Ui,
-) {
+) -> (Option<RowClick>, Option<Line>) {
     // A look asks for one flash, at the drawing right after it: a pane with
     // nothing to show now does not flash later.
     let flash_due = views
@@ -928,7 +968,7 @@ pub fn show(
         .is_some_and(|v| std::mem::take(&mut v.flash_due));
     // Only when subagents are involved.
     let Some(tracker) = tracker.filter(|t| !t.is_empty()) else {
-        return;
+        return (None, None);
     };
     let view = views.tabs.entry(tab).or_default();
     let now = now_ms();
@@ -940,7 +980,7 @@ pub fn show(
     };
     let table = build_with(tracker.rows(), now, &clock, panel.done(), &view.folded);
     if table.is_empty() {
-        return;
+        return (None, None);
     }
     // What landed since the last look breathes; whatever is drawn now has
     // been seen.
@@ -967,6 +1007,7 @@ pub fn show(
         view.flash = None;
     }
     let flash = view.flash.as_ref().zip(glow).map(|(f, g)| (&f.rows, g));
+    let shown_line = shown.and_then(|s| table.lines.iter().find(|l| s.same_row(&l.click)).cloned());
     if table.any_running() {
         // ELAPSED is a stopwatch.
         ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -990,6 +1031,7 @@ pub fn show(
     let id = egui::Id::new(("management_panel", tab));
     follow_rows(ui.ctx(), id, &mut view.fit, fit);
 
+    let mut clicked = None;
     egui::Panel::bottom(id)
         .resizable(true)
         .default_size(fit)
@@ -1011,11 +1053,12 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let fold = draw_table(
+                    let drew = draw_table(
                         ui,
                         id.with("rows"),
                         &table,
                         &panel.columns,
+                        shown,
                         flash,
                         animate,
                         shared,
@@ -1024,7 +1067,8 @@ pub fn show(
                         cols,
                         &mut view.sel,
                     );
-                    if let Some(ident) = fold {
+                    clicked = drew.clicked;
+                    if let Some(ident) = drew.fold {
                         if !view.folded.remove(&ident) {
                             view.folded.insert(ident);
                         }
@@ -1033,6 +1077,7 @@ pub fn show(
                 });
             outer.advance_cursor_after_rect(inner.min_rect());
         });
+    (clicked, shown_line)
 }
 
 /// The pane's frame: the session's own background, not the rail's lifted
@@ -1087,6 +1132,11 @@ const FLASH_OUT: f32 = 3.0;
 
 /// How strongly a hovered row is tinted.
 const HOVER_TINT: f32 = 0.10;
+/// How strongly a pressed row is tinted.
+const PRESS_TINT: f32 = 0.22;
+/// How strongly the row of the worker on view is lit: past a hover's, so
+/// it reads as the selection even under the pointer.
+const VIEWED_TINT: f32 = 0.26;
 
 /// The scrollbar's full lane, in points, whether or not it is showing.
 fn bar_lane(ui: &Ui) -> f32 {
@@ -1419,6 +1469,8 @@ struct RowsInput {
     click_col: Option<usize>,
     /// The row under the pointer, while it is not dragging.
     hovered: Option<usize>,
+    /// The pointer is down on the rows.
+    pressed: bool,
     dragging: bool,
 }
 
@@ -1438,7 +1490,8 @@ fn cell_at(rects: &[egui::Rect], cw: f32, p: egui::Pos2) -> Option<(usize, usize
 /// The pane's pointer handling over rows at `rects` reading `texts`: a drag
 /// selects text and copies it as it ends, the terminal's copy-on-select;
 /// `Ctrl+Shift+C` copies the selection again. A click (press and release in
-/// place) is reported, for the fold toggles; a drag is never a click.
+/// place) is reported: it opens a row or flips its fold. A drag is never a
+/// click.
 fn rows_input(
     ui: &mut Ui,
     id: egui::Id,
@@ -1503,6 +1556,7 @@ fn rows_input(
             .zip(rects.first())
             .map(|(p, first)| ((p.x - first.left()) / cw.max(1.0)).floor().max(0.0) as usize);
     }
+    out.pressed = resp.is_pointer_button_down_on();
     if !out.dragging {
         out.hovered = resp
             .hover_pos()
@@ -1516,14 +1570,24 @@ fn rows_input(
     Some((out, resp))
 }
 
-/// Draw the rows; return the fold a click on a row's toggle flips
-/// ([`Fold::ident`]), if one did.
+/// What [`draw_table`] saw this frame.
+#[derive(Default)]
+struct Drew {
+    /// The row a click opens.
+    clicked: Option<RowClick>,
+    /// A click on a row's fold toggle: that row's [`Fold::ident`].
+    fold: Option<String>,
+}
+
+/// Draw the rows, `viewed`'s lit; return the row a click opens, or the fold
+/// a click on a row's toggle flips.
 #[allow(clippy::too_many_arguments)]
 fn draw_table(
     ui: &mut Ui,
     id: egui::Id,
     table: &Table,
     shown: &PaneColumns,
+    viewed: Option<&RowClick>,
     flash: Option<(&HashSet<String>, f32)>,
     animate: bool,
     shared: &mut RenderShared,
@@ -1531,7 +1595,7 @@ fn draw_table(
     row_h: f32,
     cols: usize,
     sel: &mut Option<Selection>,
-) -> Option<String> {
+) -> Drew {
     let cw = cell.x.max(1.0);
     let layout = Cols::shown(table, cols, shown);
     let segs: Vec<Vec<(usize, String)>> = table.lines.iter().map(|l| layout.segments(l)).collect();
@@ -1543,15 +1607,10 @@ fn draw_table(
                 .0
         })
         .collect();
-    let (input, resp) = rows_input(ui, id, &rects, &texts, cw, sel)?;
-    // A fold toggle under the pointer is the one thing a click does.
-    let toggle_at = |i: usize, p: egui::Pos2| {
-        let col = ((p.x - rects[i].left()) / cw).floor().max(0.0) as usize;
-        layout.fold_hit(&table.lines[i], col).is_some()
+    let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
+        return Drew::default();
     };
-    if let Some(i) = input.hovered
-        && resp.hover_pos().is_some_and(|p| toggle_at(i, p))
-    {
+    if input.hovered.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     // Every row's hover reads its whole title and why it is where it is.
@@ -1571,8 +1630,24 @@ fn draw_table(
     for (i, rect) in rects.iter().copied().enumerate() {
         let line = &table.lines[i];
         let color = stage_color(line.stage);
+        // The worker whose page the terminal's place shows: held lit, with
+        // a bar at its left edge, as a selection.
+        if viewed.is_some_and(|v| v.same_row(&line.click)) {
+            p.rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
+            // In the pane's left margin, clear of the text.
+            let bar = egui::Rect::from_min_size(
+                rect.min - egui::vec2(6.0, 0.0),
+                egui::vec2(3.0, rect.height()),
+            );
+            p.rect_filled(bar, 1.0, color);
+        }
         if input.hovered == Some(i) {
-            p.rect_filled(rect, 2.0, color.gamma_multiply(HOVER_TINT));
+            let tint = if input.pressed {
+                PRESS_TINT
+            } else {
+                HOVER_TINT
+            };
+            p.rect_filled(rect, 2.0, color.gamma_multiply(tint));
         }
         // Landed since the last look: its frame breathes with the others'.
         // Painted only, over the row and a hair out to its left so it clears
@@ -1609,9 +1684,13 @@ fn draw_table(
         }
     }
     // A click on a row's fold toggle, or the space after it, folds or
-    // unfolds what hangs under it.
-    let line = table.lines.get(input.clicked?)?;
-    layout.fold_hit(line, input.click_col?)
+    // unfolds what hangs under it and opens nothing.
+    let clicked_line = input.clicked.and_then(|i| table.lines.get(i));
+    let fold = clicked_line.and_then(|l| layout.fold_hit(l, input.click_col?));
+    let clicked = clicked_line
+        .filter(|_| fold.is_none())
+        .map(|l| l.click.clone());
+    Drew { clicked, fold }
 }
 
 #[cfg(test)]
@@ -1716,6 +1795,8 @@ mod tests {
                 .tip()
                 .contains("2 agents of its own under it, 1 running")
         );
-        assert_eq!(t.lines[1].agent_id, "c1");
+        // A click on it is any worker's: its own id and transcript.
+        assert_eq!(t.lines[1].click.agent_id, "c1");
+        assert_eq!(t.lines[2].click.stage, Stage::Done);
     }
 }

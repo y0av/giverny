@@ -18,6 +18,18 @@ A row's hover has its whole title and why it is where it is. A drag selects the 
 
 Rows stay until the tab's conversation is cleared (`/clear`), a fresh `claude` starts in it, or the tab is closed. They are saved, so a Giverny restart keeps the Done rows; they show again once that session is back up.
 
+## What a click on a row opens
+
+A click on any row opens Giverny's **worker page** in the tab, in the terminal's place. Claude Code cannot open a worker's view from outside, and keeps none of a worker whose turn has ended, so Giverny draws the worker as Claude Code's own subagent view does, from its transcript (`agent-<id>.jsonl`):
+
+- It fills the terminal's area, in the terminal's own grid, font and colours, on a background tinted toward the theme's magenta. The worker's prompt is on its grey band, and each tool call and reply under it: `●` green once its result is back, red on an error, grey while it runs, and a tool's output folded to its first three lines.
+- Claude Code's prompt box follows, dimmed and `read-only`, its rules in the worker's colour and the worker's name on the top one. Nothing typed reaches the shell under the page, and nothing is typed into Claude Code.
+- A header over the page names the worker and carries its row's facts as the pane draws them: elapsed, NOW and tokens. Its `×` hides it for that page.
+- A **Running** worker's page follows its transcript as it grows. A **Done** one's opens at its end, on the worker's report. A worker with no transcript yet gets a page saying so.
+- The row of the worker on the page is lit in the pane.
+- The "back" button under the prompt box, Esc, or a second click on the row goes back to the terminal.
+- The wheel, ↑/↓, PgUp/PgDn, Space and Home/End scroll it, and a drag selects and copies.
+
 ## Where the rows come from
 
 - **Running** rows come from Claude Code's live worker list, through the relay below.

@@ -118,6 +118,41 @@ impl RenderShared {
         }
     }
 
+    /// One terminal cell at the current font size, in logical points.
+    pub fn cell_size(&mut self, pixels_per_point: f32) -> Vec2 {
+        let m = self.metrics_for(self.font_size * pixels_per_point);
+        Vec2::new(m.cell_w as f32, m.cell_h as f32) / pixels_per_point
+    }
+
+    /// Paint one line of `text` in the terminal's own glyphs — same face,
+    /// size, hinting and cell grid as the session — with cell 0's top-left
+    /// at `top_left` (snapped to the pixel grid). One cell per `char`.
+    pub fn paint_text(
+        &mut self,
+        painter: &egui::Painter,
+        top_left: Pos2,
+        text: &str,
+        color: Color32,
+    ) {
+        let ctx = painter.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let metrics = self.metrics_for(self.font_size * ppp);
+        let origin_px = Vec2::new((top_left.x * ppp).round(), (top_left.y * ppp).round());
+        let meshes = mesh::text_line(
+            &ctx,
+            &self.fonts,
+            &mut self.atlas,
+            metrics,
+            origin_px,
+            ppp,
+            text,
+            color,
+        );
+        for m in meshes {
+            painter.add(Shape::Mesh(Arc::new(m)));
+        }
+    }
+
     /// Change the font size; invalidates every tab's cached meshes.
     pub fn set_font_size(&mut self, size: f32) {
         let size = size.clamp(7.0, 32.0);

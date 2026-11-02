@@ -7,20 +7,25 @@ mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
+mod management_live;
+mod management_panel;
 mod oom;
 mod overlays;
 mod paste_image;
 mod prompt_bar;
 mod rail;
+mod row_open;
 mod settings_ui;
 mod splash;
 mod taskbar;
 mod titlebar;
 mod translucency;
 mod update;
+mod view_header;
 mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+mod worker_page;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -491,6 +496,8 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      taskbar icon on Wayland)\n  \
      giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
      giverny relay      (internal) agent hook entrypoint\n  \
+     giverny relay --subagent-line\n                     \
+     (internal) Claude Code subagentStatusLine entrypoint\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
@@ -511,7 +518,14 @@ fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let panel_on = config::load(paths.base()).claude.management_panel;
+                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), panel_on);
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -937,6 +951,12 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
+    /// A row of the management panel was clicked: its worker's page opens
+    /// in the tab (`row_open`), or closes when it is the one up.
+    AgentRowClicked(TabId, Box<management_panel::RowClick>),
+    /// The "back" button, or Esc, on the worker page a tab shows: the tab's
+    /// terminal again.
+    ClosePage(TabId),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -1012,6 +1032,10 @@ const UNREACHABLE_TOKENS: u64 = 1_000_000_000;
 
 const RAIL_MIN: f32 = 180.0;
 const RAIL_MAX: f32 = 420.0;
+
+/// The worker page's back button, longest first: the first that fits is
+/// drawn.
+const BACK_LABELS: &[&str] = &["↺ back to the terminal", "↺ back"];
 
 /// How much scrollback a snapshot keeps, and how far behind the tab it is
 /// allowed to fall.
@@ -1163,6 +1187,12 @@ pub struct App {
     wslg_watchdog: Option<wslg_watchdog::Handle>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
+    /// Each tab's management panel view state (`claude.management_panel`);
+    /// the rows are `claude.agents`'.
+    agent_views: management_panel::Views,
+    /// The worker page a tab shows in its terminal's place (`worker_page`):
+    /// a management-panel row's worker. A second click on its row closes it.
+    page: Option<worker_page::WorkerPage>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
@@ -1262,11 +1292,14 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode.
+/// Bring every account in line with the config at startup: auto mode, and
+/// the management panel's subagent line.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
-/// following those would rewrite accounts against what the user configured.
+/// following those would rewrite accounts against what the user configured:
+/// strip the management panel's subagent line from every account where it
+/// was turned on.
 /// Once the file parses again, the hot reload applies what it says. Hook
 /// paths and the status line read nothing from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
@@ -1284,6 +1317,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
+    claude.set_management_panel(cfg.claude.management_panel);
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1704,6 +1738,8 @@ impl App {
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             wslg_watchdog,
             limited: HashMap::new(),
+            agent_views: management_panel::Views::default(),
+            page: None,
             was: HashMap::new(),
             unseen_done: HashSet::new(),
             fg_running: HashMap::new(),
@@ -1869,6 +1905,8 @@ impl App {
                 // recent stack yet. Commit the walk first, so closing the
                 // previewed tab goes back to it.
                 self.end_switch();
+                self.agent_views.forget(id);
+                self.close_page(id);
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
@@ -1921,6 +1959,8 @@ impl App {
                 self.layout.rail_view = view;
                 self.state_dirty = true;
             }
+            Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
+            Action::ClosePage(tab) => self.close_page(tab),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -1977,10 +2017,16 @@ impl App {
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => match self.claude.install_hooks() {
-                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                Err(e) => tracing::error!("hook install: {e}"),
-            },
+            Action::InstallHooks => {
+                match self.claude.install_hooks() {
+                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                    Err(e) => tracing::error!("hook install: {e}"),
+                }
+                // The hooks are the consent the management panel's line
+                // waits for.
+                self.claude
+                    .set_management_panel(self.cfg.claude.management_panel);
+            }
             Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
             Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
             Action::ConfirmCodexResume(id) => {
@@ -3025,6 +3071,13 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
+        if cfg.claude.management_panel != self.cfg.claude.management_panel {
+            self.claude
+                .set_management_panel(cfg.claude.management_panel);
+            if !cfg.claude.management_panel {
+                self.page = None;
+            }
+        }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
             self.shared.opacity = opacity;
@@ -3385,8 +3438,14 @@ impl App {
     }
 
     /// The user looked at tab `id`: its done-markers clear, Claude's tick and
-    /// the unseen-finish badge alike.
+    /// the unseen-finish badge alike. A look at a tab that wore the tick
+    /// flashes its management panel's rows that landed since the last one.
     fn mark_seen(&mut self, id: TabId) {
+        let ticked = self.unseen_done.contains(&id)
+            || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
+        if ticked {
+            self.agent_views.flash_new_done(id);
+        }
         self.claude.mark_viewed(id);
         self.codex.attended(id);
         self.unseen_done.remove(&id);
@@ -3783,10 +3842,59 @@ impl App {
         }
     }
 
+    /// A click on a management-panel row of tab `parent`: its worker's page
+    /// (Running live, Done at its end). The row whose page is up, clicked
+    /// again, closes it.
+    fn open_agent_row(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &management_panel::RowClick,
+    ) {
+        let again = self
+            .page
+            .as_ref()
+            .filter(|p| p.tab == parent)
+            .and_then(|p| p.row.as_ref())
+            .is_some_and(|row| row.same_row(click));
+        tracing::info!(
+            "management panel: row {} clicked{}",
+            click.agent_id,
+            if again { " again: back" } else { "" }
+        );
+        self.close_page(parent);
+        if again {
+            return;
+        }
+        let name = view_header::name_of(&click.name, &click.agent_id);
+        let page = match row_open::plan(click) {
+            row_open::Plan::Watch { transcript, live } => {
+                worker_page::WorkerPage::transcript(parent, name, transcript, live)
+            }
+            row_open::Plan::Show(text) => worker_page::WorkerPage::text(parent, name, text),
+        };
+        self.settings = None;
+        self.keys_overlay = None;
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        self.page = Some(page.of_row(click.clone()));
+    }
+
+    /// The page `tab` shows goes, and its terminal is back.
+    fn close_page(&mut self, tab: TabId) {
+        if self.page.as_ref().is_some_and(|p| p.tab == tab) {
+            self.page = None;
+            self.focus_terminal = true;
+        }
+    }
+
     /// Picking a tab means "show me that tab": the settings screen and the
     /// key list take the terminal's place, so a tab clicked in the rail while
     /// one of them is open used to look like a click that did nothing — the
     /// only way back was the button that opened it.
+    ///
+    /// A worker page is the tab's own and stays.
     fn reveal_terminal(&mut self) {
         self.settings = None;
         self.keys_overlay = None;
@@ -3819,6 +3927,9 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        // A worker page takes the keyboard while its tab shows it: Esc and
+        // the scroll keys, and nothing typed reaches the shell underneath.
+        actions.extend(worker_page::keys(self, ctx));
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
@@ -4223,8 +4334,67 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
+            // The management panel takes the bottom of the terminal's area,
+            // once the tab's session is up. A worker page up in the tab is
+            // the row it shows, lit in the pane and named in its header.
+            let page_row = self
+                .page
+                .as_ref()
+                .filter(|p| p.tab == active)
+                .and_then(|p| p.row.clone());
+            let mut shown_line = None;
+            if self.cfg.claude.management_panel {
+                let (click, line) = management_panel::show(
+                    &mut self.agent_views,
+                    active,
+                    self.claude.agents.shown(active),
+                    page_row.as_ref(),
+                    management_panel::limit_for(
+                        &self.claude,
+                        active,
+                        self.limited.get(&active).map(|w| w.reopens),
+                        jiff::Timestamp::now(),
+                    ),
+                    &self.cfg.management_panel,
+                    &mut self.shared,
+                    ui,
+                );
+                if let Some(click) = click {
+                    actions.push(Action::AgentRowClicked(active, Box::new(click)));
+                }
+                shown_line = line;
+            }
+
             if let Some(rt) = self.rt.get_mut(&active) {
-                if let Some(session) = &mut rt.session {
+                if let Some(page) = self.page.as_mut().filter(|p| p.tab == active) {
+                    // The tab shows a worker page in its terminal's place:
+                    // the same grid, under a header, and nothing reaches the
+                    // terminal under it.
+                    let drawn = page.show(ui, &mut self.shared, BACK_LABELS, self.chrome.accent);
+                    grid_rect = Some(drawn.rect);
+                    if drawn.back {
+                        actions.push(Action::ClosePage(active));
+                    }
+                    if page.header_closed {
+                        page.header_h = 0.0;
+                    } else {
+                        let head = match &shown_line {
+                            Some(line) => view_header::Head::of(line),
+                            None => view_header::Head::titled(&page.name),
+                        };
+                        let band = view_header::show(ui, drawn.rect, &head, &self.chrome, active);
+                        // The rows under it are the banner's: a header that
+                        // grew moves the entries down, next frame.
+                        if (band.height - page.header_h).abs() > 0.5 {
+                            page.header_h = band.height;
+                            ctx.request_repaint();
+                        }
+                        if band.closed {
+                            page.header_closed = true;
+                        }
+                    }
+                    prompt_bar::hide(&ctx, active);
+                } else if let Some(session) = &mut rt.session {
                     // The wheel over the closed prompt bar scrolls the
                     // terminal under it.
                     rt.view.wheel_through([prompt_bar::layer(active)]);

@@ -68,6 +68,9 @@ pub fn build_env(cfg: &SpawnCfg) -> HashMap<String, String> {
     );
     env.insert("GIVERNY_TAB_ID".into(), cfg.tab_id.clone());
     env.insert("GIVERNY_NONCE".into(), cfg.nonce.clone());
+    // The app's own process id: the relay walks up to it to tell the tab's
+    // claude from one that merely inherited `GIVERNY_TAB_ID`.
+    env.insert("GIVERNY_PID".into(), std::process::id().to_string());
     if let Some(dir) = &cfg.claude_config_dir {
         env.insert(
             "CLAUDE_CONFIG_DIR".into(),
@@ -270,6 +273,10 @@ mod tests {
         assert_eq!(env.get("TERM_PROGRAM").unwrap(), "giverny");
         assert_eq!(env.get("GIVERNY_TAB_ID").unwrap(), "tab-1");
         assert_eq!(env.get("GIVERNY_NONCE").unwrap(), "n0nce");
+        assert_eq!(
+            env.get("GIVERNY_PID").unwrap(),
+            &std::process::id().to_string()
+        );
         assert_eq!(
             env.get("CLAUDE_CONFIG_DIR").unwrap(),
             "/home/u/envs/x/claude"

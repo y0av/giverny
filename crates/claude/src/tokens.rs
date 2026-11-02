@@ -546,20 +546,8 @@ pub fn subagent_transcripts(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"))
-            })
-            .collect();
-        files.sort();
-        for p in files {
+        for id in crate::subagents::list_agent_ids(dir) {
+            let p = crate::subagents::agent_transcript(dir, &id);
             let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
             if seen.insert(key) {
                 out.push(p);

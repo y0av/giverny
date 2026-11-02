@@ -237,6 +237,10 @@ fn body(
         ui.add_space(8.0);
     }
 
+    if state.search.is_empty() && state.section == Section::ManagementPanel {
+        return management_panel_page(ui, state, cfg, rows, suggestions, actions, c);
+    }
+
     if state.search.is_empty() && state.section == Section::Codex {
         ui.label(
             "Codex is detected automatically. Type codex normally in any tab; usage uses its existing sign-in.",
@@ -280,6 +284,95 @@ fn body(
         });
         ui.add_space(10.0);
     }
+}
+
+/// The table under the `columns` row: `management_panel.columns.*`.
+const COLUMNS: &str = "management_panel.columns.";
+
+/// Settings → Management panel: the pane's switch, then its columns as one
+/// row of switches, in the pane's own order (which is `SETTINGS`').
+fn management_panel_page(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    rows: &[&'static SettingDef],
+    suggestions: &[String],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let (columns, rest): (Vec<&'static SettingDef>, Vec<&'static SettingDef>) =
+        rows.iter().partition(|d| d.key.starts_with(COLUMNS));
+    for def in rest {
+        row(ui, state, cfg, def, suggestions, actions, c);
+        ui.add_space(10.0);
+    }
+    columns_row(ui, state, cfg, &columns, actions, c);
+    ui.add_space(10.0);
+}
+
+/// One row for every column of the pane: a switch each, lit while the
+/// column shows, and one ● ↺ putting every column back.
+fn columns_row(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    columns: &[&'static SettingDef],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let modified: Vec<&'static SettingDef> = columns
+        .iter()
+        .copied()
+        .filter(|d| !settings::is_default(cfg, d))
+        .collect();
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(230.0);
+            ui.label(RichText::new("columns").font(FontId::monospace(12.5)));
+            ui.label(
+                RichText::new(COLUMNS.trim_end_matches('.'))
+                    .font(FontId::monospace(10.0))
+                    .color(c.dim),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            for def in columns {
+                let on = settings::current(cfg, def)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if ui
+                    .selectable_label(
+                        on,
+                        RichText::new(def.label)
+                            .font(FontId::monospace(12.0))
+                            .color(if on { c.accent } else { c.dim }),
+                    )
+                    .on_hover_text(format!("{}\n{}", def.doc, def.key))
+                    .clicked()
+                {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Bool(!on)));
+                }
+            }
+            if !modified.is_empty() {
+                ui.label(
+                    RichText::new("●")
+                        .font(FontId::monospace(9.0))
+                        .color(c.amber),
+                )
+                .on_hover_text("changed from the default");
+                if ui
+                    .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
+                    .on_hover_text("every column back on")
+                    .clicked()
+                {
+                    for def in &modified {
+                        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
+                    }
+                    state.editing = None;
+                }
+            }
+        });
+    });
 }
 
 fn row(

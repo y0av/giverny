@@ -36,6 +36,12 @@ pub struct ManagementLive {
     /// ended since: the ones whose rows are shown. Not saved — a restart
     /// starts every tab's session over.
     up: HashSet<TabId>,
+    /// Tabs whose session started with no table and no worker yet: the
+    /// session and its account. Such a start makes no table (a fresh
+    /// `claude` in every tab would rescan for workers each second), until
+    /// the session is marked a manager: then it gets one, so its pane shows
+    /// its Next up before its first spawn.
+    waiting: HashMap<TabId, (String, Option<PathBuf>)>,
     /// Where the trackers are saved; `None` keeps them in memory only.
     path: Option<PathBuf>,
     dirty: bool,
@@ -60,6 +66,7 @@ impl ManagementLive {
         ManagementLive {
             trackers,
             up: HashSet::new(),
+            waiting: HashMap::new(),
             path: Some(path),
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -73,6 +80,7 @@ impl ManagementLive {
         ManagementLive {
             trackers: HashMap::new(),
             up: HashSet::new(),
+            waiting: HashMap::new(),
             path: None,
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -82,7 +90,10 @@ impl ManagementLive {
 
     /// The subagents of `tab`'s Claude session, Running and Done — what the
     /// management panel draws. `None` until the tab's Claude has spawned a
-    /// worker or resumed a conversation.
+    /// worker, resumed a conversation, or been marked a manager.
+    ///
+    /// [`Tracker::rows`] is the table; [`Tracker::session_id`] and
+    /// [`Tracker::aliases`] name the feed file to merge with it.
     pub fn tracker(&self, tab: TabId) -> Option<&Tracker> {
         self.trackers.get(&tab)
     }
@@ -98,6 +109,20 @@ impl ManagementLive {
     /// are kept for the next start.
     pub fn session_ended(&mut self, tab: TabId) {
         self.up.remove(&tab);
+        self.waiting.remove(&tab);
+    }
+
+    /// A manager's clear-done message in `tab` (`hooks::CLEAR_DONE_EVENT`):
+    /// drop its Done rows (and hide the feed's that landed by then), keeping
+    /// what runs. `at_ms` is when the clear was asked for, else now.
+    pub fn clear_done(&mut self, tab: TabId, at_ms: Option<u64>) {
+        let now = now_ms();
+        let Some(tracker) = self.trackers.get_mut(&tab) else {
+            return;
+        };
+        let gone = tracker.clear_done(at_ms.unwrap_or(now).min(now));
+        tracing::info!("tab {tab:?}: {gone} Done row(s) cleared from the management panel");
+        self.dirty = true;
     }
 
     /// One relayed tick: Claude Code's `subagentStatusLine` stdin as it
@@ -161,7 +186,9 @@ impl ManagementLive {
     /// workers show from disk on the next refresh instead of waiting for a
     /// live one. A `clear` or `startup` with no table makes none: a fresh
     /// `claude` in every tab would rescan for workers each second. Its first
-    /// worker's tick makes it. `config_dir` is the account it runs under.
+    /// worker's tick makes it, or its session being marked a manager
+    /// ([`ManagementLive::waiting`]). `config_dir` is the account it runs
+    /// under.
     pub fn session_started(
         &mut self,
         tab: TabId,
@@ -170,14 +197,17 @@ impl ManagementLive {
         config_dir: Option<PathBuf>,
     ) {
         self.up.insert(tab);
+        self.waiting.remove(&tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
-            if let Some(sid) = session_id
-                && !matches!(source, Some("clear" | "startup"))
-            {
-                let mut fresh = Tracker::new(config_dir.or_else(default_config_dir));
-                fresh.set_session(sid);
-                self.trackers.insert(tab, fresh);
-                self.dirty = true;
+            if let Some(sid) = session_id {
+                if matches!(source, Some("clear" | "startup")) {
+                    self.waiting.insert(tab, (sid.to_string(), config_dir));
+                } else {
+                    let mut fresh = Tracker::new(config_dir.or_else(default_config_dir));
+                    fresh.set_session(sid);
+                    self.trackers.insert(tab, fresh);
+                    self.dirty = true;
+                }
             }
             return;
         };
@@ -200,10 +230,12 @@ impl ManagementLive {
         let before = self.trackers.len();
         self.trackers.retain(|id, _| tab_exists(*id));
         self.up.retain(|id| tab_exists(*id));
+        self.waiting.retain(|id, _| tab_exists(*id));
         self.dirty |= self.trackers.len() != before;
 
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.last_refresh = Instant::now();
+            self.adopt_managers(&giverny_claude::feed::feed_dir());
             for tracker in self.trackers.values_mut() {
                 let before = signature(tracker);
                 tracker.refresh();
@@ -212,6 +244,27 @@ impl ManagementLive {
         }
         if self.dirty && self.last_save.elapsed() >= SAVE_INTERVAL {
             self.save();
+        }
+    }
+
+    /// Give each [`ManagementLive::waiting`] tab whose session is marked a
+    /// manager in `feeds` ([`giverny_claude::managers`]) its table, bound to
+    /// that session: a `stat` per waiting tab.
+    fn adopt_managers(&mut self, feeds: &Path) {
+        let marked: Vec<TabId> = self
+            .waiting
+            .iter()
+            .filter(|(_, (sid, _))| giverny_claude::managers::is_marked(feeds, sid, &[], || None))
+            .map(|(tab, _)| *tab)
+            .collect();
+        for tab in marked {
+            let Some((sid, config)) = self.waiting.remove(&tab) else {
+                continue;
+            };
+            let mut fresh = Tracker::new(config.or_else(default_config_dir));
+            fresh.set_session(&sid);
+            self.trackers.insert(tab, fresh);
+            self.dirty = true;
         }
     }
 

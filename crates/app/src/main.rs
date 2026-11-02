@@ -1320,6 +1320,11 @@ fn set_up_accounts(
     claude.set_management_panel(cfg.claude.management_panel);
 }
 
+/// `GIVERNY_FEED_DIR` as `%WSLENV%` lists it: `/p` translates the Windows
+/// path into the distribution's terms going in (`C:\…` → `/mnt/c/…`), so a
+/// feed writer inside WSL writes where the app reads.
+const FEED_DIR_WSLENV: &str = "GIVERNY_FEED_DIR/p";
+
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
@@ -3747,6 +3752,12 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
+        // Where a manager in this tab writes its management-panel feed
+        // (`docs/management-panel.md`): the directory this app reads.
+        env.push((
+            giverny_claude::feed::DIR_ENV.into(),
+            giverny_claude::feed::feed_dir().display().to_string(),
+        ));
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
@@ -3823,6 +3834,14 @@ impl App {
             // only what we set, since listing a name we did not set is what
             // put an empty CLAUDE_CONFIG_DIR in front of Claude Code.
             .filter(|name| name.starts_with("GIVERNY_") || name.starts_with("CLAUDE_"))
+            // A path, so it crosses translated.
+            .map(|name| {
+                if name == giverny_claude::feed::DIR_ENV {
+                    FEED_DIR_WSLENV
+                } else {
+                    name
+                }
+            })
             // These two come from the spawn itself rather than from here.
             .chain(["GIVERNY_TAB_ID", "GIVERNY_NONCE"])
             .collect();
@@ -3843,8 +3862,8 @@ impl App {
     }
 
     /// A click on a management-panel row of tab `parent`: its worker's page
-    /// (Running live, Done at its end). The row whose page is up, clicked
-    /// again, closes it.
+    /// (Running live, Done at its end), a Next up row's brief, or the feed's
+    /// `open` command. The row whose page is up, clicked again, closes it.
     fn open_agent_row(
         &mut self,
         ctx: &egui::Context,
@@ -3859,19 +3878,75 @@ impl App {
             .is_some_and(|row| row.same_row(click));
         tracing::info!(
             "management panel: row {} clicked{}",
-            click.agent_id,
+            row_open::title_of(click),
             if again { " again: back" } else { "" }
         );
         self.close_page(parent);
         if again {
             return;
         }
-        let name = view_header::name_of(&click.name, &click.agent_id);
+        // A Done row whose `open` resumes a conversation that is running in
+        // a Giverny tab goes to that tab.
+        if let Some(sid) = row_open::done_resumes(click)
+            && let Some(id) = self.live_holder(&sid)
+        {
+            self.apply(ctx, Action::Select(id));
+            return;
+        }
+        let fallback = click.agent_id.as_deref().unwrap_or(&click.key);
+        let name = if click.key.is_empty() {
+            view_header::name_of(&click.name, fallback)
+        } else {
+            click.key.clone()
+        };
+        use row_open::{Body, Plan};
+        use worker_page::WorkerPage;
         let page = match row_open::plan(click) {
-            row_open::Plan::Watch { transcript, live } => {
-                worker_page::WorkerPage::transcript(parent, name, transcript, live)
+            Plan::Watch { transcript, live } => {
+                WorkerPage::transcript(parent, name, transcript, live)
             }
-            row_open::Plan::Show(text) => worker_page::WorkerPage::text(parent, name, text),
+            // A brief is what the worker will be given: drawn as its
+            // prompt, as Claude Code draws one.
+            Plan::Show(Body::File(path)) => {
+                let text = row_open::read_brief(&path);
+                let rows = giverny_claude::transcript::prompt_rows(&text, None);
+                WorkerPage::rows(parent, name, rows)
+            }
+            Plan::Show(Body::Unbriefed { prompt, hint }) => {
+                use giverny_claude::transcript::{Row, Tone, prompt_rows};
+                let mut rows = prompt_rows(&prompt, None);
+                let mut hint = Row::one(Tone::Dim, format!("  {hint}"));
+                hint.starts = true;
+                rows.push(hint);
+                WorkerPage::rows(parent, name, rows)
+            }
+            Plan::Show(Body::Text(text)) => WorkerPage::text(parent, name, text),
+            Plan::Run { title, command } => {
+                // The same guard a resume has: two claudes on one
+                // conversation interleave its transcript.
+                let running = row_open::resumed_session(&command).filter(|sid| {
+                    let dirs = self.claude.profiles.iter().map(|p| p.config_dir.clone());
+                    giverny_claude::registry::session_is_live(dirs, sid)
+                });
+                let Some(sid) = running else {
+                    self.open_worker_tab(ctx, parent, &title, command);
+                    return;
+                };
+                if let Some(id) = self.live_holder(&sid) {
+                    self.apply(ctx, Action::Select(id));
+                    return;
+                }
+                WorkerPage::text(
+                    parent,
+                    name,
+                    format!(
+                        "This worker's conversation is already running outside Giverny \
+                         ({sid}). Resuming it here as well would put two claudes on one \
+                         transcript, so nothing was opened.\n\nThe row's open command:\n  \
+                         {command}"
+                    ),
+                )
+            }
         };
         self.settings = None;
         self.keys_overlay = None;
@@ -3879,6 +3954,50 @@ impl App {
             self.apply(ctx, Action::Select(parent));
         }
         self.page = Some(page.of_row(click.clone()));
+    }
+
+    /// The Giverny tab running conversation `sid`, when it is live.
+    fn live_holder(&self, sid: &str) -> Option<TabId> {
+        let dirs = self.claude.profiles.iter().map(|p| p.config_dir.clone());
+        if !giverny_claude::registry::session_is_live(dirs, sid) {
+            return None;
+        }
+        self.ws
+            .tabs
+            .iter()
+            .find(|t| t.claude_session.as_deref() == Some(sid))
+            .map(|t| t.id)
+    }
+
+    /// A new tab beside `parent` (its category, its directory), titled for
+    /// a worker, that runs `command` once its shell is up: a feed row's
+    /// `open`.
+    fn open_worker_tab(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        command: String,
+    ) {
+        let cwd = self.ws.tab(parent).and_then(|t| t.cwd.clone());
+        let cat = match self.ws.tab(parent) {
+            Some(t) => t.category,
+            None => category_for_agent(&mut self.ws, cwd.as_deref()),
+        };
+        let id = self.new_tab(cat);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.cwd = cwd.or_else(dirs::home_dir);
+            tab.custom_title = Some(title.to_string());
+        }
+        self.spawn_session(ctx, id, None);
+        // The deferred injection the other tab-opening paths use: give the
+        // shell time to be ready before typing into it.
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(900),
+            id,
+            Inject::Raw(format!("{command}\r").into_bytes()),
+        ));
+        self.apply(ctx, Action::Select(id));
     }
 
     /// The page `tab` shows goes, and its terminal is back.
@@ -4356,6 +4475,7 @@ impl eframe::App for App {
                         jiff::Timestamp::now(),
                     ),
                     &self.cfg.management_panel,
+                    &self.chrome,
                     &mut self.shared,
                     ui,
                 );

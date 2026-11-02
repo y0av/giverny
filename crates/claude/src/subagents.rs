@@ -1090,6 +1090,31 @@ impl SubagentRow {
     }
 }
 
+/// A native row is what the feed merge calls a live row.
+impl crate::feed::LiveAgent for SubagentRow {
+    fn agent_id(&self) -> &str {
+        SubagentRow::agent_id(self)
+    }
+    fn running(&self) -> bool {
+        SubagentRow::running(self)
+    }
+    fn started_ms(&self) -> Option<u64> {
+        self.started_ms
+    }
+    fn tokens(&self) -> Option<u64> {
+        self.shown_tokens()
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn ended_ms(&self) -> Option<u64> {
+        self.ended_ms
+    }
+    fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
+    }
+}
+
 /// The subagents of one tab's Claude session, Running and Done.
 ///
 /// Feed it [`LiveSnapshot`]s as the relay delivers them
@@ -1134,6 +1159,14 @@ pub struct Tracker {
     /// before its parent was kept) has its parent only there.
     #[serde(skip)]
     meta_read: std::collections::HashSet<String>,
+    /// Workers whose Done rows were cleared by hand ([`Tracker::clear_done`]):
+    /// not brought back by the disk or the live list unless they run again.
+    #[serde(default)]
+    dismissed: Vec<String>,
+    /// When the Done rows were last cleared by hand: the pane hides the
+    /// feed's Done rows that landed before it too.
+    #[serde(default)]
+    pub done_cleared_ms: Option<u64>,
 }
 
 impl Tracker {
@@ -1164,9 +1197,26 @@ impl Tracker {
         self.rows.clear();
     }
 
-    /// Has anything worth keeping over a restart: rows.
+    /// Clear the Done rows by hand (a manager's clear-done message),
+    /// keeping the Running ones. A cleared worker stays gone (the next
+    /// refresh finds its transcript and notification still on disk) unless
+    /// it runs again. Returns how many rows went.
+    pub fn clear_done(&mut self, now_ms: u64) -> usize {
+        let before = self.rows.len();
+        for r in &self.rows {
+            if r.stage == Stage::Done && !self.dismissed.contains(&r.id) {
+                self.dismissed.push(r.id.clone());
+            }
+        }
+        self.rows.retain(|r| r.stage != Stage::Done);
+        self.done_cleared_ms = Some(now_ms);
+        before - self.rows.len()
+    }
+
+    /// Has anything worth keeping over a restart: rows, or a clear that has
+    /// to keep holding.
     pub fn worth_saving(&self) -> bool {
-        !self.rows.is_empty()
+        !self.rows.is_empty() || !self.dismissed.is_empty()
     }
 
     /// Is `session` the conversation these rows belong to? `Some(true)` for
@@ -1228,6 +1278,14 @@ impl Tracker {
             self.set_session(sid);
         }
         for t in &snap.tasks {
+            if let Some(i) = self.dismissed.iter().position(|d| *d == t.id) {
+                // Cleared by hand: still listed finished for a while, which
+                // must not bring it back; running again, it is a row again.
+                if Outcome::parse(&t.status).is_some() {
+                    continue;
+                }
+                self.dismissed.remove(i);
+            }
             let row = self.row_mut(&t.id, Stage::Running);
             if t.name.is_some() {
                 row.name = t.name.clone();
@@ -1331,6 +1389,10 @@ impl Tracker {
         for dir in &dirs {
             for id in list_agent_ids(dir) {
                 let known = self.rows.iter().any(|r| r.id == id);
+                if !known && self.dismissed.contains(&id) {
+                    // Cleared by hand; the live list says if it runs again.
+                    continue;
+                }
                 let completion = completions.get(&id);
                 if !known && completion.is_none() {
                     // Not in the live list and never notified: a worker the

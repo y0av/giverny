@@ -878,6 +878,14 @@ impl ClaudeWatch {
             }
             return;
         }
+        // A manager's clear-done: the tab's Done rows, cleared by hand.
+        if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
+            if let Some(tab_id) = Self::tab_id_of(msg) {
+                let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
+                self.agents.clear_done(tab_id, at);
+            }
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };

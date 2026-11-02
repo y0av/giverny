@@ -74,6 +74,7 @@ pub struct PaneColumns {
     pub id: bool,
     pub title: bool,
     pub elapsed: bool,
+    pub eta: bool,
     pub now: bool,
     pub tokens: bool,
 }
@@ -85,6 +86,7 @@ impl Default for PaneColumns {
             id: true,
             title: true,
             elapsed: true,
+            eta: true,
             now: true,
             tokens: true,
         }

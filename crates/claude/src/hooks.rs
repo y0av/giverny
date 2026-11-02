@@ -823,6 +823,13 @@ fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
 /// [`crate::subagents::LiveSnapshot::from_value`] reads it directly.
 pub const SUBAGENT_LINE_EVENT: &str = "GivernySubagentLine";
 
+/// Synthetic event name a manager sends to clear the management panel's
+/// Done rows in its tab (not a Claude hook event): it pipes
+/// `{"hook_event_name": "GivernyClearDone", "session_id": …, "at_ms": …}`
+/// into `giverny relay` from inside the tab, and the relay forwards it as it
+/// forwards any hook. `at_ms` is when the clear was asked for.
+pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
+
 /// The argument after `relay` that selects the subagent-line mode.
 pub const SUBAGENT_LINE_FLAG: &str = "--subagent-line";
 

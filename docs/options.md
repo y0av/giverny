@@ -35,10 +35,11 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.management_panel` | `false` | Show the tab's subagents, running and done, in a table under the terminal. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
-| `management_panel.columns.stage` | `true` | STAGE: Running or Done. |
-| `management_panel.columns.id` | `true` | The subagent's name, else its model. |
-| `management_panel.columns.title` | `true` | The subagent's description: the column that takes the room left. |
+| `management_panel.columns.stage` | `true` | STAGE: Running, NextUp or Done. |
+| `management_panel.columns.id` | `true` | The feed's task key, else the subagent's name, else its model. |
+| `management_panel.columns.title` | `true` | The task's title, else the subagent's description: the column that takes the room left. |
 | `management_panel.columns.elapsed` | `true` | How long the row has worked: a stopwatch while it runs. |
+| `management_panel.columns.eta` | `true` | A manager's estimate: time left, or how a Done row landed against it. |
 | `management_panel.columns.now` | `true` | What the row is doing now: its last tool call, or how it ended. |
 | `management_panel.columns.tokens` | `true` | The tokens the row has used. |
 | `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |

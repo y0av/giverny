@@ -15,7 +15,8 @@
 //! shell under the page, and nothing typed goes anywhere.
 //!
 //! A Running worker is followed as its transcript grows; a Done one opens at
-//! its end, on its report.
+//! its end, on its report. A Next up row's brief is drawn as the prompt its
+//! worker will be given, and opens at its top.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -73,6 +74,9 @@ pub struct WorkerPage {
 
 pub enum Content {
     Text(String),
+    /// Rows drawn as a transcript is: a Next up row's brief, as the
+    /// prompt its worker will be given.
+    Rows(Vec<Row>),
     Transcript(TranscriptView),
 }
 
@@ -101,6 +105,14 @@ impl WorkerPage {
     /// Plain text: why there is nothing else to show.
     pub fn text(tab: TabId, name: String, text: String) -> Self {
         let mut page = Self::with(tab, name, Content::Text(text));
+        page.at_top = true;
+        page
+    }
+
+    /// Rows in the transcript's look, opened at the top: a brief as the
+    /// prompt it will be.
+    pub fn rows(tab: TabId, name: String, rows: Vec<Row>) -> Self {
+        let mut page = Self::with(tab, name, Content::Rows(rows));
         page.at_top = true;
         page
     }
@@ -149,6 +161,7 @@ impl WorkerPage {
                 .lines()
                 .map(|l| Row::one(Tone::Plain, format!("  {l}")))
                 .collect(),
+            Content::Rows(rows) => rows.clone(),
             Content::Transcript(v) => v.lines_for_view(),
         }
     }

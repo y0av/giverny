@@ -1,9 +1,10 @@
 //! The header over a worker page.
 //!
 //! While a tab shows a worker's page (`worker_page`), a slim band at the
-//! top of it says what that worker is on: its name, then the facts of its
-//! management-panel row (time so far, what it is doing or how it ended,
-//! tokens). The facts are the row's, as the pane drew it this frame, so both
+//! top of it says what that worker is on: its task's name, then the facts
+//! of its management-panel row (time so far against the estimate, what it
+//! is doing, how it ended or why it waits, tokens), and a Done row's Review
+//! line. The facts are the row's, as the pane drew it this frame, so both
 //! change together, and a running worker and a finished one read the same.
 //! It is drawn over the page rather than beside it, so it never resizes the
 //! grid. A small `×` closes it for that page.
@@ -14,6 +15,8 @@ use egui::{FontId, Rect, Sense, Ui};
 use giverny_core::tabs::TabId;
 
 use crate::chrome::Chrome;
+use giverny_claude::feed::Stage;
+
 use crate::management_panel::Line;
 
 /// Room kept free at the band's right end for its `×`.
@@ -27,17 +30,30 @@ const FACTS_SIZE: f32 = 12.0;
 /// What the header says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
-    /// The worker's name ([`name_of`]).
+    /// The task's key, else the worker's name ([`name_of`]).
     pub name: String,
     pub facts: String,
+    /// A Done row's Review line ([`review_line`]).
+    pub review: Option<String>,
 }
 
 impl Head {
     /// The header of a management-panel row.
     pub fn of(line: &Line) -> Head {
+        let name = if line.click.key.is_empty() {
+            name_of(&line.click.name, &line.id)
+        } else {
+            line.click.key.clone()
+        };
+        let facts = if line.click.facts.is_empty() {
+            facts(line)
+        } else {
+            line.click.facts.join("  ·  ")
+        };
         Head {
-            name: name_of(&line.click.name, &line.id),
-            facts: facts(line),
+            name,
+            facts,
+            review: review_line(line.stage, line.click.review.as_deref()),
         }
     }
 
@@ -46,6 +62,7 @@ impl Head {
         Head {
             name: name.to_string(),
             facts: String::new(),
+            review: None,
         }
     }
 }
@@ -65,11 +82,25 @@ pub fn name_of(described: &str, fallback: &str) -> String {
     }
 }
 
-/// The facts line of a row: its cells, labelled, the empty ones left out.
+/// The Review line of a Done row: its feed's `review`, trimmed. Nothing for
+/// any other row, or for a blank line; nothing is looked up anywhere else.
+pub fn review_line(stage: Stage, review: Option<&str>) -> Option<String> {
+    (stage == Stage::Done)
+        .then_some(review?)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
+/// The facts line of a row with none of its own: its cells, labelled, the
+/// empty ones left out.
 pub fn facts(line: &Line) -> String {
     let mut out: Vec<String> = Vec::new();
     if !line.elapsed.is_empty() {
         out.push(format!("{} elapsed", line.elapsed));
+    }
+    if !line.eta.is_empty() {
+        out.push(format!("ETA {}", line.eta));
     }
     if !line.now.is_empty() {
         out.push(line.now.clone());
@@ -113,6 +144,16 @@ pub fn show(ui: &mut Ui, term: Rect, head: &Head, chrome: &Chrome, tab: TabId) -
             line_job(&[(&head.facts, FACTS_SIZE, chrome.dim)]),
             chrome.dim,
             "facts",
+        ));
+    }
+    if let Some(review) = &head.review {
+        texts.push((
+            line_job(&[
+                ("Review  ", FACTS_SIZE, chrome.amber),
+                (review, FACTS_SIZE, chrome.fg),
+            ]),
+            chrome.fg,
+            "review",
         ));
     }
     let text_h: f32 = texts.iter().map(|(g, ..)| g.size().y).sum::<f32>()

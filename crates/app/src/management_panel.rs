@@ -1,29 +1,39 @@
 //! The management panel: a table under a tab's terminal listing that tab's
-//! Claude Code subagents — Running and Done — one row each.
+//! Claude Code subagents, Running, Next up and Done, one row each.
 //!
 //! Off by default (`claude.management_panel`); off, nothing here runs. On, it
-//! is drawn as a resizable bottom panel inside the terminal's area, only in a
-//! tab whose tracker holds a real subagent, running or done this session.
+//! is drawn as a resizable bottom panel inside the terminal's area, only when
+//! subagents are involved: in a tab whose tracker holds a real subagent,
+//! running or done this session, or whose session is a manager
+//! ([`giverny_claude::managers`]), so its Next up shows before its first
+//! spawn. A feed never opens it alone ([`feed::opens`]).
 //!
-//! The rows are a [`Tracker`]: Claude Code's own data (live list,
-//! transcripts, notifications), nothing else. This module owns only the
-//! look: the columns STAGE, TASK, ELAPSED, NOW and TOKENS, every one but TASK
-//! a fixed width, no column headings, the whole row tinted by its stage, a
-//! stopwatch ELAPSED ticking every second — a compact status table pinned
-//! under Claude Code. The session's token total is not here: it is on the
-//! status line.
+//! The rows are a [`Tracker`] (Claude Code's own data: live list,
+//! transcripts, notifications) merged with the optional feed file a manager
+//! writes ([`feed::merge`], `docs/management-panel.md`), and **every row
+//! drawn is a real agent** ([`Drawn`]): a feed row with no subagent behind
+//! it is not drawn, save a manager's own Next up. This module owns only the
+//! look: the columns STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one
+//! but TASK a fixed width, no column headings, the whole row tinted by its
+//! stage, a stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done
+//! row's `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's
+//! row above it: a compact status table pinned under Claude Code. The
+//! session's token total is not here: it is on the status line.
 //!
-//! **The rows are not kept here.** [`show`] is handed the tab's tracker —
-//! `ClaudeWatch::agents` (`management_live.rs`), fed by the relay, persisted,
-//! emptied on `/clear` and refreshed once a second — and keeps only what the
-//! pane itself needs per tab.
+//! **The rows are not kept here.** [`show`] is handed the tab's tracker
+//! (`ClaudeWatch::agents`, `management_live.rs`), fed by the relay,
+//! persisted, emptied on `/clear` and refreshed once a second, and keeps only
+//! what the pane itself needs per tab: the feed it last read.
 //!
 //! **Clocks stop while nothing can run**: while the tab's account is out of
-//! a usage limit ([`Limit`]), a Running row's ELAPSED stops and NOW says
-//! `5h limit → 13:00`. The pane remembers each such span ([`Hold`]) and the
-//! clock carries on from where it stopped once the limit resets. A worker
-//! stopped on an API error stands still the same way, from its error until
-//! its next turn. A Done row is measured history and never moves.
+//! a usage limit ([`Limit`]), a Running row's ELAPSED stops, its ETA holds
+//! instead of counting down past zero, and NOW says `5h limit → 13:00`. The
+//! pane remembers each such span ([`Hold`]) and both clocks carry on from
+//! where they stopped once the limit resets. A worker stopped on an API
+//! error stands still the same way, from its error until its next turn, and
+//! so does a feed row its manager paused (`paused_since`), which reads
+//! `paused since 12:58`. Planned ETAs are durations and hold by themselves;
+//! a Done row is measured history and never moves.
 //!
 //! **Nesting**: an agent a worker spawned is drawn under that worker's row,
 //! indented a step per level, and goes where that row goes ([`nest`]); a
@@ -41,39 +51,63 @@
 //!
 //! **Clicks** produce a [`RowClick`], which the app receives as
 //! `Action::AgentRowClicked`. What a click *does* is not decided here
-//! (`row_open`). The row of the worker the tab shows is lit as the selection.
+//! (`row_open`). The row the tab's worker page shows is lit as the
+//! selection.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
-use giverny_claude::subagents::{Outcome, Stage, SubagentRow, Tracker};
+use giverny_claude::feed::{self, Drawn, Feed, FeedCache, PaneRow, Stage};
+use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_core::config::{DoneRows, ManagementPanelConfig, PaneColumns};
 use giverny_core::tabs::TabId;
 use giverny_term::widget::RenderShared;
 
+use crate::chrome::Chrome;
 use crate::claude_watch::{ClaudeWatch, LiveUsage};
 
-/// The stage tints, the 256-colour codes 38;5;32 and 38;5;28, picked to read
-/// on dark and light themes alike.
+/// The three stage tints, the 256-colour codes 38;5;32, 38;5;67 and
+/// 38;5;28, picked to read on dark and light themes alike.
 pub const RUNNING: Color32 = Color32::from_rgb(0x00, 0x87, 0xd7);
+pub const PLANNED: Color32 = Color32::from_rgb(0x5f, 0x87, 0xaf);
 pub const DONE: Color32 = Color32::from_rgb(0x00, 0x87, 0x00);
+
+/// How often the feed file is stat'ed.
+const POLL: Duration = Duration::from_secs(1);
 
 // Column widths, in characters.
 const STAGE_W: usize = 7;
 const EL_W: usize = 8;
+const ETA_W: usize = 10;
 const NOW_W: usize = 28;
 const TOK_W: usize = 6;
 const GAP: usize = 2;
 const MIN_TITLE: usize = 12;
 
+/// What a Running feed row's ETA cell says when its writer gave it no
+/// estimate: drawn dim, so it reads as missing one rather than as a blank.
+pub const NO_ETA: &str = "no ETA";
+/// Where in [`Cols::segments`] the ETA cell sits.
+const ETA_SEG: usize = 3;
+
 // --------------------------------------------------------- view state ----
 
-/// What the pane itself keeps per tab. Never the rows — those are the
-/// tracker's.
+/// What the pane itself keeps per tab: the feed it last read. Never the
+/// rows: those are the tracker's.
 #[derive(Default)]
 struct View {
+    feed: FeedCache,
+    feed_now: Option<Feed>,
+    feed_session: Option<String>,
+    /// The session is a manager ([`giverny_claude::managers`]). Looked up
+    /// with the feed.
+    manager: bool,
+    /// The session's conversation root, once read: what a resumed
+    /// manager's mark is found by, read from its transcript once per id.
+    root: Option<Option<String>>,
+    last_poll: Option<Instant>,
     /// The height the pane last sized itself to, while the user has not
     /// dragged it; `None` once they have.
     fit: Option<f32>,
@@ -81,9 +115,9 @@ struct View {
     holds: Vec<Hold>,
     /// The text dragged over, until the next press.
     sel: Option<Selection>,
-    /// The Done rows this tab's pane has shown, by agent id: what of it was
-    /// seen, kept up every frame it is drawn. `None` until it is first
-    /// drawn.
+    /// The Done rows this tab's pane has shown, by [`done_ident`]: what of
+    /// it was seen, kept up every frame it is drawn. `None` until it is
+    /// first drawn.
     seen_done: Option<HashSet<String>>,
     /// The tab was just looked at with its unseen-finish tick on
     /// ([`Views::flash_new_done`]): the next drawing flashes what landed
@@ -92,12 +126,52 @@ struct View {
     /// The newly done rows breathing now, if any.
     flash: Option<Flash>,
     /// The rows whose agents' own agents are folded away under them, by
-    /// agent id: kept for as long as the tab is.
+    /// [`fold_ident`]: kept for as long as the tab is.
     folded: HashSet<String>,
 }
 
-/// The newly done rows' frames breathing together: which rows (by agent id)
-/// and from when, on the animation clock.
+impl View {
+    /// Re-read the feed for `session`, at most once a [`POLL`] (or at once
+    /// when the session changed). A session Claude Code re-id'd is looked
+    /// up by its earlier ids too, newest first, until its feed names the
+    /// new one.
+    ///
+    /// The manager mark is looked up with it ([`View::manager`]): a `stat`
+    /// of the session's mark and its earlier ids', and of its
+    /// conversation's, whose root is read from the transcript (under
+    /// `config`) once.
+    fn poll_feed(&mut self, session: Option<&str>, aliases: &[String], config: Option<&Path>) {
+        let changed = self.feed_session.as_deref() != session;
+        if !changed && self.last_poll.is_some_and(|t| t.elapsed() < POLL) {
+            return;
+        }
+        self.last_poll = Some(Instant::now());
+        if changed {
+            self.root = None;
+        }
+        self.feed_session = session.map(str::to_string);
+        let ids: Vec<&str> = session
+            .into_iter()
+            .chain(aliases.iter().rev().map(String::as_str))
+            .collect();
+        let dir = feed::feed_dir();
+        self.manager = session.is_some_and(|s| {
+            let root = &mut self.root;
+            giverny_claude::managers::is_marked(&dir, s, &ids[1..], || {
+                root.get_or_insert_with(|| {
+                    let cfg = config?;
+                    let transcript = giverny_claude::subagents::session_transcript(cfg, s)?;
+                    giverny_claude::subagents::conversation_root(&transcript)
+                })
+                .clone()
+            })
+        });
+        self.feed_now = session.and_then(|_| self.feed.poll_any(&dir, &ids).cloned());
+    }
+}
+
+/// The newly done rows' frames breathing together: which rows (by
+/// [`done_ident`]) and from when, on the animation clock.
 struct Flash {
     rows: HashSet<String>,
     from: f64,
@@ -128,6 +202,19 @@ fn flash_glow(t: f64, animate: bool) -> Option<f32> {
     })
 }
 
+/// What a Done row is known by from one look at the pane to the next: the
+/// feed's key, else its worker's id, else its name, as
+/// [`RowClick::same_row`] tells rows apart.
+fn done_ident(c: &RowClick) -> String {
+    if !c.key.is_empty() {
+        format!("k:{}", c.key)
+    } else if let Some(a) = &c.agent_id {
+        format!("a:{a}")
+    } else {
+        format!("n:{}", c.name)
+    }
+}
+
 /// The Done rows of `lines` that landed since the pane was last looked at:
 /// those it never showed (`seen`). A pane not drawn since Giverny started
 /// (`seen` is `None`) knows nothing of what was seen before, so only rows
@@ -137,10 +224,10 @@ fn newly_done(lines: &[Line], seen: Option<&HashSet<String>>, born_ms: u64) -> H
         .iter()
         .filter(|l| l.stage == Stage::Done)
         .filter(|l| match seen {
-            Some(seen) => !seen.contains(&l.agent_id),
+            Some(seen) => !seen.contains(&done_ident(&l.click)),
             None => l.landed_ms.is_some_and(|e| e >= born_ms),
         })
-        .map(|l| l.agent_id.clone())
+        .map(|l| done_ident(&l.click))
         .collect()
 }
 
@@ -148,7 +235,7 @@ fn newly_done(lines: &[Line], seen: Option<&HashSet<String>>, born_ms: u64) -> H
 fn note_seen(seen: &mut Option<HashSet<String>>, lines: &[Line]) {
     let seen = seen.get_or_insert_with(HashSet::new);
     for l in lines.iter().filter(|l| l.stage == Stage::Done) {
-        seen.insert(l.agent_id.clone());
+        seen.insert(done_ident(&l.click));
     }
 }
 
@@ -388,20 +475,42 @@ fn now_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowClick {
     pub stage: Stage,
-    /// The Claude Code subagent id.
-    pub agent_id: String,
-    /// The worker's name or description, for its page's header.
+    /// The feed's key (`acme#158`), else empty.
+    pub key: String,
+    /// The Claude Code subagent id, when a worker holds the row.
+    pub agent_id: Option<String>,
+    /// A Running row whose worker has finished and nobody has landed: its
+    /// transcript is final, and its page opens at its end, as a Done row's.
+    pub finished: bool,
+    /// The worker's name or description, else the row's title.
     pub name: String,
     /// The worker's `agent-<id>.jsonl`, once known.
     pub transcript: Option<PathBuf>,
+    /// The feed's `open` command.
+    pub open: Option<String>,
+    /// The feed's `brief` (Next up).
+    pub brief: Option<PathBuf>,
+    /// The feed's `note`.
+    pub note: Option<String>,
+    /// The feed's `review` line (Done): shown in the page's header as is.
+    pub review: Option<String>,
+    /// The row's state in words, for the page's header: how it landed, how
+    /// long it took against its estimate, its tokens.
+    pub facts: Vec<String>,
 }
 
 impl RowClick {
-    /// Whether `other` is a click on the same row: the same worker. The
-    /// stage is left out: a row viewed while Running is still that row once
-    /// Done.
+    /// Whether `other` is a click on the same row: the feed's key when
+    /// there is one, else the worker's id, else its name. The stage is left
+    /// out: a row viewed while Running is still that row once Done.
     pub fn same_row(&self, other: &RowClick) -> bool {
-        self.agent_id == other.agent_id
+        if !self.key.is_empty() || !other.key.is_empty() {
+            return self.key == other.key;
+        }
+        if self.agent_id.is_some() || other.agent_id.is_some() {
+            return self.agent_id == other.agent_id;
+        }
+        self.name == other.name
     }
 }
 
@@ -411,19 +520,22 @@ impl RowClick {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub stage: Stage,
-    /// The subagent's id: `agent-<id>.jsonl`, `tasks[].id`.
-    pub agent_id: String,
-    /// The TASK column's first word: the agent's name, else its model.
+    /// The TASK column's first word: the feed's key, else the agent's name,
+    /// else its model.
     pub id: String,
     pub title: String,
     pub elapsed: String,
+    pub eta: String,
+    /// A Running feed row with no estimate: `eta` is empty, and the cell is
+    /// drawn as a dim [`NO_ETA`].
+    pub no_eta: bool,
     pub now: String,
     pub tokens: String,
     /// When a Done row landed (epoch ms), when known; `None` on any other
     /// row.
     pub landed_ms: Option<u64>,
     /// The hover's lines under the title: where the row is and why, in
-    /// words ([`running_why`], [`done_why`]).
+    /// words ([`running_why`], [`Wait::why`], [`done_why`]).
     pub why: Vec<String>,
     /// How deep under another row it hangs: 0 for a row of its own, 1 for an
     /// agent a worker spawned, 2 for one that agent spawned. Its title is
@@ -439,7 +551,7 @@ pub struct Line {
 /// them away under it or shows them again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fold {
-    /// What the pane keeps the fold by: the agent's id.
+    /// What the pane keeps the fold by ([`fold_ident`]).
     pub ident: String,
     /// They are folded away.
     pub folded: bool,
@@ -494,10 +606,11 @@ impl Line {
     }
 }
 
-/// The whole table.
+/// The whole table: rows and the feed's footer line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Table {
     pub lines: Vec<Line>,
+    pub footer: Option<String>,
     /// Some row has agents hung under it ([`Line::fold`]): every
     /// top-level title leaves room for the toggle, so they stay aligned.
     pub nested: bool,
@@ -512,51 +625,77 @@ impl Table {
     }
 }
 
-/// Format with no limit ever seen, every Done row shown and nothing folded.
-/// Pure: `now_ms` in, text out.
+/// Merge and format with no limit ever seen, every row and every Done row
+/// shown and nothing folded. Pure: `now_ms` in, text out.
 #[cfg(test)]
-pub fn build(live: &[SubagentRow], now_ms: u64) -> Table {
+pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
     build_with(
+        feed,
         live,
         now_ms,
         &Clock::plain(),
         DoneRows::All,
+        Drawn::Every,
         &HashSet::new(),
     )
 }
 
-/// The table for `live` at `now_ms`, its clocks held through `clock`'s
-/// usage-limit spans, showing only the Done rows `done` keeps
-/// (`management_panel.done_rows`).
+/// The table for `feed` merged with `live` at `now_ms`, its clocks held
+/// through `clock`'s usage-limit spans, showing only the Done rows `done`
+/// keeps (`management_panel.done_rows`) and the rows `drawn` keeps. Rows
+/// are dropped before they are formatted, so a `"` never stands for a row
+/// that is not drawn.
 ///
 /// An agent another drawn agent spawned hangs under that agent's row
 /// ([`nest`]), unless that row is in `folded`.
 pub fn build_with(
+    feed: Option<&Feed>,
     live: &[SubagentRow],
     now_ms: u64,
     clock: &Clock,
     done: DoneRows,
+    drawn: Drawn,
     folded: &HashSet<String>,
 ) -> Table {
-    let nested = nest(live, done, folded);
-    let lines: Vec<Line> = nested
-        .iter()
-        .map(|n| {
-            let mut line = format_row(&live[n.at], now_ms, clock);
-            line.depth = n.depth;
-            line.fold = n.fold.clone();
-            if let Some(f) = &n.fold {
-                line.why.push(fold_why(f));
-            }
-            if let Some(p) = &n.parent {
-                line.why.push(format!("spawned by {p}"));
-            }
-            line
-        })
+    let rows = placed_rows(feed, live);
+    // What a Next up row waits for is read off every row, drawn or not: the
+    // task it was planned after may have no worker yet.
+    let waits: Vec<Option<Wait>> = rows.iter().map(|r| planned_wait(r, &rows)).collect();
+    let order = start_order(&rows, &waits);
+    let mut kept: Vec<_> = rows
+        .into_iter()
+        .zip(waits)
+        .zip(order)
+        .filter(|((r, _), _)| drawn.keeps(r))
         .collect();
+    // Next up in the order its rows will start, the next on top; Running
+    // and Done as they were.
+    kept.sort_by_key(|(_, o)| *o);
+    let (rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().map(|(rw, _)| rw).unzip();
+    let nested = nest(&rows, done, folded);
+    let mut slots: Vec<Option<_>> = rows.into_iter().zip(waits).map(Some).collect();
+    let (mut rows, waits): (Vec<_>, Vec<_>) =
+        nested.iter().filter_map(|n| slots[n.at].take()).unzip();
+    reditto(&mut rows);
+    let written = feed.and_then(|f| f.written_ms);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    for ((row, wait), n) in rows.iter().zip(waits).zip(&nested) {
+        let mut line = format_row(row, now_ms, written, clock, wait);
+        line.depth = n.depth;
+        line.fold = n.fold.clone();
+        if let Some(f) = &n.fold {
+            line.why.push(fold_why(f));
+        }
+        if let Some(p) = &n.parent {
+            line.why.push(format!("spawned by {p}"));
+        }
+        lines.push(line);
+    }
+    dittos(&rows, &mut lines);
     Table {
         nested: lines.iter().any(|l| l.fold.is_some()),
         lines,
+        footer: feed.and_then(|f| f.footer.clone()),
     }
 }
 
@@ -571,19 +710,57 @@ struct Nested {
     parent: Option<String>,
 }
 
-/// The row each row hangs under, by place: the row of the agent that
-/// spawned it ([`SubagentRow::parent_id`]). An agent whose spawner holds no
-/// row stands on its own, and so does one caught in a loop of parents
-/// (never seen; never trusted).
-fn parent_rows(rows: &[SubagentRow]) -> Vec<Option<usize>> {
+/// What a row's fold is kept by: its feed key, else its agent's id, as
+/// [`done_ident`] knows a row, so a worker's fold holds from Running to
+/// Done.
+fn fold_ident(row: &PaneRow<'_, SubagentRow>) -> String {
+    match (
+        row.feed.filter(|f| f.keyed).map(|f| f.key.as_str()),
+        row.agent_id(),
+    ) {
+        (Some(k), _) => format!("k:{k}"),
+        (None, Some(a)) => format!("a:{a}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// A row by name, for a hover: its feed key, else its agent's name.
+fn row_name(row: &PaneRow<'_, SubagentRow>) -> String {
+    row.feed
+        .filter(|f| f.keyed)
+        .map(|f| f.key.clone())
+        .or_else(|| row.live.map(|l| l.display_name().to_string()))
+        .unwrap_or_default()
+}
+
+/// The row each row hangs under, by place: the drawn row of the agent that
+/// spawned it ([`SubagentRow::parent_id`]). A worker that holds several
+/// rows takes it under the one whose task was under way when it spawned it
+/// (the latest to start no later), else its first. An agent whose spawner
+/// holds no row stands on its own, and so does one caught in a loop of
+/// parents (never seen; never trusted).
+fn parent_rows(rows: &[PaneRow<'_, SubagentRow>]) -> Vec<Option<usize>> {
     let mut up: Vec<Option<usize>> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let p = r.parent_id.as_deref()?;
-            rows.iter()
+            let l = r.live?;
+            let p = l.parent_id.as_deref()?;
+            let holds = |(j, o): &(usize, &PaneRow<'_, SubagentRow>)| {
+                *j != i && o.stage != Stage::Planned && o.agent_id() == Some(p)
+            };
+            let under_way = rows
+                .iter()
                 .enumerate()
-                .position(|(j, o)| j != i && o.id == p)
+                .filter(holds)
+                .filter(|(_, o)| match (o.started_ms(), l.started_ms) {
+                    (Some(a), Some(b)) => a <= b,
+                    _ => false,
+                })
+                .max_by_key(|(_, o)| o.started_ms());
+            under_way
+                .or_else(|| rows.iter().enumerate().find(holds))
+                .map(|(j, _)| j)
         })
         .collect();
     for i in 0..up.len() {
@@ -601,10 +778,10 @@ fn parent_rows(rows: &[SubagentRow]) -> Vec<Option<usize>> {
     up
 }
 
-/// Place the rows as the pane draws them: each agent another agent spawned
-/// right under its spawner's row, a level deeper, in the order the rows
-/// came; its spawner's Running or Done row carries it wherever that row is.
-/// A row in `folded` hides everything under it and says how much
+/// Place the rows as the pane draws them: each agent another drawn agent
+/// spawned right under its spawner's row, a level deeper, in the order the
+/// rows came; its spawner's Running or Done row carries it wherever that
+/// row is. A row in `folded` hides everything under it and says how much
 /// ([`Fold`]).
 ///
 /// `done` keeps the newest Done rows of their own (`Last(n)` counts only
@@ -612,7 +789,11 @@ fn parent_rows(rows: &[SubagentRow]) -> Vec<Option<usize>> {
 /// not kept goes with it, but an agent still running there stands on its
 /// own instead: a running agent is never hidden by the Done setting.
 /// `Hide` hides every Done row, nested or not.
-fn nest(rows: &[SubagentRow], done: DoneRows, folded: &HashSet<String>) -> Vec<Nested> {
+fn nest(
+    rows: &[PaneRow<'_, SubagentRow>],
+    done: DoneRows,
+    folded: &HashSet<String>,
+) -> Vec<Nested> {
     let n = rows.len();
     let mut up = parent_rows(rows);
     let level = |up: &[Option<usize>], i: usize| {
@@ -664,7 +845,7 @@ fn nest(rows: &[SubagentRow], done: DoneRows, folded: &HashSet<String>) -> Vec<N
         }
     }
     // Everything under a row, every level down, and how much of it runs.
-    fn under(i: usize, kids: &[Vec<usize>], rows: &[SubagentRow]) -> (usize, usize) {
+    fn under(i: usize, kids: &[Vec<usize>], rows: &[PaneRow<'_, SubagentRow>]) -> (usize, usize) {
         kids[i].iter().fold((0, 0), |(all, run), &k| {
             let (a, r) = under(k, kids, rows);
             let me = usize::from(rows[k].stage == Stage::Running);
@@ -676,13 +857,13 @@ fn nest(rows: &[SubagentRow], done: DoneRows, folded: &HashSet<String>) -> Vec<N
         depth: usize,
         parent: Option<String>,
         kids: &[Vec<usize>],
-        rows: &[SubagentRow],
+        rows: &[PaneRow<'_, SubagentRow>],
         folded: &HashSet<String>,
         out: &mut Vec<Nested>,
     ) {
         let fold = (!kids[i].is_empty()).then(|| {
             let (under, running) = under(i, kids, rows);
-            let ident = rows[i].id.clone();
+            let ident = fold_ident(&rows[i]);
             Fold {
                 folded: folded.contains(&ident),
                 ident,
@@ -699,7 +880,7 @@ fn nest(rows: &[SubagentRow], done: DoneRows, folded: &HashSet<String>) -> Vec<N
         });
         if open {
             for &k in &kids[i] {
-                let name = Some(rows[i].display_name().to_string());
+                let name = Some(row_name(&rows[i]));
                 place(k, depth + 1, name, kids, rows, folded, out);
             }
         }
@@ -732,104 +913,551 @@ fn fold_why(f: &Fold) -> String {
     }
 }
 
-fn format_row(l: &SubagentRow, now_ms: u64, clock: &Clock) -> Line {
-    // A named agent shows its name and description; any other its model
-    // and description.
-    let (id, title) = match (&l.name, &l.description) {
+/// The pane's rows: the feed merged with the live rows, and the Running
+/// rows nobody works on moved to Next up ([`benched`]). Every row, drawn or
+/// not ([`Drawn`] says which are).
+fn placed_rows<'a>(
+    feed: Option<&'a Feed>,
+    live: &'a [SubagentRow],
+) -> Vec<PaneRow<'a, SubagentRow>> {
+    let mut rows = feed::merge(feed, live);
+    let mut moved = false;
+    for row in rows.iter_mut() {
+        if benched(row) {
+            row.stage = Stage::Planned;
+            moved = true;
+        }
+    }
+    if moved {
+        // Stable: every other row keeps its place.
+        rows.sort_by_key(|r| r.stage);
+        reditto(&mut rows);
+    }
+    rows
+}
+
+/// A Running feed row nobody works on: no worker at all yet (a manager
+/// marks a task started a moment before it spawns the worker), or one its
+/// manager paused or held after its worker finished. It is drawn under Next
+/// up, its NOW saying why ([`planned_wait`]): `held: …`, `paused since …`,
+/// [`NO_WORKER_YET`]. The feed still says Running: a worker picking it up
+/// moves it back.
+fn benched(row: &PaneRow<'_, SubagentRow>) -> bool {
+    let Some(f) = row.feed.filter(|_| row.stage == Stage::Running) else {
+        return false;
+    };
+    match row.live {
+        None => true,
+        Some(l) => !l.running() && (f.held.is_some() || f.paused_since_ms.is_some()),
+    }
+}
+
+/// Ditto again ([`PaneRow::ditto`]) where rows moved or went: a row is a
+/// ditto of the one now directly above it, the same worker.
+fn reditto(rows: &mut [PaneRow<'_, SubagentRow>]) {
+    for i in 0..rows.len() {
+        let same = i > 0
+            && match (rows[i - 1].agent_id(), rows[i].agent_id()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+        rows[i].ditto = same;
+    }
+}
+
+/// A cell is `"` when its row is the same worker as the row above
+/// ([`PaneRow::ditto`]) and its text is that row's text, compared before
+/// either was replaced, so a run of three dittos all the way down.
+fn dittos(rows: &[PaneRow<'_, SubagentRow>], lines: &mut [Line]) {
+    let raw: Vec<[String; 4]> = lines
+        .iter()
+        .map(|l| {
+            [
+                l.elapsed.clone(),
+                l.eta.clone(),
+                l.now.clone(),
+                l.tokens.clone(),
+            ]
+        })
+        .collect();
+    for i in 1..lines.len() {
+        if !rows[i].ditto {
+            continue;
+        }
+        let out = &mut lines[i];
+        let cells = [
+            &mut out.elapsed,
+            &mut out.eta,
+            &mut out.now,
+            &mut out.tokens,
+        ];
+        for (k, cell) in cells.into_iter().enumerate() {
+            if !raw[i][k].is_empty() && raw[i][k] == raw[i - 1][k] {
+                *cell = "\"".into();
+            }
+        }
+    }
+}
+
+/// Where a Running row's clock stands: `now`, or for a row paused in the
+/// feed, the instant its `started` is true as of: the feed's write time (a
+/// writer that pauses moves `started` on by the open pause up to then),
+/// never before the pause began nor after `now`.
+fn clock_stop(paused_since: Option<u64>, written: Option<u64>, now_ms: u64) -> u64 {
+    match paused_since {
+        Some(p) => written.map_or(p, |w| w.max(p)).min(now_ms),
+        None => now_ms,
+    }
+}
+
+/// A live row's TASK cells: a named agent shows its name and description;
+/// any other its model and description.
+fn live_cells(l: &SubagentRow) -> (String, String) {
+    match (&l.name, &l.description) {
         (Some(n), Some(d)) => (n.clone(), d.clone()),
         _ => (
             l.model.as_deref().and_then(short_model).unwrap_or_default(),
             l.display_name().to_string(),
         ),
+    }
+}
+
+fn format_row(
+    row: &PaneRow<'_, SubagentRow>,
+    now_ms: u64,
+    written: Option<u64>,
+    clock: &Clock,
+    wait: Option<Wait>,
+) -> Line {
+    let f = row.feed;
+    let l = row.live;
+    let key = f.map(shown_key).unwrap_or_default();
+    // A feed row's key and title; a worker's name and description.
+    let (id, title) = match (f, l) {
+        (Some(f), _) if !key.is_empty() => (
+            key.clone(),
+            f.title
+                .clone()
+                .or_else(|| l.map(|l| l.display_name().to_string()))
+                .unwrap_or_default(),
+        ),
+        (f, Some(l)) => {
+            let (id, title) = live_cells(l);
+            (id, f.and_then(|f| f.title.clone()).unwrap_or(title))
+        }
+        (f, None) => (
+            String::new(),
+            f.and_then(|f| f.title.clone()).unwrap_or_default(),
+        ),
     };
-    let start = l.started_ms;
+    // This row's own start: the worker's, or the feed's where it is the
+    // truer one ([`PaneRow::started_ms`]).
+    let row_start = row.started_ms();
+    let paused = row.paused_since_ms();
+    // A Running row drawn under Next up ([`benched`]) that its manager
+    // paused.
+    let benched_pause = f
+        .filter(|f| row.stage == Stage::Planned && f.stage == Some(Stage::Running))
+        .and_then(|f| f.paused_since_ms);
+    // A feed row that carries its pauses has its stops taken off `started`
+    // already (a writer may also pause rows for a limit itself): the
+    // pane's own holds would take them off twice.
+    let writer_pauses = f.is_some_and(|f| f.paused_s.is_some() || f.paused_since_ms.is_some());
+    let holds = if writer_pauses { &[][..] } else { clock.holds };
     // A worker stopped on an API error stands still from then, and its
     // error spans are off its clock.
-    let stopped = l.stopped().filter(|_| l.stage == Stage::Running);
+    let stopped = l
+        .filter(|_| row.stage == Stage::Running)
+        .and_then(|l| l.stopped());
+    let error_ms = |s: u64, e: u64| l.map_or(0, |l| l.stopped_ms(s, e));
     // Where a Running row's clock stands now.
-    let stop = match (l.stage, start) {
-        (Stage::Running, Some(s)) => Some(match &stopped {
-            Some((since, _)) => now_ms.min((*since).max(s)),
-            None => now_ms,
-        }),
+    let stop = match (row.stage, row_start) {
+        (Stage::Running, Some(s)) => {
+            let mut stop = clock_stop(paused, written, now_ms);
+            if let Some((since, _)) = &stopped {
+                stop = stop.min((*since).max(s));
+            }
+            Some(stop)
+        }
         _ => None,
     };
-    let elapsed = match (l.stage, start) {
-        // The work so far: wall time up to where its clock stands, less
-        // every span the account was out of its limit or the worker stood
-        // on an error.
-        (Stage::Running, Some(s)) => {
-            let stop = stop.unwrap_or(now_ms);
-            let from = s.min(stop);
-            stopwatch(
-                stop.saturating_sub(from)
-                    .saturating_sub(held_ms(clock.holds, from, stop))
-                    .saturating_sub(l.stopped_ms(from, stop))
-                    / 1000,
-            )
-        }
-        (Stage::Done, Some(s)) => match l.ended_ms {
-            Some(e) => stopwatch(e.saturating_sub(s).saturating_sub(l.stopped_ms(s, e)) / 1000),
-            None => String::new(),
-        },
-        _ => String::new(),
+    // The work in `[from, stop]`, in seconds: its wall time less every span
+    // the account was out of its limit or the worker stood on an error.
+    let work_since = |from: u64, stop: u64| {
+        let from = from.min(stop);
+        stop.saturating_sub(from)
+            .saturating_sub(held_ms(holds, from, stop))
+            .saturating_sub(error_ms(from, stop))
+            / 1000
     };
-    let limit = clock.limit.filter(|l| l.out_at(now_ms));
-    let now = match l.stage {
-        // The limit first, then a stop on an API error, then what it does.
-        Stage::Running => match (limit, &stopped) {
-            (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
-            (None, Some((_, why))) => why.clone(),
-            (None, None) => l.activity.clone().unwrap_or_default(),
-        },
-        Stage::Done => l.outcome.map(outcome_word).unwrap_or_default(),
-    };
-    let tokens = l.shown_tokens().map(fmt_tokens).unwrap_or_default();
-    // The hover's lines under the title: where the row is and why, from the
-    // cells above.
-    let why = match l.stage {
-        Stage::Running => {
-            let mut who = format!("worker {}", l.display_name());
-            if let Some(m) = l.model.as_deref().and_then(short_model) {
-                who.push_str(&format!(" ({m})"));
+    let work_s = row_start.zip(stop).map(|(s, stop)| work_since(s, stop));
+    let elapsed = match row.stage {
+        Stage::Planned => String::new(),
+        Stage::Running => work_s.map(stopwatch).unwrap_or_default(),
+        Stage::Done => match (row_start, row.ended_ms()) {
+            (Some(s), Some(e)) => {
+                stopwatch(e.saturating_sub(s).saturating_sub(error_ms(s, e)) / 1000)
             }
-            let since = start.map(|s| clock_at(s, now_ms, &clock.tz));
-            let state = match (limit, &stopped) {
-                (Some(lim), _) => Some(format!(
+            _ => String::new(),
+        },
+    };
+    let eta_s = f.and_then(|f| f.eta_s);
+    let figure = row.last_figure();
+    // A Done row's ± and the figure it was measured against.
+    let delta = match row.stage {
+        Stage::Done => row.eta_delta_s(&error_ms),
+        _ => None,
+    };
+    // Re-estimated: the latest figure less the work since it was given;
+    // else the estimate less the work since the start.
+    let left_s = match (row.stage, figure, stop, eta_s, work_s) {
+        (Stage::Running, Some((at, left)), Some(stop), _, _) => {
+            Some(left as i64 - work_since(at, stop) as i64)
+        }
+        (Stage::Running, _, _, Some(eta), Some(work)) => Some(eta as i64 - work as i64),
+        _ => None,
+    };
+    let eta = match row.stage {
+        Stage::Running => left_s.map(countdown).unwrap_or_default(),
+        Stage::Planned => eta_s
+            .map(|e| format!("~{}", feed::fmt_span(e as i64)))
+            .unwrap_or_default(),
+        Stage::Done => delta.map(|(d, _)| feed::fmt_delta(d)).unwrap_or_default(),
+    };
+    // Only a row its writer named a task of is missing an estimate; a
+    // worker no feed row names has none to miss.
+    let no_eta = row.stage == Stage::Running
+        && f.is_some_and(|f| f.keyed)
+        && eta_s.is_none()
+        && figure.is_none();
+    let limit = clock.limit.filter(|l| l.out_at(now_ms));
+    // A Running feed row whose worker has finished, and that nobody has
+    // landed: how and when it ended.
+    let finished = (row.stage == Stage::Running)
+        .then_some(l)
+        .flatten()
+        .filter(|l| !l.running())
+        .map(|l| {
+            let how = match l.outcome {
+                Some(Outcome::Failed) => "failed",
+                Some(Outcome::Killed) => "killed",
+                Some(Outcome::Stopped) => "stopped",
+                _ => "turn ended",
+            };
+            (how, l.ended_ms.or(l.last_turn_ms))
+        });
+    let now = match row.stage {
+        // The limit first, then a pause, then a stop on an API error, then
+        // an end nobody has landed, then what it does.
+        Stage::Running => match (limit, paused, &stopped, finished) {
+            (Some(limit), ..) => limit_note(limit, now_ms, &clock.tz),
+            (None, Some(p), ..) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
+            (None, None, Some((_, why)), _) => why.clone(),
+            (None, None, None, Some((how, at))) => match at {
+                Some(at) => format!("{how} {}", clock_at(at, now_ms, &clock.tz)),
+                None => how.to_string(),
+            },
+            (None, None, None, None) => l.and_then(|l| l.activity.clone()).unwrap_or_default(),
+        },
+        // What it waits for ([`planned_wait`]); nothing when it waits on
+        // nothing recorded. A Running row benched while paused: since when.
+        Stage::Planned => {
+            match benched_pause.filter(|_| wait.as_ref().is_none_or(|w| w.held.is_none())) {
+                Some(p) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
+                None => wait.as_ref().map(|w| w.note.clone()).unwrap_or_default(),
+            }
+        }
+        Stage::Done => f
+            .and_then(|f| f.landing.clone())
+            .or_else(|| l.and_then(|l| l.outcome).map(outcome_word))
+            .unwrap_or_default(),
+    };
+    let tokens = row.tokens().map(fmt_tokens).unwrap_or_default();
+    let vs = delta.map_or_else(|| "estimate".into(), |(_, a)| a.label());
+    let mut facts = row_facts(row.stage, &elapsed, &eta, &vs, &now, &tokens);
+    if no_eta {
+        facts.insert(1.min(facts.len()), NO_ETA_WHY.to_string());
+    }
+    if let Some(why) = wait.as_ref().and_then(|w| w.held.as_deref()) {
+        facts.push(format!("held: {why}"));
+    }
+    // The hover's lines under the title: where the row is and why, from
+    // the cells above before any ditto.
+    let note = f.and_then(|f| f.note.as_deref());
+    let why = match row.stage {
+        Stage::Running => {
+            let who = match l {
+                Some(l) => {
+                    let mut w = format!("worker {}", l.display_name());
+                    if let Some(m) = l.model.as_deref().and_then(short_model) {
+                        w.push_str(&format!(" ({m})"));
+                    }
+                    w
+                }
+                None => "no worker on it".into(),
+            };
+            let since = f
+                .and_then(|f| f.spawned_ms)
+                .or(row_start)
+                .map(|s| clock_at(s, now_ms, &clock.tz));
+            let state = if let Some(lim) = limit {
+                Some(format!(
                     "{} — out of usage; its clock is held",
                     limit_note(lim, now_ms, &clock.tz)
-                )),
-                (None, Some((_, why))) => Some(format!("{why} — its worker is not working")),
-                (None, None) => None,
+                ))
+            } else if let Some(p) = paused {
+                Some(paused_why(&clock_at(p, now_ms, &clock.tz), note))
+            } else if let Some((_, why)) = &stopped {
+                Some(format!("{why} — its worker is not working"))
+            } else {
+                finished.map(|(how, at)| {
+                    let at = at.map_or(String::new(), |at| {
+                        format!(" at {}", clock_at(at, now_ms, &clock.tz))
+                    });
+                    format!("its worker {how}{at}; not landed yet")
+                })
             };
             // What the worker is doing right now, whole: NOW cuts it to fit.
-            let doing = l.activity.clone().filter(|a| !a.is_empty());
+            let doing = l
+                .filter(|l| l.running())
+                .and_then(|l| l.activity.clone())
+                .filter(|a| !a.is_empty());
+            // Only a feed row has an estimate to speak of.
+            let est = f.map(|_| estimate_why(eta_s, left_s));
             doing
                 .into_iter()
                 .chain(running_why(&who, since.as_deref(), state))
+                .chain(est)
                 .collect()
         }
-        Stage::Done => done_why(&now, &elapsed),
+        Stage::Planned => {
+            let line =
+                match benched_pause.filter(|_| wait.as_ref().is_none_or(|w| w.held.is_none())) {
+                    Some(p) => paused_why(&clock_at(p, now_ms, &clock.tz), note),
+                    None => wait.as_ref().map(|w| w.why.clone()).unwrap_or_default(),
+                };
+            let est = (!eta.is_empty()).then(|| format!("estimate {eta}"));
+            [Some(line).filter(|l| !l.is_empty()), est]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+        Stage::Done => done_why(
+            &now,
+            &elapsed,
+            f.map(|_| delta),
+            f.and_then(|f| f.review.as_deref()),
+        ),
     };
     Line {
-        stage: l.stage,
-        agent_id: l.id.clone(),
+        stage: row.stage,
         id,
         title,
+        why,
         elapsed,
+        eta,
+        no_eta,
         now,
         tokens,
-        landed_ms: l.ended_ms.filter(|_| l.stage == Stage::Done),
-        why,
+        landed_ms: row.ended_ms().filter(|_| row.stage == Stage::Done),
         depth: 0,
         fold: None,
         click: RowClick {
-            stage: l.stage,
-            agent_id: l.id.clone(),
-            name: l.display_name().to_string(),
-            transcript: l.transcript.clone(),
+            stage: row.stage,
+            key,
+            // The worker drawn: a fresh one that took the row from a
+            // finished one is the one to open, not the id the feed names.
+            agent_id: l
+                .map(|l| l.id.clone())
+                .or_else(|| row.agent_id().map(str::to_string)),
+            finished: finished.is_some(),
+            name: l
+                .map(|l| l.display_name().to_string())
+                .or_else(|| f.and_then(|f| f.title.clone()))
+                .unwrap_or_default(),
+            transcript: l.and_then(|l| l.transcript.clone()),
+            open: f.and_then(|f| f.open.clone()),
+            brief: f.and_then(|f| f.brief.clone()),
+            note: f.and_then(|f| f.note.clone()),
+            review: f.and_then(|f| f.review.clone()),
+            facts,
         },
     }
+}
+
+/// What a Next up row's NOW says ([`planned_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    pub note: String,
+    /// The manager's hold, in full, for the page's header.
+    pub held: Option<String>,
+    /// The row's hover line: the note, and why it is there.
+    pub why: String,
+    /// Where it stands in line to start ([`start_order`]).
+    pub start: Start,
+    /// The task it waits for (`after <key>`), if any.
+    pub after: Option<String>,
+}
+
+/// Where a Next up row stands in line to start, first to last: the pane
+/// draws Next up in this order, the one that starts next on top
+/// ([`start_order`]); rows of one place keep their feed order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Start {
+    /// It was started: it waits only for its worker.
+    Ready,
+    /// Nothing recorded to wait for.
+    Idle,
+    /// After another task ([`Wait::after`]), and after that task's row when
+    /// it is in Next up too.
+    After,
+    /// Held or paused: it starts only on its manager's call.
+    SetAside,
+}
+
+/// What a Next up row waits for: a hold its manager recorded (`held:
+/// <why>`), or another task: the one it was planned `after` until that
+/// lands, or the task its worker is busy with (`after <key>`). A row with
+/// none of these waits on nothing, and its NOW is empty. `None` for any
+/// other row.
+fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>]) -> Option<Wait> {
+    if row.stage != Stage::Planned {
+        return None;
+    }
+    let f = row.feed;
+    let waits = |note: String, why: String, start: Start| Wait {
+        note,
+        held: None,
+        why,
+        start,
+        after: None,
+    };
+    if let Some(why) = f.and_then(|f| f.held.clone()) {
+        return Some(Wait {
+            note: format!("held: {why}"),
+            why: format!("held — not started; waiting for: {why}"),
+            held: Some(why),
+            ..waits(String::new(), String::new(), Start::SetAside)
+        });
+    }
+    // A Running row benched for want of a worker ([`benched`]): a paused
+    // one says since when ([`format_row`]), and is set aside.
+    if let Some(f) = f.filter(|f| f.stage == Some(Stage::Running)) {
+        return Some(waits(
+            NO_WORKER_YET.to_string(),
+            format!("{NO_WORKER_YET} — started, but no worker has picked it up"),
+            if f.paused_since_ms.is_some() {
+                Start::SetAside
+            } else {
+                Start::Ready
+            },
+        ));
+    }
+    // The task it was planned after: waited for until it is drawn Done; one
+    // gone from the feed is no wait.
+    let before = f
+        .and_then(|f| f.after.as_deref())
+        .and_then(|a| rows.iter().find(|r| r.feed.is_some_and(|f| f.key == a)));
+    let after = |k: &str, why: String| {
+        Some(Wait {
+            after: Some(k.to_string()),
+            ..waits(format!("after {k}"), why, Start::After)
+        })
+    };
+    if let Some(r) = before.filter(|r| r.stage != Stage::Done) {
+        let k = r.feed.map_or("", |f| f.key.as_str());
+        return after(k, format!("after {k} — starts when that lands"));
+    }
+    if let Some(k) = &row.after_key {
+        return after(
+            k,
+            format!("after {k} — starts when its worker is done with that"),
+        );
+    }
+    f?;
+    Some(waits(String::new(), IDLE_WHY.to_string(), Start::Idle))
+}
+
+/// Each row's place in the pane's drawing order: its section, then, in Next
+/// up, where it stands in line to start ([`Wait::start`]) and how deep in a
+/// chain of `after`s it sits. A row after another Next up row goes after
+/// that row: no sooner than its place, one deeper, so it is set aside too
+/// behind a held one. Sorted on stably, rows of one place keep their feed
+/// order.
+fn start_order(
+    rows: &[PaneRow<'_, SubagentRow>],
+    waits: &[Option<Wait>],
+) -> Vec<(Stage, Start, usize)> {
+    fn place(
+        i: usize,
+        rows: &[PaneRow<'_, SubagentRow>],
+        waits: &[Option<Wait>],
+        seen: &mut Vec<usize>,
+    ) -> (Start, usize) {
+        let Some(w) = &waits[i] else {
+            return (Start::Idle, 0);
+        };
+        let before = w.after.as_deref().and_then(|k| {
+            rows.iter()
+                .position(|r| r.stage == Stage::Planned && r.feed.is_some_and(|f| f.key == k))
+        });
+        match before {
+            // A loop of `after`s is no chain: its rows keep their own place.
+            Some(j) if !seen.contains(&j) && j != i => {
+                seen.push(i);
+                let (start, depth) = place(j, rows, waits, seen);
+                (start.max(w.start), depth + 1)
+            }
+            _ => (w.start, usize::from(w.after.is_some())),
+        }
+    }
+    (0..rows.len())
+        .map(|i| match rows[i].stage {
+            Stage::Planned => {
+                let (start, depth) = place(i, rows, waits, &mut Vec::new());
+                (Stage::Planned, start, depth)
+            }
+            s => (s, Start::Ready, 0),
+        })
+        .collect()
+}
+
+/// The hover of a Next up row that waits on nothing recorded.
+pub const IDLE_WHY: &str = "not started — waits on nothing recorded";
+
+/// NOW of a Running row with no worker, drawn under Next up ([`benched`]).
+pub const NO_WORKER_YET: &str = "no worker yet";
+
+/// The page header's fact for a Running feed row with no estimate.
+pub const NO_ETA_WHY: &str = "no ETA: its feed row has no eta_s";
+
+/// The page header's facts, from the row's own cells before any ditto.
+/// `vs` names what a Done row's ± was measured against: `estimate 30m`.
+fn row_facts(
+    stage: Stage,
+    elapsed: &str,
+    eta: &str,
+    vs: &str,
+    now: &str,
+    tokens: &str,
+) -> Vec<String> {
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let v = match stage {
+        Stage::Done => [
+            some(now),
+            some(elapsed).map(|e| format!("took {e}")),
+            some(eta).map(|d| format!("{d} vs {vs}")),
+            some(tokens).map(|t| format!("{t} tokens")),
+        ],
+        Stage::Running => [
+            some(elapsed).map(|e| format!("running {e}")),
+            some(eta).map(|l| format!("{l} left")),
+            some(now),
+            some(tokens).map(|t| format!("{t} tokens")),
+        ],
+        Stage::Planned => [some(eta).map(|e| format!("est {e}")), None, None, None],
+    };
+    v.into_iter().flatten().collect()
 }
 
 /// A Running row's hover: who works on it and since when, and what holds it
@@ -842,9 +1470,44 @@ fn running_why(who: &str, since: Option<&str>, state: Option<String>) -> Vec<Str
     std::iter::once(head).chain(state).collect()
 }
 
-/// A Done row's hover: how it ended (`now`, the row's NOW) and how long it
-/// took.
-fn done_why(now: &str, elapsed: &str) -> Vec<String> {
+/// A Running feed row's estimate against the time left (`left_s`, below
+/// zero once over), for its hover.
+fn estimate_why(estimate_s: Option<u64>, left_s: Option<i64>) -> String {
+    match (estimate_s, left_s) {
+        (Some(e), Some(left)) if left < 0 && feed::fmt_span(left) != "0m" => format!(
+            "estimate {}: {} over it",
+            feed::fmt_span(e as i64),
+            feed::fmt_span(-left)
+        ),
+        (Some(e), Some(left)) => format!(
+            "estimate {}: {} left, on track",
+            feed::fmt_span(e as i64),
+            countdown(left)
+        ),
+        (Some(e), None) => format!("estimate {}", feed::fmt_span(e as i64)),
+        (None, Some(left)) => format!("{} left", countdown(left)),
+        (None, None) => "no estimate yet".into(),
+    }
+}
+
+/// A paused row's hover: `paused since 15:10: <note>`, else why its clock
+/// stands.
+fn paused_why(since: &str, note: Option<&str>) -> String {
+    match note.filter(|n| !n.is_empty()) {
+        Some(n) => format!("paused since {since}: {n}"),
+        None => format!("paused since {since} — its clock is stopped"),
+    }
+}
+
+/// A Done row's hover: how it landed (`now`, the row's NOW) and how long it
+/// took, against its estimate for a feed row (`delta`), then who is to
+/// review it and where, when someone is.
+fn done_why(
+    now: &str,
+    elapsed: &str,
+    delta: Option<Option<(i64, feed::Against)>>,
+    review: Option<&str>,
+) -> Vec<String> {
     let mut head = "Done".to_string();
     // An ending that says only done is not said twice.
     if !now.is_empty() && !now.eq_ignore_ascii_case("done") {
@@ -852,8 +1515,22 @@ fn done_why(now: &str, elapsed: &str) -> Vec<String> {
     }
     if !elapsed.is_empty() {
         head.push_str(&format!("; took {elapsed}"));
+        head.push_str(&match delta {
+            Some(Some((d, a))) => {
+                let what = format!("its {}", a.label());
+                match feed::fmt_span(d.abs()) {
+                    s if s == "0m" => format!(", on {what}"),
+                    s if d > 0 => format!(", {s} over {what}"),
+                    s => format!(", {s} under {what}"),
+                }
+            }
+            Some(None) => ", no estimate".into(),
+            None => String::new(),
+        });
     }
-    vec![head]
+    std::iter::once(head)
+        .chain(review.map(|r| format!("awaiting review: {r}")))
+        .collect()
 }
 
 /// A model id in Claude Code's short names (`haiku`, `sonnet`, `opus`,
@@ -864,6 +1541,17 @@ fn short_model(m: &str) -> Option<String> {
         .into_iter()
         .find(|f| m.contains(f))
         .map(str::to_string)
+}
+
+/// A feed row's key as the TASK column shows it: none for a row that only
+/// names its worker ([`feed::FeedRow::keyed`]), which is drawn as its
+/// worker would be.
+fn shown_key(f: &feed::FeedRow) -> String {
+    if f.keyed {
+        f.key.clone()
+    } else {
+        String::new()
+    }
 }
 
 fn outcome_word(o: Outcome) -> String {
@@ -890,7 +1578,16 @@ pub fn stopwatch(secs: u64) -> String {
     }
 }
 
-/// Claude Code's compact count — `842`, `13.5k`, `124.8k`, `1.2M` — with a
+/// A Running row's time left: `~20m`, and `-~12m` once past its estimate.
+pub fn countdown(left_s: i64) -> String {
+    if left_s < 0 && feed::fmt_span(left_s) != "0m" {
+        format!("-~{}", feed::fmt_span(-left_s))
+    } else {
+        format!("~{}", feed::fmt_span(left_s.max(0)))
+    }
+}
+
+/// Claude Code's compact count (`842`, `13.5k`, `124.8k`, `1.2M`), with a
 /// capital `M` so a total never reads as minutes.
 pub fn fmt_tokens(n: u64) -> String {
     for (floor, div, suffix) in [
@@ -910,6 +1607,7 @@ pub fn fmt_tokens(n: u64) -> String {
 fn stage_word(s: Stage) -> &'static str {
     match s {
         Stage::Running => "Running",
+        Stage::Planned => "NextUp",
         Stage::Done => "Done",
     }
 }
@@ -917,6 +1615,7 @@ fn stage_word(s: Stage) -> &'static str {
 fn stage_color(s: Stage) -> Color32 {
     match s {
         Stage::Running => RUNNING,
+        Stage::Planned => PLANNED,
         Stage::Done => DONE,
     }
 }
@@ -946,9 +1645,11 @@ fn cut(s: &str, max: usize) -> String {
 /// central panel, before the terminal takes the rest. Returns the row
 /// clicked this frame, and the row of `shown` as the pane drew it.
 ///
-/// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
-/// while it is, the Running rows' clocks are held. `shown` is the row whose
-/// worker page the tab shows: it is lit as the selection.
+/// The rows are `tracker`'s merged with the feed of its session, which is
+/// read here at most once a second. `limit` is the usage limit the tab's
+/// account is out on ([`limit_for`]): while it is, the Running rows' clocks
+/// are held. `shown` is the row whose worker page the tab shows: it is lit
+/// as the selection.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     views: &mut Views,
@@ -957,6 +1658,7 @@ pub fn show(
     shown: Option<&RowClick>,
     limit: Option<Limit>,
     panel: &ManagementPanelConfig,
+    chrome: &Chrome,
     shared: &mut RenderShared,
     ui: &mut Ui,
 ) -> (Option<RowClick>, Option<Line>) {
@@ -966,11 +1668,21 @@ pub fn show(
         .tabs
         .get_mut(&tab)
         .is_some_and(|v| std::mem::take(&mut v.flash_due));
-    // Only when subagents are involved.
-    let Some(tracker) = tracker.filter(|t| !t.is_empty()) else {
+    let Some(tracker) = tracker else {
         return (None, None);
     };
     let view = views.tabs.entry(tab).or_default();
+    view.poll_feed(
+        tracker.session_id.as_deref(),
+        &tracker.aliases,
+        tracker.config_dir.as_deref(),
+    );
+    // Only when subagents are involved, or for a manager: a feed row alone
+    // opens nothing.
+    if !feed::opens(!tracker.is_empty(), view.manager) {
+        return (None, None);
+    }
+    let drawn = Drawn::of(view.manager);
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
     let clock = Clock {
@@ -978,7 +1690,20 @@ pub fn show(
         limit: limit.as_ref(),
         tz: jiff::tz::TimeZone::system(),
     };
-    let table = build_with(tracker.rows(), now, &clock, panel.done(), &view.folded);
+    // Done rows cleared by hand go from the feed too, whoever wrote it.
+    let cleared = tracker
+        .done_cleared_ms
+        .and_then(|c| view.feed_now.as_ref().map(|f| f.without_done_by(c)));
+    let feed = cleared.as_ref().or(view.feed_now.as_ref());
+    let table = build_with(
+        feed,
+        tracker.rows(),
+        now,
+        &clock,
+        panel.done(),
+        drawn,
+        &view.folded,
+    );
     if table.is_empty() {
         return (None, None);
     }
@@ -1018,9 +1743,10 @@ pub fn show(
     let cell = shared.cell_size(ui.ctx().pixels_per_point());
     // A little air around each row; a table, not a wall of grid.
     let row_h = (cell.y * 1.2).round().max(cell.y);
+    let rows = table.lines.len() + usize::from(table.footer.is_some());
     let frame = pane_frame(shared.theme.bg);
     let want = pane_height(
-        table.lines.len(),
+        rows,
         row_h,
         ui.spacing().item_spacing.y,
         frame.total_margin().sum().y,
@@ -1061,6 +1787,7 @@ pub fn show(
                         shown,
                         flash,
                         animate,
+                        chrome,
                         shared,
                         cell,
                         row_h,
@@ -1184,6 +1911,10 @@ struct Cols {
     taskw: usize,
     x_task: usize,
     x_el_end: usize,
+    /// Where the ETA column ends; it takes no width while no row has an
+    /// estimate, as with no feed at all.
+    eta: bool,
+    x_eta_end: usize,
     x_now: usize,
     x_tok_end: usize,
     /// The table nests rows ([`Table::nested`]).
@@ -1208,12 +1939,18 @@ impl Cols {
         } else {
             0
         };
+        let eta = on.eta && table.lines.iter().any(|l| !eta_cell(l).is_empty());
         // The fixed columns right of TASK, each with the gap before it.
-        let fixed_right: usize = [(on.elapsed, EL_W), (on.now, NOW_W), (on.tokens, TOK_W)]
-            .iter()
-            .filter(|(shown, _)| *shown)
-            .map(|(_, w)| w + GAP)
-            .sum();
+        let fixed_right: usize = [
+            (on.elapsed, EL_W),
+            (eta, ETA_W),
+            (on.now, NOW_W),
+            (on.tokens, TOK_W),
+        ]
+        .iter()
+        .filter(|(shown, _)| *shown)
+        .map(|(_, w)| w + GAP)
+        .sum();
         let stage_cols = if on.stage { STAGE_W + GAP } else { 0 };
         // TASK is the id and the title; with the title off, just the id.
         // However narrow the pane, it holds the id and, on every row, its
@@ -1257,6 +1994,7 @@ impl Cols {
         place(on.stage, STAGE_W);
         let x_task = place(taskw > 0, taskw);
         let x_el_end = place(on.elapsed, EL_W) + EL_W;
+        let x_eta_end = place(eta, ETA_W) + ETA_W;
         let x_now = place(on.now, NOW_W);
         let x_tok_end = place(on.tokens, TOK_W) + TOK_W;
         Cols {
@@ -1265,6 +2003,8 @@ impl Cols {
             taskw,
             x_task,
             x_el_end,
+            eta,
+            x_eta_end,
             x_now,
             x_tok_end,
             nested: table.nested,
@@ -1305,8 +2045,8 @@ impl Cols {
     }
 
     /// A row's cells as drawn: each one's text and the column it starts at.
-    /// Always the same five, in this order; a column switched off is an
-    /// empty cell.
+    /// Always the same six, in this order ([`ETA_SEG`]); a column switched
+    /// off is an empty cell.
     fn segments(&self, line: &Line) -> Vec<(usize, String)> {
         let on = &self.on;
         let idw = self.idw;
@@ -1325,6 +2065,13 @@ impl Cols {
                 (0, String::new())
             }
         };
+        // A row with no tokens (Next up) lends NOW the TOKENS column:
+        // `after acme#12` and its like are long.
+        let now_w = if line.tokens.is_empty() && on.tokens {
+            NOW_W + GAP + TOK_W
+        } else {
+            NOW_W
+        };
         vec![
             cell(on.stage, 0, stage_word(line.stage).to_string()),
             cell(self.taskw > 0, self.x_task, task),
@@ -1334,7 +2081,12 @@ impl Cols {
                 right_at(self.x_el_end, &line.elapsed),
                 line.elapsed.clone(),
             ),
-            cell(on.now, self.x_now, cut(&line.now, NOW_W)),
+            cell(
+                self.eta,
+                right_at(self.x_eta_end, eta_cell(line)),
+                eta_cell(line).into(),
+            ),
+            cell(on.now, self.x_now, cut(&line.now, now_w)),
             cell(
                 on.tokens,
                 right_at(self.x_tok_end, &line.tokens),
@@ -1392,6 +2144,12 @@ fn nest_head(line: &Line, nested: bool) -> String {
         (None, 0) => String::new(),
         (None, _) => format!("{indent}└ "),
     }
+}
+
+/// The ETA cell's text: the row's own, or [`NO_ETA`] for a Running feed
+/// row nobody estimated.
+fn eta_cell(line: &Line) -> &str {
+    if line.no_eta { NO_ETA } else { &line.eta }
 }
 
 /// A row's text as it reads on screen, one character a cell: what a
@@ -1590,6 +2348,7 @@ fn draw_table(
     viewed: Option<&RowClick>,
     flash: Option<(&HashSet<String>, f32)>,
     animate: bool,
+    chrome: &Chrome,
     shared: &mut RenderShared,
     cell: egui::Vec2,
     row_h: f32,
@@ -1598,7 +2357,12 @@ fn draw_table(
 ) -> Drew {
     let cw = cell.x.max(1.0);
     let layout = Cols::shown(table, cols, shown);
-    let segs: Vec<Vec<(usize, String)>> = table.lines.iter().map(|l| layout.segments(l)).collect();
+    let mut segs: Vec<Vec<(usize, String)>> =
+        table.lines.iter().map(|l| layout.segments(l)).collect();
+    // The feed's footer, under the rows: selectable, never a click.
+    if let Some(footer) = &table.footer {
+        segs.push(vec![(0, cut(footer, cols))]);
+    }
     let texts: Vec<String> = segs.iter().map(|s| compose(s)).collect();
     let rects: Vec<egui::Rect> = segs
         .iter()
@@ -1610,7 +2374,8 @@ fn draw_table(
     let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
         return Drew::default();
     };
-    if input.hovered.is_some() {
+    let hovered = input.hovered.filter(|&r| r < table.lines.len());
+    if hovered.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     // Every row's hover reads its whole title and why it is where it is.
@@ -1618,7 +2383,7 @@ fn draw_table(
     // hovered row's rect: it sits under that row, and moving to another row
     // keeps it open (same id, the pointer still inside) with the new text.
     // egui keeps it closed while a drag selects or just after a click.
-    if let Some(i) = input.hovered {
+    if let Some(i) = hovered {
         let mut row = resp.clone();
         row.rect = rects[i];
         row.interact_rect = rects[i];
@@ -1628,43 +2393,46 @@ fn draw_table(
     let p = ui.painter().clone();
 
     for (i, rect) in rects.iter().copied().enumerate() {
-        let line = &table.lines[i];
-        let color = stage_color(line.stage);
-        // The worker whose page the terminal's place shows: held lit, with
-        // a bar at its left edge, as a selection.
-        if viewed.is_some_and(|v| v.same_row(&line.click)) {
-            p.rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
-            // In the pane's left margin, clear of the text.
-            let bar = egui::Rect::from_min_size(
-                rect.min - egui::vec2(6.0, 0.0),
-                egui::vec2(3.0, rect.height()),
-            );
-            p.rect_filled(bar, 1.0, color);
-        }
-        if input.hovered == Some(i) {
-            let tint = if input.pressed {
-                PRESS_TINT
-            } else {
-                HOVER_TINT
-            };
-            p.rect_filled(rect, 2.0, color.gamma_multiply(tint));
-        }
-        // Landed since the last look: its frame breathes with the others'.
-        // Painted only, over the row and a hair out to its left so it clears
-        // the first glyph: nothing moves. Kept moving only while the row is
-        // on screen.
-        if let Some((rows, glow)) = flash
-            && line.stage == Stage::Done
-            && rows.contains(&line.agent_id)
-        {
-            p.rect_stroke(
-                rect.with_min_x(rect.min.x - FLASH_OUT),
-                2.0,
-                egui::Stroke::new(FLASH_WIDTH, color.gamma_multiply(glow)),
-                egui::StrokeKind::Inside,
-            );
-            if animate {
-                crate::rail::keep_animating(ui, rect);
+        let line = table.lines.get(i);
+        // The footer is drawn dim.
+        let color = line.map_or(chrome.dim, |l| stage_color(l.stage));
+        if let Some(line) = line {
+            // The worker whose page the terminal's place shows: held lit,
+            // with a bar at its left edge, as a selection.
+            if viewed.is_some_and(|v| v.same_row(&line.click)) {
+                p.rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
+                // In the pane's left margin, clear of the text.
+                let bar = egui::Rect::from_min_size(
+                    rect.min - egui::vec2(6.0, 0.0),
+                    egui::vec2(3.0, rect.height()),
+                );
+                p.rect_filled(bar, 1.0, color);
+            }
+            if hovered == Some(i) {
+                let tint = if input.pressed {
+                    PRESS_TINT
+                } else {
+                    HOVER_TINT
+                };
+                p.rect_filled(rect, 2.0, color.gamma_multiply(tint));
+            }
+            // Landed since the last look: its frame breathes with the
+            // others'. Painted only, over the row and a hair out to its left
+            // so it clears the first glyph: nothing moves. Kept moving only
+            // while the row is on screen.
+            if let Some((rows, glow)) = flash
+                && line.stage == Stage::Done
+                && rows.contains(&done_ident(&line.click))
+            {
+                p.rect_stroke(
+                    rect.with_min_x(rect.min.x - FLASH_OUT),
+                    2.0,
+                    egui::Stroke::new(FLASH_WIDTH, color.gamma_multiply(glow)),
+                    egui::StrokeKind::Inside,
+                );
+                if animate {
+                    crate::rail::keep_animating(ui, rect);
+                }
             }
         }
         // The selected text, behind the glyphs.
@@ -1678,9 +2446,12 @@ fn draw_table(
             p.rect_filled(r, 0.0, sel_fill);
         }
         let top = rect.center().y - cell.y / 2.0;
-        for (at, s) in &segs[i] {
+        for (k, (at, s)) in segs[i].iter().enumerate() {
             let at = egui::pos2(rect.left() + *at as f32 * cw, top);
-            shared.paint_text(&p, at, s, color);
+            // A Running feed row's missing estimate reads dim.
+            let missing = k == ETA_SEG && line.is_some_and(|l| l.no_eta);
+            let ink = if missing { chrome.dim } else { color };
+            shared.paint_text(&p, at, s, ink);
         }
     }
     // A click on a row's fold toggle, or the space after it, folds or
@@ -1700,10 +2471,22 @@ mod tests {
 
     const T0: u64 = 1_790_000_000_000; // an epoch-ms "now"
 
+    fn feed(json: &str) -> Feed {
+        feed::parse(json.as_bytes()).expect("test feed parses")
+    }
+
     fn live(json: &str) -> Vec<SubagentRow> {
         let mut t = Tracker::new(None);
         t.apply_live(&LiveSnapshot::parse(json), T0);
         t.rows().to_vec()
+    }
+
+    #[test]
+    fn countdown_goes_through_zero() {
+        assert_eq!(countdown(20 * 60), "~20m");
+        assert_eq!(countdown(63 * 60), "~1h3m");
+        assert_eq!(countdown(-12 * 60), "-~12m");
+        assert_eq!(countdown(-10), "~0m");
     }
 
     #[test]
@@ -1763,7 +2546,7 @@ mod tests {
             ("c1", "running", 20, Some("w1")),
             ("c2", "completed", 30, Some("w1")),
         ]);
-        let t = build(&rows, T0);
+        let t = build(None, &rows, T0);
         assert_eq!(
             titles(&t),
             [
@@ -1796,7 +2579,38 @@ mod tests {
                 .contains("2 agents of its own under it, 1 running")
         );
         // A click on it is any worker's: its own id and transcript.
-        assert_eq!(t.lines[1].click.agent_id, "c1");
+        assert_eq!(t.lines[1].click.agent_id.as_deref(), Some("c1"));
         assert_eq!(t.lines[2].click.stage, Stage::Done);
+    }
+
+    #[test]
+    fn the_feed_gives_ids_titles_etas_and_landings() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
+                "startTime":1789999400000,"tokenCount":1000}]}"#,
+        );
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#1","stage":"running","title":"FEATURE: one","agent_id":"a1",
+               "started":1789999400000,"eta_s":1800},
+              {"key":"acme#2","stage":"planned","title":"FEATURE: two","eta_s":3780},
+              {"key":"acme#3","stage":"done","title":"BUG: three","started":1789990000000,
+               "ended":1789993900000,"eta_s":3600,"landing":"Review — alex","tokens":5000}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["acme#1", "acme#2", "acme#3"]);
+        // Running: 10m in, 30m estimate → 20m left.
+        assert_eq!(t.lines[0].elapsed, "10:00");
+        assert_eq!(t.lines[0].eta, "~20m");
+        // Planned: its estimate, nothing else.
+        assert_eq!(t.lines[1].eta, "~1h3m");
+        assert_eq!(t.lines[1].elapsed, "");
+        assert_eq!(t.lines[1].tokens, "");
+        // Done: took 65m against 60m → five minutes late.
+        assert_eq!(t.lines[2].elapsed, "1:05:00");
+        assert_eq!(t.lines[2].eta, "(+5m)");
+        assert_eq!(t.lines[2].now, "Review — alex");
     }
 }

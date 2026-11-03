@@ -2583,6 +2583,84 @@ mod tests {
         assert_eq!(t.lines[2].click.stage, Stage::Done);
     }
 
+    /// A task handed to a fresh worker: the first worker is a Done row of
+    /// its own, with its own time and tokens, and the task's row counts only
+    /// the worker on it now.
+    #[test]
+    fn a_replaced_worker_is_a_done_row_of_its_own() {
+        let snap = |first: &str| {
+            format!(
+                r#"{{"session_id":"s","tasks":[
+                  {{"id":"a1","status":"{first}","description":"Work acme#5",
+                    "startTime":1789998800000,"tokenCount":40000}},
+                  {{"id":"a2","status":"running","description":"Work acme#5 again",
+                    "startTime":1789999400000,"tokenCount":7000}}]}}"#
+            )
+        };
+        let mut t = Tracker::new(None);
+        t.apply_live(&LiveSnapshot::parse(&snap("running")), T0 - 700_000);
+        t.apply_live(&LiveSnapshot::parse(&snap("completed")), T0 - 600_000);
+        let rows = t.rows().to_vec();
+        // The row moved to the fresh worker.
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five","agent_id":"a2",
+               "started":1789998800000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let got: Vec<(&str, Stage, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.title.as_str(), l.stage, l.tokens.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("FEATURE: five", Stage::Running, "7k"),
+                ("Work acme#5", Stage::Done, "40k"),
+            ]
+        );
+        // Its own clock: spawned 20m before now, finished 10m before.
+        assert_eq!(t.lines[1].elapsed, "10:00");
+
+        // The row still names the first worker, which has finished, and the
+        // fresh one is found by its description: the same.
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five","agent_id":"a1",
+               "started":1789998800000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let got: Vec<(Stage, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.stage, l.tokens.as_str()))
+            .collect();
+        assert_eq!(got, [(Stage::Running, "7k"), (Stage::Done, "40k")]);
+    }
+
+    /// A running worker that names a task is that task's worker: never a
+    /// row of its own beside it.
+    #[test]
+    fn a_running_worker_naming_a_task_is_not_drawn_twice() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[
+              {"id":"a1","status":"running","description":"Work acme#5",
+               "startTime":1789999400000,"tokenCount":1000}]}"#,
+        );
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five",
+               "started":1789999400000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        assert_eq!(t.lines.len(), 1);
+        assert_eq!(t.lines[0].tokens, "1k");
+    }
+
     #[test]
     fn the_feed_gives_ids_titles_etas_and_landings() {
         let rows = live(

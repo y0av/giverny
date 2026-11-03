@@ -755,8 +755,10 @@ pub fn opens(has_agents: bool, manager: bool) -> bool {
 ///   or Done; with no such worker it is no row.
 /// - A live row that no feed row carries, and whose description names no
 ///   feed key, is a row of its own, Running or Done by its own state, after
-///   the feed's rows of that stage. One that names a key is that row's
-///   worker and is never drawn twice.
+///   the feed's rows of that stage. A running one that names a key is that
+///   row's worker and is never drawn twice; a finished one that names a key
+///   and no row carries is a worker replaced on that task, a Done row of its
+///   own.
 /// - Rows are grouped Running, Planned, Done; order within Running and
 ///   Planned is kept, Done is newest landed first (undated rows last).
 /// - A row whose worker is the one directly above it is a ditto.
@@ -832,7 +834,11 @@ pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<Pan
             || feed_rows
                 .iter()
                 .any(|f| f.agent_id.as_deref() == Some(l.agent_id()) || names(l, f));
-        if !named {
+        // A finished worker that names a task but no row carries was
+        // replaced on it: a fresh worker took the task over. It is a Done
+        // row of its own, with its own time and tokens, so the task's row
+        // counts only the worker on it now and nothing is lost.
+        if !carried && (!named || !l.running()) {
             out.push(PaneRow {
                 stage: if l.running() {
                     Stage::Running

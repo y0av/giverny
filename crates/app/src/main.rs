@@ -4016,6 +4016,7 @@ impl App {
             self.claude.submits(tab).0,
             Instant::now(),
         ));
+        page.echo(text);
         page.set_sending(Sending::Going);
         ctx.request_repaint();
     }
@@ -4065,6 +4066,9 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if let Some(page) = page {
+            if step == Step::NotSent {
+                page.drop_echo();
+            }
             page.set_sending(state);
         }
     }

@@ -239,6 +239,8 @@ Claude Code has no way to type to a subagent from outside: the only way in is it
 
 `<text>` is what the person typed, line breaks kept (Shift+Enter makes one), and it goes only on their Enter. The box is on by default wherever the pane is; `management_panel.prompt_box = false` makes it read-only.
 
+**On the page.** A line reaches the worker's transcript only after the manager's turn, seconds later or more. So a line sent to a worker shows on its page at once, in a prompt's shape and dimmed, after the transcript's rows, with no words added. Each `coordinator` or `human` line that lands in the transcript takes the place of the oldest such line, first in, first out, within one look at the file (300 ms). The text is not compared, as the manager may change it. A line that ends "not sent" leaves the page and stays in the box; one "queued behind compaction" stays. A Next up row has no transcript, so its line shows nothing on the page. These lines belong to the page and go when it closes; the real line still shows once it lands. A line the manager never passes on stays dim until then.
+
 **How it is sent.** The line is pasted at the manager's prompt and submitted, so the manager reads it as the person's own typing, not as another session's message. Nothing is read off the screen.
 
 - **When.** Only while the hooks say Claude Code runs in the tab and the tab's terminal has bracketed paste on. The session's `sessions/<pid>.json` is read at send time: while its `status` is `waiting` (a permission, a question or a plan approval is up), the Enter would answer it, so the box says "Not sent: the manager is waiting on a question in its tab" and keeps the text. With no hooks reporting on the session, it refuses too.

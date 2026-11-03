@@ -26,7 +26,8 @@
 //! bookkeeping lines are left out, and so is the reply to a worker's
 //! `SubagentHandback`: its report is shown as what the worker said. A line
 //! sent to the worker after its prompt is drawn as a prompt, in whichever
-//! shape it landed ([`Render::line`]).
+//! shape it landed ([`Render::line`]). One still on its way is the page's to
+//! draw, in the same shape and dimmed ([`echo_rows`]).
 //!
 //! The worker page a row of the management panel opens draws it: a prompt
 //! whole, a tool's output folded to its first lines.
@@ -126,6 +127,8 @@ pub enum Tone {
     Error,
     /// A prompt's text: drawn on the prompt band.
     Prompt,
+    /// A line sent and not yet in the transcript: a prompt, dimmed.
+    Echo,
     /// The `●` before what the worker said.
     Said,
     /// The `●` before a tool call.
@@ -171,9 +174,10 @@ impl Row {
         self.spans.iter().map(|s| s.text.as_str()).collect()
     }
 
-    /// Whether the row is part of a prompt, drawn on its band.
-    pub fn is_prompt(&self) -> bool {
-        self.spans.first().is_some_and(|s| s.tone == Tone::Prompt)
+    /// The row's tone when it is part of a prompt, drawn on its band.
+    pub fn band(&self) -> Option<Tone> {
+        let tone = self.spans.first()?.tone;
+        matches!(tone, Tone::Prompt | Tone::Echo).then_some(tone)
     }
 
     /// The row as a terminal line.
@@ -194,6 +198,7 @@ fn ansi(tone: Tone) -> &'static str {
         Tone::Dim | Tone::Bullet(Call::Running) => DIM,
         Tone::Error | Tone::Bullet(Call::Failed) => "\x1b[38;2;255;107;128m",
         Tone::Prompt => "\x1b[48;2;55;55;55m",
+        Tone::Echo => "\x1b[2m\x1b[48;2;55;55;55m",
         Tone::Bullet(Call::Done) => "\x1b[38;2;78;186;101m",
     }
 }
@@ -480,6 +485,16 @@ pub fn prompt_rows(text: &str, keep: Option<usize>) -> Vec<Row> {
     out
 }
 
+/// `text` as [`prompt_rows`] draws it, dimmed: a line sent to the worker that
+/// has not reached its transcript yet.
+pub fn echo_rows(text: &str) -> Vec<Row> {
+    let mut rows = prompt_rows(text, None);
+    for s in rows.iter_mut().flat_map(|r| r.spans.iter_mut()) {
+        s.tone = Tone::Echo;
+    }
+    rows
+}
+
 /// One line of a reply, its `` `code` `` and `**bold**` picked out.
 fn inline(line: &str) -> Vec<Span> {
     let mut out = Vec::new();
@@ -602,9 +617,15 @@ fn result_rows(text: &str, keep: usize, error: bool) -> Vec<Row> {
 #[derive(Debug, Clone, Default)]
 pub struct Render {
     hidden: HashSet<String>,
+    sent_lines: usize,
 }
 
 impl Render {
+    /// How many lines someone sent the worker it has rendered so far.
+    pub fn sent_lines(&self) -> usize {
+        self.sent_lines
+    }
+
     /// Render one JSONL line as rows. Unknown or uninteresting lines
     /// render as nothing.
     pub fn line(&mut self, line: &str) -> Vec<Row> {
@@ -666,6 +687,7 @@ impl Render {
                     if v.get("isMeta").and_then(Value::as_bool) != Some(true) {
                         entry(prompt_rows(s, None), &mut out);
                     } else if sent(&v) {
+                        self.sent_lines += 1;
                         entry(prompt_rows(unwrapped(s), None), &mut out);
                     }
                 }
@@ -708,6 +730,7 @@ impl Render {
                     && sent(att)
                     && let Some(text) = att.get("prompt").and_then(Value::as_str)
                 {
+                    self.sent_lines += 1;
                     entry(prompt_rows(text, None), &mut out);
                 }
             }
@@ -902,6 +925,48 @@ mod tests {
                 "",
                 "❯ typed in its view",
             ]
+        );
+    }
+
+    /// Both shapes count; a worker's first prompt and other records don't.
+    #[test]
+    fn it_counts_the_lines_sent_to_a_worker() {
+        let mut r = Render::default();
+        for l in [
+            r#"{"type":"user","message":{"role":"user","content":"Count, then report."}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"a task notification","origin":{"kind":"task-notification"}}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"peer"},"message":{"role":"user","content":"Another Claude session sent a message"}}"#,
+        ] {
+            r.line(l);
+        }
+        assert_eq!(r.sent_lines(), 0);
+        r.line(
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"PING","origin":{"kind":"coordinator"}}}"#,
+        );
+        r.line(
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"human"},"message":{"role":"user","content":"hello"}}"#,
+        );
+        assert_eq!(r.sent_lines(), 2);
+    }
+
+    /// The shape of the prompt it stands in for, in its own tone, so the real
+    /// row takes its place with nothing moving.
+    #[test]
+    fn an_echo_is_a_prompt_dimmed() {
+        let echo = echo_rows("first\n\nsecond");
+        let prompt = prompt_rows("first\n\nsecond", None);
+        assert_eq!(
+            echo.iter().map(Row::plain).collect::<Vec<_>>(),
+            prompt.iter().map(Row::plain).collect::<Vec<_>>()
+        );
+        assert!(echo[0].starts);
+        assert!(echo.iter().all(|r| r.band() == Some(Tone::Echo)));
+        assert!(prompt.iter().all(|r| r.band() == Some(Tone::Prompt)));
+        let on = Style { color: true };
+        assert!(
+            echo[0]
+                .to_ansi(on)
+                .starts_with("\x1b[2m\x1b[48;2;55;55;55m")
         );
     }
 

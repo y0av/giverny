@@ -20,6 +20,12 @@
 //! to send to, or with `management_panel.prompt_box` off, keeps the box
 //! dimmed and `read-only`.
 //!
+//! The manager's turn takes seconds, so a line sent to a worker shows on its
+//! page at once, as its prompt will, dimmed, after the transcript's rows
+//! ([`WorkerPage::echo`]). Each line that lands in the transcript takes the
+//! place of the oldest such echo. The text is not compared, as the manager
+//! may change it. Echoes live on the page, and go when it closes.
+//!
 //! A worker's transcript opens at its end, on its report once it has one,
 //! and is followed as it grows, a Done worker's too: a line from the box can
 //! wake it. A Next up row's brief is drawn as the prompt its worker will be
@@ -132,6 +138,8 @@ pub struct TranscriptView {
     /// Why the file could not be read, when it could not.
     error: Option<String>,
     polled: Instant,
+    /// Lines sent to the worker and not in the transcript yet, oldest first.
+    echoes: Vec<String>,
 }
 
 /// What a frame of the page did.
@@ -169,6 +177,7 @@ impl WorkerPage {
             rows: Vec::new(),
             error: None,
             polled: Instant::now(),
+            echoes: Vec::new(),
         };
         view.poll();
         Self::with(tab, name, Content::Transcript(view))
@@ -226,6 +235,30 @@ impl WorkerPage {
         self.page.to_end();
     }
 
+    /// `text` just went to the manager: show it now, until it lands in the
+    /// transcript. A page with no transcript has nowhere for it to land, and
+    /// shows none.
+    pub fn echo(&mut self, text: &str) {
+        let Content::Transcript(v) = &mut self.content else {
+            return;
+        };
+        // What is in the file by now came before this line.
+        v.poll();
+        v.echoes.push(text.to_string());
+        self.generation += 1;
+        self.page.to_end();
+    }
+
+    /// The line sent last never reached the manager: its echo goes. A send
+    /// is refused while another is on its way, so the newest is this line's.
+    pub fn drop_echo(&mut self) {
+        if let Content::Transcript(v) = &mut self.content
+            && v.echoes.pop().is_some()
+        {
+            self.generation += 1;
+        }
+    }
+
     /// The page shows this row.
     pub fn of_row(mut self, row: RowClick) -> Self {
         self.row = Some(row);
@@ -252,12 +285,12 @@ impl WorkerPage {
         let mut wrapped: Vec<Row> = Vec::new();
         for row in self.entries() {
             for mut r in transcript::wrap(&row, cols - 1) {
-                if r.is_prompt() {
+                if let Some(tone) = r.band() {
                     // The band runs the grid's width, as Claude Code's does.
                     let n = r.plain().chars().count();
                     if n < cols {
                         r.spans.push(transcript::Span {
-                            tone: Tone::Prompt,
+                            tone,
                             text: " ".repeat(cols - n),
                         });
                     }
@@ -681,9 +714,12 @@ impl TranscriptView {
                     self.render = transcript::Render::default();
                 }
                 let before = self.rows.len();
+                let sent = self.render.sent_lines();
                 for line in &update.lines {
                     transcript::push(&mut self.rows, self.render.line(line));
                 }
+                let landed = self.render.sent_lines() - sent;
+                self.echoes.drain(..landed.min(self.echoes.len()));
                 was_error || update.restarted || self.rows.len() != before
             }
             Err(err) => {
@@ -695,7 +731,8 @@ impl TranscriptView {
         }
     }
 
-    /// The rows, and for a finished transcript its unterminated last line.
+    /// The rows, for a finished transcript its unterminated last line, and
+    /// the lines still on their way.
     fn lines_for_view(&self) -> Vec<Row> {
         let mut rows = self.rows.clone();
         if !self.live
@@ -716,6 +753,9 @@ impl TranscriptView {
                     "(the transcript is empty)"
                 },
             ));
+        }
+        for echo in &self.echoes {
+            rows.extend(transcript::echo_rows(echo));
         }
         rows
     }
@@ -809,6 +849,204 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Done worker's page over a scratch transcript, and a way to append to
+    /// it and have the page look.
+    struct Scratch {
+        page: WorkerPage,
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("giverny-echo-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("agent-t.jsonl");
+            std::fs::write(
+                &path,
+                concat!(
+                    r#"{"type":"user","message":{"role":"user","content":"Count."}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+            let page = WorkerPage::transcript(TabId(1), "counter".into(), path.clone(), false)
+                .with_input(Some(Ask::Send {
+                    task: "acme#1".into(),
+                    agent_id: "a1".into(),
+                }));
+            Scratch { page, path }
+        }
+
+        fn append(&mut self, record: &str) {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.path)
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
+        }
+
+        /// A line the manager passed on lands.
+        fn lands(&mut self, text: &str) {
+            let record = serde_json::json!({
+                "type": "attachment",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": text,
+                    "origin": {"kind": "coordinator"},
+                },
+            });
+            self.append(&record.to_string());
+            self.look();
+        }
+
+        fn look(&mut self) {
+            let Content::Transcript(v) = &mut self.page.content else {
+                panic!("a transcript page");
+            };
+            v.polled -= POLL;
+            assert!(self.page.follow());
+        }
+
+        /// What the page draws, the echoes marked.
+        fn rows(&self) -> Vec<String> {
+            self.page
+                .entries()
+                .iter()
+                .map(|r| {
+                    let mark = if r.band() == Some(Tone::Echo) {
+                        "~"
+                    } else {
+                        ""
+                    };
+                    format!("{mark}{}", r.plain())
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Some(dir) = self.path.parent() {
+                std::fs::remove_dir_all(dir).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_shows_at_once_and_after_the_rows() {
+        let mut s = Scratch::new("shows");
+        let generation = s.page.generation;
+        s.page.echo("go on");
+        assert_ne!(s.page.generation, generation, "redrawn");
+        assert_eq!(s.rows(), vec!["❯ Count.", "~❯ go on"]);
+        // Whatever the worker does next goes above it.
+        s.append(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"One."}]}}"#);
+        s.look();
+        assert_eq!(s.rows(), vec!["❯ Count.", "● One.", "~❯ go on"]);
+    }
+
+    #[test]
+    fn its_band_runs_the_grid_dim_as_a_prompt_does() {
+        let mut s = Scratch::new("band");
+        s.page.echo("go on");
+        let (lines, _) = s.page.lines(40, 0);
+        let echo = lines
+            .iter()
+            .find(|l| plain(l).starts_with("❯ go on"))
+            .unwrap();
+        assert!(echo.contains(DIM));
+        assert_eq!(plain(echo).chars().count(), 40);
+    }
+
+    #[test]
+    fn lines_land_first_in_first_out_with_no_duplicate() {
+        let mut s = Scratch::new("fifo");
+        s.page.echo("one");
+        s.page.echo("two");
+        assert_eq!(s.rows(), vec!["❯ Count.", "~❯ one", "~❯ two"]);
+        s.lands("one");
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ one", "~❯ two"]);
+        s.lands("two");
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ one", "❯ two"]);
+        // Nothing to clear: nothing goes wrong.
+        s.lands("three");
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ one", "❯ two", "❯ three"]);
+    }
+
+    #[test]
+    fn a_line_the_manager_changed_still_lands() {
+        let mut s = Scratch::new("paraphrase");
+        s.page.echo("plz count slower");
+        s.lands("Please count more slowly.");
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ Please count more slowly."]);
+    }
+
+    #[test]
+    fn a_line_that_wakes_a_finished_worker_lands_too() {
+        let mut s = Scratch::new("wakes");
+        s.page.echo("hello");
+        s.append(
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\nhello\n\nAddress this before completing your current task."}}"#,
+        );
+        s.look();
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ hello"]);
+    }
+
+    #[test]
+    fn what_landed_before_the_send_clears_nothing() {
+        let mut s = Scratch::new("before");
+        // In the file, not looked at yet, when the line goes.
+        let record = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"earlier","origin":{"kind":"coordinator"}}}"#;
+        s.append(record);
+        s.page.echo("now");
+        s.look();
+        assert_eq!(s.rows(), vec!["❯ Count.", "❯ earlier", "~❯ now"]);
+    }
+
+    #[test]
+    fn other_records_clear_nothing() {
+        let mut s = Scratch::new("others");
+        s.page.echo("go on");
+        s.append(r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>x</system-reminder>"}}"#);
+        s.append(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"One."}]}}"#);
+        s.look();
+        assert_eq!(s.rows(), vec!["❯ Count.", "● One.", "~❯ go on"]);
+    }
+
+    #[test]
+    fn not_sent_takes_the_echo_back_and_compaction_keeps_it() {
+        let mut s = Scratch::new("notsent");
+        s.page.echo("first");
+        s.page.echo("second");
+        s.page.set_sending(Sending::Compacting);
+        assert_eq!(s.rows(), vec!["❯ Count.", "~❯ first", "~❯ second"]);
+        s.page.drop_echo();
+        s.page.set_sending(Sending::Refused("Not sent: x".into()));
+        assert_eq!(s.rows(), vec!["❯ Count.", "~❯ first"], "the last one's");
+        // A refusal alone isn't a line that was on its way.
+        s.page.set_sending(Sending::Refused("Not sent: y".into()));
+        assert_eq!(s.rows(), vec!["❯ Count.", "~❯ first"]);
+    }
+
+    #[test]
+    fn a_page_with_no_transcript_shows_no_echo() {
+        let brief = transcript::prompt_rows("The brief.", None);
+        let ask = Ask::Start {
+            task: "acme#2".into(),
+        };
+        let mut next_up = WorkerPage::rows(TabId(1), "acme#2".into(), brief).with_input(Some(ask));
+        next_up.echo("add this");
+        let said: Vec<String> = next_up.entries().iter().map(Row::plain).collect();
+        assert_eq!(said, vec!["❯ The brief."]);
+
+        let mut waiting = WorkerPage::text(TabId(1), "w".into(), "No transcript yet.".into());
+        waiting.echo("hello");
+        assert_eq!(waiting.entries().len(), 1);
+        waiting.drop_echo();
     }
 
     #[test]

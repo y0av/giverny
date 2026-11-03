@@ -11,8 +11,14 @@
 //! Claude Code 2.1.308): its banner's rows (here blank, under the header),
 //! the worker's prompt on its grey band and each entry under it
 //! ([`transcript`]), then the prompt box, its rules in the worker's colour
-//! with its name on the top one, dimmed and `read-only`. No key reaches the
-//! shell under the page, and nothing typed goes anywhere.
+//! with its name on the top one. No key reaches the shell under the page.
+//!
+//! A line typed in the box goes to the tab's manager, its own Claude Code,
+//! which passes it on to the worker with `SendMessage`, or for a Next up row
+//! starts the task with it ([`Ask`], `send_line`). The box takes only what
+//! the user types, and a line goes only on their Enter. A page with nobody
+//! to send to, or with `management_panel.prompt_box` off, keeps the box
+//! dimmed and `read-only`.
 //!
 //! A Running worker is followed as its transcript grows; a Done one opens at
 //! its end, on its report. A Next up row's brief is drawn as the prompt its
@@ -28,6 +34,7 @@ use giverny_term::page::Page;
 use giverny_term::widget::{RenderShared, RowMarks};
 
 use crate::management_panel::RowClick;
+use crate::row_open::Ask;
 use crate::{Action, App};
 
 /// How often a live transcript is looked at.
@@ -70,6 +77,38 @@ pub struct WorkerPage {
     at_top: bool,
     /// The line of the text the button is on.
     button_line: usize,
+    /// The prompt box, when a line typed in it goes to the manager.
+    input: Option<Input>,
+}
+
+/// The page's prompt box while it takes a line for the manager.
+struct Input {
+    ask: Ask,
+    text: String,
+    /// The cursor, in chars into `text`.
+    cursor: usize,
+    state: Sending,
+}
+
+/// Where the box's line is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sending {
+    /// Nothing sent yet, or the last line went and another may follow.
+    Idle,
+    /// Written to the manager's prompt; waiting to hear it was submitted.
+    Going,
+    /// Waiting at the manager's prompt for a compaction to end.
+    Compacting,
+    /// The manager has it: what the box says under it.
+    Sent(String),
+    /// Not sent, and why: the line stays in the box.
+    Refused(String),
+}
+
+impl Sending {
+    fn busy(&self) -> bool {
+        matches!(self, Sending::Going | Sending::Compacting)
+    }
 }
 
 pub enum Content {
@@ -145,7 +184,43 @@ impl WorkerPage {
             laid: None,
             at_top: false,
             button_line: 0,
+            input: None,
         }
+    }
+
+    /// The page's box takes a line for the manager: `ask` says what the
+    /// line asks of it. `None` keeps the box read-only.
+    pub fn with_input(mut self, ask: Option<Ask>) -> Self {
+        self.input = ask.map(|ask| Input {
+            ask,
+            text: String::new(),
+            cursor: 0,
+            state: Sending::Idle,
+        });
+        self
+    }
+
+    /// What a line typed in the box asks of the manager, if one can be.
+    pub fn ask(&self) -> Option<&Ask> {
+        self.input.as_ref().map(|i| &i.ask)
+    }
+
+    /// The box's line is on its way, went, or was refused: the box says so
+    /// under it. A line the manager has leaves the box; any other stays.
+    pub fn set_sending(&mut self, state: Sending) {
+        let Some(input) = &mut self.input else {
+            return;
+        };
+        if input.state == state {
+            return;
+        }
+        if matches!(state, Sending::Sent(_)) {
+            input.text.clear();
+            input.cursor = 0;
+        }
+        input.state = state;
+        self.generation += 1;
+        self.page.to_end();
     }
 
     /// The page shows this row.
@@ -190,7 +265,13 @@ impl WorkerPage {
         let style = transcript::Style { color: true };
         out.extend(transcript::lay_out(&wrapped, true, style));
         out.push(String::new());
-        out.extend(prompt_box(cols, &self.name));
+        match &self.input {
+            Some(input) => {
+                out.extend(input_box(cols, &self.name, input));
+                out.extend(status_lines(input, cols));
+            }
+            None => out.extend(prompt_box(cols, &self.name)),
+        }
         out.push(String::new());
         // The button's row: blank, the button drawn over it.
         out.push(String::new());
@@ -251,12 +332,17 @@ impl WorkerPage {
     /// The page's keys, taken before the terminal under it sees them: the
     /// scroll keys scroll, as in Claude Code's view, and nothing typed
     /// reaches the shell. Esc goes back. Ctrl and Alt chords pass through
-    /// to Giverny's own shortcuts. Returns whether Esc was pressed.
-    fn keys(&mut self, ctx: &egui::Context) -> bool {
-        let mut back = false;
+    /// to Giverny's own shortcuts. With a box that takes a line, typing
+    /// goes into it, Shift+Enter breaks the line and Enter sends it; Esc
+    /// then clears a line first, and Home/End move in it.
+    fn keys(&mut self, ctx: &egui::Context) -> Keys {
+        let mut out = Keys::default();
         let page = i32::from(self.page.rows()).saturating_sub(2).max(1);
         let mut moves: Vec<i32> = Vec::new();
         let mut ends: Vec<bool> = Vec::new();
+        let mut edits: Vec<Edit> = Vec::new();
+        let typing = self.input.as_ref().is_some_and(|i| !i.state.busy());
+        let has_text = self.input.as_ref().is_some_and(|i| !i.text.is_empty());
         ctx.input_mut(|i| {
             i.events.retain(|e| match e {
                 egui::Event::Key {
@@ -271,11 +357,25 @@ impl WorkerPage {
                 {
                     if *pressed {
                         match key {
-                            Key::Escape => back = true,
+                            Key::Escape if typing && has_text => edits.push(Edit::Clear),
+                            Key::Escape => out.back = true,
+                            Key::Enter if typing && modifiers.shift => {
+                                edits.push(Edit::Insert("\n".into()));
+                            }
+                            Key::Enter if typing => edits.push(Edit::Enter),
+                            Key::Backspace if typing => edits.push(Edit::Back),
+                            Key::Delete if typing => edits.push(Edit::Delete),
+                            Key::ArrowLeft if typing => edits.push(Edit::Left),
+                            Key::ArrowRight if typing => edits.push(Edit::Right),
+                            Key::Home if typing && has_text => edits.push(Edit::Start),
+                            Key::End if typing && has_text => edits.push(Edit::End),
                             Key::ArrowUp => moves.push(1),
                             Key::ArrowDown => moves.push(-1),
                             Key::PageUp => moves.push(page),
-                            Key::PageDown | Key::Space => moves.push(-page),
+                            Key::PageDown => moves.push(-page),
+                            // A space is typed, not a scroll, in a box that
+                            // takes a line.
+                            Key::Space if !typing => moves.push(-page),
                             Key::Home => ends.push(true),
                             Key::End => ends.push(false),
                             _ => {}
@@ -283,10 +383,32 @@ impl WorkerPage {
                     }
                     false
                 }
-                egui::Event::Text(_) | egui::Event::Paste(_) => false,
+                egui::Event::Text(t) | egui::Event::Paste(t) => {
+                    if typing {
+                        edits.push(Edit::Insert(t.clone()));
+                    }
+                    false
+                }
                 _ => true,
             });
         });
+        if let Some(input) = &mut self.input {
+            let before = (input.text.clone(), input.cursor);
+            for edit in edits {
+                if let Some(line) = input.edit(edit) {
+                    out.send = Some(line);
+                }
+            }
+            if (input.text.clone(), input.cursor) != before || out.send.is_some() {
+                // A new line: what became of the last one is old news.
+                if matches!(input.state, Sending::Refused(_) | Sending::Sent(_)) {
+                    input.state = Sending::Idle;
+                }
+                self.generation += 1;
+                // The box is at the page's end: typing shows it.
+                self.page.to_end();
+            }
+        }
         for n in moves {
             self.page.scroll(n);
         }
@@ -297,7 +419,75 @@ impl WorkerPage {
                 self.page.to_end();
             }
         }
-        back
+        out
+    }
+}
+
+/// What the page's keys did this frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Keys {
+    /// Back to the terminal.
+    back: bool,
+    /// The box's line, sent with Enter.
+    send: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edit {
+    Insert(String),
+    Back,
+    Delete,
+    Left,
+    Right,
+    Start,
+    End,
+    Clear,
+    Enter,
+}
+
+impl Input {
+    /// One edit. Enter on a line with words in it hands the line over; it
+    /// stays in the box, unchangeable, until the manager has it.
+    fn edit(&mut self, edit: Edit) -> Option<String> {
+        let len = self.text.chars().count();
+        let at = |s: &str, n: usize| s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
+        match edit {
+            Edit::Insert(t) => {
+                let t: String = t
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('\t', "    ")
+                    .chars()
+                    .filter(|c| *c == '\n' || !c.is_control())
+                    .collect();
+                let i = at(&self.text, self.cursor);
+                self.text.insert_str(i, &t);
+                self.cursor += t.chars().count();
+            }
+            Edit::Back if self.cursor > 0 => {
+                let i = at(&self.text, self.cursor - 1);
+                self.text.remove(i);
+                self.cursor -= 1;
+            }
+            Edit::Delete if self.cursor < len => {
+                let i = at(&self.text, self.cursor);
+                self.text.remove(i);
+            }
+            Edit::Left => self.cursor = self.cursor.saturating_sub(1),
+            Edit::Right => self.cursor = (self.cursor + 1).min(len),
+            Edit::Start => self.cursor = 0,
+            Edit::End => self.cursor = len,
+            Edit::Clear => {
+                self.text.clear();
+                self.cursor = 0;
+            }
+            Edit::Enter if !self.text.trim().is_empty() => {
+                self.state = Sending::Going;
+                return Some(self.text.clone());
+            }
+            Edit::Back | Edit::Delete | Edit::Enter => {}
+        }
+        None
     }
 }
 
@@ -308,11 +498,139 @@ pub fn keys(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let Some(page) = app.page.as_mut().filter(|p| Some(p.tab) == active) else {
         return Vec::new();
     };
-    if page.keys(ctx) {
-        vec![Action::ClosePage(page.tab)]
-    } else {
-        Vec::new()
+    let keys = page.keys(ctx);
+    let mut out = Vec::new();
+    if let Some(text) = keys.send {
+        out.push(Action::SendLine(page.tab, text));
     }
+    if keys.back {
+        out.push(Action::ClosePage(page.tab));
+    }
+    out
+}
+
+/// The prompt box while it takes a line for the manager: Claude Code's box
+/// under a worker's view, bright, its rules in the worker's colour and its
+/// name on the top one, the text typed so far with the cursor in it,
+/// wrapped as Claude Code wraps a long line. Empty, it shows what a line
+/// is for, dim. While the line is on its way it is drawn dim, with no
+/// cursor.
+fn input_box(cols: usize, name: &str, input: &Input) -> Vec<String> {
+    const REV: &str = "\x1b[7m";
+    let (r, g, b) = WORKER_RGB;
+    let rule = format!("\x1b[38;2;{r};{g};{b}m");
+    let top = prompt_box(cols, name)[0].replace(DIM, "");
+    let bottom = format!("{rule}{}{RESET}", "─".repeat(cols));
+    let busy = input.state.busy();
+    let mut body: Vec<String> = Vec::new();
+    if input.text.is_empty() {
+        // The cursor sits on the placeholder's first cell, as Claude Code's
+        // does.
+        let hint: String = input
+            .ask
+            .placeholder()
+            .chars()
+            .take(cols.saturating_sub(3))
+            .collect();
+        let mut chars = hint.chars();
+        let first = chars.next().unwrap_or(' ');
+        let rest: String = chars.collect();
+        body.push(format!("❯ {REV}{DIM}{first}{RESET}{DIM}{rest}{RESET}"));
+    } else {
+        let width = cols.saturating_sub(2).max(1);
+        let cursor = (!busy).then_some(input.cursor);
+        let lead = if busy { DIM } else { "" };
+        for (n, row) in text_rows(&input.text, cursor, width)
+            .into_iter()
+            .enumerate()
+        {
+            let prompt = if n == 0 { "❯ " } else { "  " };
+            body.push(format!("{prompt}{lead}{row}{RESET}"));
+        }
+    }
+    let mut lines = vec![top];
+    lines.extend(body);
+    lines.push(bottom);
+    lines
+}
+
+/// `text` in rows of at most `width` cells: broken at each line break and
+/// wrapped where a line is longer. The char at `cursor`, or a cell past the
+/// end of its line, is drawn reversed.
+fn text_rows(text: &str, cursor: Option<usize>, width: usize) -> Vec<String> {
+    const REV: &str = "\x1b[7m";
+    const UNREV: &str = "\x1b[27m";
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut cells = 0;
+    for i in 0..=chars.len() {
+        let here = cursor == Some(i);
+        match chars.get(i) {
+            Some('\n') => {
+                if here {
+                    row.push_str(&format!("{REV} {UNREV}"));
+                }
+                rows.push(std::mem::take(&mut row));
+                cells = 0;
+            }
+            Some(c) => {
+                if cells == width {
+                    rows.push(std::mem::take(&mut row));
+                    cells = 0;
+                }
+                if here {
+                    row.push_str(&format!("{REV}{c}{UNREV}"));
+                } else {
+                    row.push(*c);
+                }
+                cells += 1;
+            }
+            None => {
+                if here {
+                    if cells == width {
+                        rows.push(std::mem::take(&mut row));
+                    }
+                    row.push_str(&format!("{REV} {UNREV}"));
+                }
+                rows.push(std::mem::take(&mut row));
+            }
+        }
+    }
+    rows
+}
+
+/// The rows under the box: where the line is, wrapped to the grid.
+fn status_lines(input: &Input, cols: usize) -> Vec<String> {
+    let (color, text) = match &input.state {
+        Sending::Idle => return Vec::new(),
+        Sending::Going => (DIM, "sending…"),
+        Sending::Compacting => (DIM, "queued behind compaction"),
+        Sending::Sent(what) => (DIM, what.as_str()),
+        Sending::Refused(why) => ("\x1b[38;2;220;90;90m", why.as_str()),
+    };
+    let width = cols.saturating_sub(6).max(8);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let n = line.chars().count();
+        if n > 0 && n + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    lines.push(line);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let lead = if i == 0 { "  ⎿  " } else { "     " };
+            format!("{color}{lead}{l}{RESET}")
+        })
+        .collect()
 }
 
 /// Claude Code's prompt box under a worker's view, dimmed: nothing can be
@@ -390,5 +708,91 @@ impl TranscriptView {
             ));
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> Input {
+        Input {
+            ask: Ask::Start {
+                task: "acme#2".into(),
+            },
+            text: String::new(),
+            cursor: 0,
+            state: Sending::Idle,
+        }
+    }
+
+    fn plain(s: &str) -> String {
+        let mut out = String::new();
+        let mut esc = false;
+        for c in s.chars() {
+            match c {
+                '\x1b' => esc = true,
+                'm' if esc => esc = false,
+                _ if esc => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_box_edits_a_line_and_enter_hands_it_over() {
+        let mut i = input();
+        assert_eq!(i.edit(Edit::Enter), None, "an empty box sends nothing");
+        i.edit(Edit::Insert("helo".into()));
+        i.edit(Edit::Left);
+        i.edit(Edit::Insert("l".into()));
+        assert_eq!((i.text.as_str(), i.cursor), ("hello", 4));
+        i.edit(Edit::End);
+        i.edit(Edit::Insert("\r\nthere\tyou\x07".into()));
+        assert_eq!(i.text, "hello\nthere    you");
+        i.edit(Edit::Start);
+        i.edit(Edit::Delete);
+        assert_eq!(i.text, "ello\nthere    you");
+        assert_eq!(i.edit(Edit::Enter), Some("ello\nthere    you".into()));
+        assert_eq!(i.state, Sending::Going);
+        assert_eq!(
+            i.text, "ello\nthere    you",
+            "kept until the manager has it"
+        );
+        i.edit(Edit::Clear);
+        assert_eq!((i.text.as_str(), i.cursor), ("", 0));
+    }
+
+    #[test]
+    fn the_text_wraps_and_breaks_with_the_cursor_in_it() {
+        let rows: Vec<String> = text_rows("abcdef\ngh", Some(9), 4)
+            .iter()
+            .map(|r| plain(r))
+            .collect();
+        assert_eq!(rows, vec!["abcd", "ef", "gh "]);
+        let rows: Vec<String> = text_rows("abcd", Some(4), 4)
+            .iter()
+            .map(|r| plain(r))
+            .collect();
+        assert_eq!(rows, vec!["abcd", " "], "a full row puts the cursor below");
+        assert_eq!(text_rows("ab", None, 4), vec!["ab"]);
+    }
+
+    #[test]
+    fn under_the_box_it_says_where_the_line_is() {
+        let mut i = input();
+        assert!(status_lines(&i, 80).is_empty());
+        i.state = Sending::Going;
+        assert_eq!(plain(&status_lines(&i, 80)[0]), "  ⎿  sending…");
+        i.state = Sending::Compacting;
+        assert_eq!(
+            plain(&status_lines(&i, 80)[0]),
+            "  ⎿  queued behind compaction"
+        );
+        i.state = Sending::Refused("Not sent: the manager is waiting on a question.".into());
+        assert_eq!(status_lines(&i, 30).len(), 2, "wrapped to the grid");
+        let empty = input_box(40, "acme#2", &i);
+        assert!(plain(&empty[1]).starts_with("❯ Start this task now."));
     }
 }

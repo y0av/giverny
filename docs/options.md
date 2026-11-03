@@ -35,6 +35,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.management_panel` | `false` | Show the tab's subagents, running and done, in a table under the terminal. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
+| `management_panel.prompt_box` | `true` | A line typed in a worker page's prompt box goes to the tab's manager, which passes it on. |
 | `management_panel.columns.stage` | `true` | STAGE: Running, NextUp or Done. |
 | `management_panel.columns.id` | `true` | The feed's task key, else the subagent's name, else its model. |
 | `management_panel.columns.title` | `true` | The task's title, else the subagent's description: the column that takes the room left. |

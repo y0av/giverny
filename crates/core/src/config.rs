@@ -33,6 +33,9 @@ pub struct ManagementPanelConfig {
     pub done_last: u32,
     /// One switch per pane column.
     pub columns: PaneColumns,
+    /// The worker page's prompt box: a line typed there goes to the tab's
+    /// manager. Off, the box is read-only.
+    pub prompt_box: bool,
 }
 
 impl Default for ManagementPanelConfig {
@@ -41,6 +44,7 @@ impl Default for ManagementPanelConfig {
             done_rows: "all".into(),
             done_last: 5,
             columns: PaneColumns::default(),
+            prompt_box: true,
         }
     }
 }

@@ -15,6 +15,7 @@ mod paste_image;
 mod prompt_bar;
 mod rail;
 mod row_open;
+mod send_line;
 mod settings_ui;
 mod splash;
 mod taskbar;
@@ -957,6 +958,9 @@ pub enum Action {
     /// The "back" button, or Esc, on the worker page a tab shows: the tab's
     /// terminal again.
     ClosePage(TabId),
+    /// The Enter in a worker page's prompt box: its line goes to the tab's
+    /// manager (`send_line`).
+    SendLine(TabId, String),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -1193,6 +1197,9 @@ pub struct App {
     /// The worker page a tab shows in its terminal's place (`worker_page`):
     /// a management-panel row's worker. A second click on its row closes it.
     page: Option<worker_page::WorkerPage>,
+    /// A line from a worker page's box, written to its manager's prompt
+    /// and waited for.
+    sending: Option<send_line::Pending>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
@@ -1745,6 +1752,7 @@ impl App {
             limited: HashMap::new(),
             agent_views: management_panel::Views::default(),
             page: None,
+            sending: None,
             was: HashMap::new(),
             unseen_done: HashSet::new(),
             fg_running: HashMap::new(),
@@ -1966,6 +1974,7 @@ impl App {
             }
             Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
             Action::ClosePage(tab) => self.close_page(tab),
+            Action::SendLine(tab, text) => self.send_line(ctx, tab, &text),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -3899,6 +3908,8 @@ impl App {
         } else {
             click.key.clone()
         };
+        // What is typed in the page's box goes to the tab's manager.
+        let ask = row_open::Ask::of(click, &name).filter(|_| self.cfg.management_panel.prompt_box);
         use row_open::{Body, Plan};
         use worker_page::WorkerPage;
         let page = match row_open::plan(click) {
@@ -3953,7 +3964,109 @@ impl App {
         if self.ws.active != Some(parent) {
             self.apply(ctx, Action::Select(parent));
         }
-        self.page = Some(page.of_row(click.clone()));
+        self.page = Some(page.of_row(click.clone()).with_input(ask));
+    }
+
+    /// The Enter in `tab`'s worker page: the line goes to the tab's manager,
+    /// pasted at its Claude Code's prompt and submitted, when nothing there
+    /// would take the Enter for something else (`send_line`).
+    fn send_line(&mut self, ctx: &egui::Context, tab: TabId, text: &str) {
+        use worker_page::Sending;
+        let Some(page) = self.page.as_mut().filter(|p| p.tab == tab) else {
+            return;
+        };
+        let Some(ask) = page.ask().cloned() else {
+            return;
+        };
+        let claude = self.claude.tabs.get(&tab);
+        let session = claude.and_then(|c| c.session_id.clone());
+        // Read now: a permission or a question that came up a moment ago is
+        // in the registry before it is drawn, and long before its
+        // notification.
+        let registry = session.as_deref().and_then(|sid| {
+            let dirs = self.claude.profiles.iter().map(|p| p.config_dir.clone());
+            giverny_claude::registry::scan(dirs)
+                .into_iter()
+                .find(|s| s.entry.session_id == sid)
+                .map(|s| s.entry.waiting())
+        });
+        let term = self.rt.get(&tab).and_then(|rt| rt.session.as_ref());
+        let facts = send_line::Facts {
+            hooked: self.claude.hooked(tab),
+            running: self.claude.state_of(tab) != claude_watch::ClaudeState::None,
+            registry,
+            bracketed: term.is_some_and(|t| t.bracketed_paste()),
+            in_flight: self.sending.is_some(),
+        };
+        if let Some(why) = send_line::refusal(&facts) {
+            tracing::info!("worker page: line not sent: {why}");
+            page.set_sending(Sending::Refused(why.to_string()));
+            return;
+        }
+        let Some(term) = term else {
+            return;
+        };
+        let line = ask.line(text);
+        tracing::info!("worker page: line sent to the manager in tab {tab:?}");
+        term.write(send_line::encode(&line));
+        self.sending = Some(send_line::Pending::new(
+            tab,
+            page.row.clone(),
+            &line,
+            self.claude.submits(tab).0,
+            Instant::now(),
+        ));
+        page.set_sending(Sending::Going);
+        ctx.request_repaint();
+    }
+
+    /// Whether the line in flight has reached its manager: its page says
+    /// so, if it is still up.
+    fn process_sending(&mut self, ctx: &egui::Context) {
+        use send_line::Step;
+        use worker_page::Sending;
+        let Some(pending) = self.sending.as_mut() else {
+            return;
+        };
+        let (count, recent) = self.claude.submits(pending.tab);
+        let new = usize::try_from(count.saturating_sub(pending.submits))
+            .unwrap_or(usize::MAX)
+            .min(recent.len());
+        let prompts = recent[recent.len() - new..].iter().map(String::as_str);
+        let compacting = self.claude.compacting(pending.tab);
+        let step = pending.step(Instant::now(), prompts, compacting);
+        let page = self.page.as_mut().filter(|p| {
+            p.tab == pending.tab
+                && match (&p.row, &pending.row) {
+                    (Some(a), Some(b)) => a.same_row(b),
+                    (a, b) => a.is_none() && b.is_none(),
+                }
+        });
+        let state = match step {
+            Step::Sending => Sending::Going,
+            Step::Compacting => Sending::Compacting,
+            Step::Delivered => {
+                tracing::info!("worker page: the manager has the line");
+                let what = page.as_ref().and_then(|p| p.ask()).map(|a| a.sent());
+                Sending::Sent(what.unwrap_or("Sent to the manager.").to_string())
+            }
+            Step::NotSent => {
+                tracing::info!("worker page: no prompt carried the line");
+                Sending::Refused(
+                    "Not sent: the manager's Claude Code never said it got the line. Look at \
+                     its tab before sending it again."
+                        .to_string(),
+                )
+            }
+        };
+        if matches!(step, Step::Delivered | Step::NotSent) {
+            self.sending = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if let Some(page) = page {
+            page.set_sending(state);
+        }
     }
 
     /// The Giverny tab running conversation `sid`, when it is live.
@@ -4177,6 +4290,7 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.deliver_pasted_images();
         self.process_pending(&ctx);
+        self.process_sending(&ctx);
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self

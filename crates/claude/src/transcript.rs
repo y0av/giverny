@@ -676,14 +676,18 @@ impl Render {
                 }
                 _ => {}
             },
-            // A message typed to a running worker in its own Claude Code view
-            // is not a `user` line: it lands as a queued command attachment,
-            // origin human, when the worker takes it.
+            // A message to a running worker is not a `user` line: it lands as
+            // a queued command attachment when the worker takes it, origin
+            // human when typed in its own Claude Code view, coordinator when
+            // its parent sent it (`SendMessage`).
             Some("attachment") => {
                 let att = v.get("attachment").unwrap_or(&Value::Null);
-                let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+                let sent = matches!(
+                    att.pointer("/origin/kind").and_then(Value::as_str),
+                    Some("human" | "coordinator")
+                );
                 if att.get("type").and_then(Value::as_str) == Some("queued_command")
-                    && human
+                    && sent
                     && let Some(text) = att.get("prompt").and_then(Value::as_str)
                 {
                     entry(prompt_rows(text, None), &mut out);
@@ -807,6 +811,29 @@ mod tests {
                 "",
                 "● notes.txt has 3 lines.",
                 "  Ran seq 1 40.",
+            ]
+        );
+    }
+
+    /// A line passed on by the worker's parent (`SendMessage`) while the
+    /// worker runs lands as a queued command, as one typed in its view does
+    /// (Claude Code 2.1.317). Other queued commands stay out.
+    #[test]
+    fn a_message_queued_for_a_running_worker_is_its_prompt() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Sleep, then report."}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"PING-ONE","origin":{"kind":"coordinator"},"isMeta":true}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"typed in its view","origin":{"kind":"human"}}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"a task notification","origin":{"kind":"task-notification"}}}"#,
+        ];
+        assert_eq!(
+            view(&lines),
+            vec![
+                "❯ Sleep, then report.",
+                "",
+                "❯ PING-ONE",
+                "",
+                "❯ typed in its view",
             ]
         );
     }

@@ -11,7 +11,8 @@
 //!   (`giverny_claude::transcript`). A Running worker's page is live,
 //!   following the transcript as it grows; a Done one's, or one whose
 //!   worker has finished ([`RowClick::finished`]), opens at its end, on the
-//!   final report. Nothing is typed into Claude Code.
+//!   final report. A line typed in the page's prompt box goes to the
+//!   tab's manager ([`Ask`]).
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab, unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave. A Done
@@ -70,6 +71,70 @@ pub fn title_of(click: &RowClick) -> String {
 
 fn agent_id(click: &RowClick) -> Option<&str> {
     click.agent_id.as_deref().filter(|id| !id.is_empty())
+}
+
+/// What a line typed in a worker page's prompt box asks the tab's manager
+/// to do. Claude Code has no way in to a subagent from outside but its
+/// parent's `SendMessage`, and a Next up row has no worker yet, so the line
+/// goes to the manager, said in the user's words (`send_line`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// Pass the line on to a worker: a running one takes it at its next
+    /// tool call, one whose turn ended is woken with it.
+    Send { task: String, agent_id: String },
+    /// Start a Next up task now, the line added to its brief.
+    Start { task: String },
+}
+
+impl Ask {
+    /// The ask of the row a page shows; `task` is the task's name as the
+    /// page gives it. `None` for a row with no worker to send to.
+    pub fn of(click: &RowClick, task: &str) -> Option<Ask> {
+        let task = task.trim().to_string();
+        match click.stage {
+            Stage::Planned => {
+                let key = Some(click.key.trim())
+                    .filter(|k| !k.is_empty())
+                    .map_or(task, str::to_string);
+                (!key.is_empty()).then_some(Ask::Start { task: key })
+            }
+            Stage::Running | Stage::Done => Some(Ask::Send {
+                task,
+                agent_id: agent_id(click)?.to_string(),
+            }),
+        }
+    }
+
+    /// The line the manager is given: the user's text after a few words
+    /// saying where it goes, as `docs/management-panel.md` spells them.
+    pub fn line(&self, text: &str) -> String {
+        let text = text.trim();
+        match self {
+            Ask::Send { task, agent_id } if task.is_empty() => {
+                format!("Send this to the worker (agent {agent_id}): {text}")
+            }
+            Ask::Send { task, agent_id } => {
+                format!("Send this to {task}'s worker (agent {agent_id}): {text}")
+            }
+            Ask::Start { task } => format!("Start {task} now, adding this to its brief: {text}"),
+        }
+    }
+
+    /// The box's placeholder, drawn dim and never sent.
+    pub fn placeholder(&self) -> &'static str {
+        match self {
+            Ask::Send { .. } => "Message this worker. Its manager passes it on.",
+            Ask::Start { .. } => "Start this task now. Its manager adds this to its brief.",
+        }
+    }
+
+    /// What the box says once the manager has the line.
+    pub fn sent(&self) -> &'static str {
+        match self {
+            Ask::Send { .. } => "Sent to the manager, to pass on to this worker.",
+            Ask::Start { .. } => "Sent to the manager, to start this task with it.",
+        }
+    }
 }
 
 /// Decide what a click does.
@@ -204,4 +269,64 @@ pub fn resumed_session(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn click(stage: Stage, key: &str, agent: Option<&str>) -> RowClick {
+        RowClick {
+            stage,
+            key: key.into(),
+            agent_id: agent.map(str::to_string),
+            finished: false,
+            name: "fix the build".into(),
+            transcript: None,
+            open: None,
+            brief: None,
+            note: None,
+            review: None,
+            facts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_row_with_a_worker_takes_a_line() {
+        for stage in [Stage::Running, Stage::Done] {
+            let ask = Ask::of(&click(stage, "acme#1", Some("a1b2")), "acme#1").unwrap();
+            assert_eq!(
+                ask.line("  go on\nwith the tests "),
+                "Send this to acme#1's worker (agent a1b2): go on\nwith the tests"
+            );
+        }
+        let mut finished = click(Stage::Running, "", Some("a1b2"));
+        finished.finished = true;
+        assert_eq!(
+            Ask::of(&finished, "").unwrap().line("hi"),
+            "Send this to the worker (agent a1b2): hi"
+        );
+        assert_eq!(
+            Ask::of(&click(Stage::Running, "acme#1", None), "acme#1"),
+            None
+        );
+        assert_eq!(Ask::of(&click(Stage::Done, "", Some("")), "x"), None);
+    }
+
+    #[test]
+    fn a_next_up_row_is_started() {
+        let ask = Ask::of(&click(Stage::Planned, "acme#2", None), "acme#2 · title").unwrap();
+        assert_eq!(
+            ask.line("use the old API"),
+            "Start acme#2 now, adding this to its brief: use the old API"
+        );
+        let ask = Ask::of(&click(Stage::Planned, "", None), "a task").unwrap();
+        assert_eq!(
+            ask,
+            Ask::Start {
+                task: "a task".into()
+            }
+        );
+        assert_eq!(Ask::of(&click(Stage::Planned, "", None), " "), None);
+    }
 }

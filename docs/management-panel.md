@@ -28,14 +28,14 @@ Rows stay until the tab's conversation is cleared (`/clear`), a fresh `claude` s
 A click on a row opens Giverny's **worker page** in the tab, in the terminal's place. Claude Code cannot open a worker's view from outside, and keeps none of a worker whose turn has ended, so Giverny draws the worker as Claude Code's own subagent view does, from its transcript (`agent-<id>.jsonl`):
 
 - It fills the terminal's area, in the terminal's own grid, font and colours, on a background tinted toward the theme's magenta. The worker's prompt is on its grey band, and each tool call and reply under it: `●` green once its result is back, red on an error, grey while it runs, and a tool's output folded to its first three lines.
-- Claude Code's prompt box follows, dimmed and `read-only`, its rules in the worker's colour and the task's name on the top one. Nothing typed reaches the shell under the page, and nothing is typed into Claude Code.
+- Claude Code's prompt box follows, its rules in the worker's colour and the task's name on the top one. A line typed there goes to the tab's manager, which passes it on (see **Lines from the worker page**). On a row with no worker to send to, or with `management_panel.prompt_box` off, the box is dimmed and `read-only`. Nothing typed on the page reaches the shell under it.
 - A header over the page names the task (the feed's key, else the worker's description up to its first `:`) and carries the row's facts: elapsed against the estimate, NOW and tokens. A Done row with a `review` adds its **Review line** (see below). Its `×` hides the header for that page.
 - A **Running** worker's page follows its transcript as it grows. A **Done** one's opens at its end, on the worker's report, and so does a Running row's whose worker has finished. A worker with no transcript yet gets a page saying so.
 - A **Next up** row's page shows its `brief`, drawn as the prompt its worker will be given, from the top. With no brief it shows the row's key, title and note.
 - A Running row with no worker and an `open` command runs that command in a new tab beside this one. A Done row whose `open` resumes (`claude --resume <id>`) a conversation running in a Giverny tab goes to that tab instead of its page. A command that resumes a conversation already running outside Giverny is not run: two claudes on one transcript would interleave it.
 - The row on the page is lit in the pane.
 - The "back" button under the prompt box, Esc, or a second click on the row goes back to the terminal.
-- The wheel, ↑/↓, PgUp/PgDn, Space and Home/End scroll it, and a drag selects and copies.
+- The wheel, ↑/↓ and PgUp/PgDn scroll it, and a drag selects and copies. Space and Home/End scroll too while the box takes no line; while it does, they edit it.
 
 ## Where the live rows come from
 
@@ -230,14 +230,22 @@ A manager may name the sessions it runs. Its names live beside the feeds, in fil
 
 They are listed here so that a Giverny reader (a name beside the model on the status line, a tab titled after its session) can be added later against a file whose shape is settled.
 
-## Proposed for a later PR: lines from the worker page
+## Lines from the worker page
 
-For now the worker page is read-only. A later change, behind its own setting, may let a person type a line in the page's prompt box and have Giverny put it at the manager's prompt as one plain line, so the manager can wake a finished worker or start a Next up task. It would type into Claude Code's screen, so it ships with opening a running worker in Claude Code's own view. The lines it would send, for a manager to understand:
+Claude Code has no way to type to a subagent from outside: the only way in is its parent's `SendMessage`. So a line typed in the worker page's prompt box goes to the tab's own Claude Code, the manager, as one plain line naming the worker, and the manager passes it on. These are the lines, for a manager to understand:
 
-- `Send this to <key>'s worker (agent <agent id>): <text>`, from the page of a worker whose turn has ended or a Done row.
+- `Send this to <key>'s worker (agent <agent id>): <text>`, from a Running or Done row's page. A running worker takes the message at its next tool call; one whose turn has ended is woken with it. With no key, `Send this to the worker (agent <agent id>): <text>`.
 - `Start <key> now, adding this to its brief: <text>`, from a Next up row's page.
 
-Only the text the person typed would be sent, and only on their Enter.
+`<text>` is what the person typed, line breaks kept (Shift+Enter makes one), and it goes only on their Enter. The box is on by default wherever the pane is; `management_panel.prompt_box = false` makes it read-only.
+
+**How it is sent.** The line is pasted at the manager's prompt and submitted, so the manager reads it as the person's own typing, not as another session's message. Nothing is read off the screen.
+
+- **When.** Only while the hooks say Claude Code runs in the tab and the tab's terminal has bracketed paste on. The session's `sessions/<pid>.json` is read at send time: while its `status` is `waiting` (a permission, a question or a plan approval is up), the Enter would answer it, so the box says "Not sent: the manager is waiting on a question in its tab" and keeps the text. With no hooks reporting on the session, it refuses too.
+- **What.** Control characters are stripped: ESC, the C0 controls but tab and line break, DEL and C1. A tab becomes four spaces. The text is split into bracketed pastes of at most 800 UTF-16 units and 2 line breaks each, all in one write, then Enter. Claude Code folds a longer paste into `[Pasted text #N]`, which reaches the model as pasted material rather than typing.
+- **Confirm.** The line counts as delivered once a `UserPromptSubmit` from that session carries it (compared word for word, paste tags off). Until then the box says "sending…"; with none within five seconds it says "not sent" and keeps the text. While the session compacts (`PreCompact` seen, the compaction's `SessionStart` not yet), Claude Code holds the line until it ends, so the box says "queued behind compaction" and waits.
+
+The box writes nothing into Claude Code's settings; it uses the hooks the relay already installs.
 
 ## Versioning
 

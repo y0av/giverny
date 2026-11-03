@@ -29,7 +29,7 @@ const ANIM_STEP: f64 = giverny_term::pace::STEP_FOCUSED.as_secs_f64();
 /// The animation clock, snapped to whole steps: every glyph drawn in one
 /// frame is on the same step, and a repaint that happens for some other
 /// reason (terminal output, the pointer) does not nudge them in between.
-fn anim_time() -> f64 {
+pub(crate) fn anim_time() -> f64 {
     giverny_term::pace::anim_time()
 }
 
@@ -37,7 +37,7 @@ fn anim_time() -> f64 {
 /// a frame by [`show`]. Off, no spinner, ring or pulse is drawn at all (their
 /// place stays blank, so nothing beside them moves), and nothing here asks
 /// for a frame.
-fn animating(ui: &Ui) -> bool {
+pub(crate) fn animating(ui: &Ui) -> bool {
     ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(ANIMATE_ID)))
         .unwrap_or(true)
@@ -48,7 +48,7 @@ const ANIMATE_ID: &str = "rail-animate";
 /// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
 /// but only while it is on screen. A row scrolled out of the rail, or a
 /// spinner nobody can see, costs nothing.
-fn keep_animating(ui: &Ui, rect: Rect) {
+pub(crate) fn keep_animating(ui: &Ui, rect: Rect) {
     if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
@@ -125,13 +125,13 @@ impl BusyMark {
 }
 
 /// One calm breath, in seconds.
-const CALM_PERIOD: f64 = 3.0;
+pub(crate) const CALM_PERIOD: f64 = 3.0;
 
 /// How far in the calm mark's breath is, 0 out to 1 in: one slow breath
 /// every three seconds, against the amber flag's two (see [`breath`]), so
 /// "working" and "wants you" never fall into step. `None` is a rail that
 /// does not move: the dot holds still, full.
-fn calm_breath(time: Option<f64>) -> f32 {
+pub(crate) fn calm_breath(time: Option<f64>) -> f32 {
     match time {
         Some(t) => (0.5 - 0.5 * (t * std::f64::consts::TAU / CALM_PERIOD).cos()) as f32,
         None => 1.0,

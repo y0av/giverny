@@ -34,8 +34,8 @@ pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// Render resources shared by all tabs.
 pub struct RenderShared {
-    fonts: FontSet,
-    atlas: Atlas,
+    pub(crate) fonts: FontSet,
+    pub(crate) atlas: Atlas,
     pub theme: Theme,
     /// Font size in logical points.
     pub font_size: f32,
@@ -43,7 +43,7 @@ pub struct RenderShared {
     /// the window was not made see-through.
     pub opacity: f32,
     metrics: Option<(u32, CellMetrics)>,
-    generation: u32,
+    pub(crate) generation: u32,
 }
 
 impl RenderShared {
@@ -70,7 +70,7 @@ impl RenderShared {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn metrics_for(&mut self, px: f32) -> CellMetrics {
+    pub(crate) fn metrics_for(&mut self, px: f32) -> CellMetrics {
         let key = px.to_bits();
         if let Some((k, m)) = self.metrics
             && k == key
@@ -115,6 +115,41 @@ impl RenderShared {
                     },
                 ],
             });
+        }
+    }
+
+    /// One terminal cell at the current font size, in logical points.
+    pub fn cell_size(&mut self, pixels_per_point: f32) -> Vec2 {
+        let m = self.metrics_for(self.font_size * pixels_per_point);
+        Vec2::new(m.cell_w as f32, m.cell_h as f32) / pixels_per_point
+    }
+
+    /// Paint one line of `text` in the terminal's own glyphs — same face,
+    /// size, hinting and cell grid as the session — with cell 0's top-left
+    /// at `top_left` (snapped to the pixel grid). One cell per `char`.
+    pub fn paint_text(
+        &mut self,
+        painter: &egui::Painter,
+        top_left: Pos2,
+        text: &str,
+        color: Color32,
+    ) {
+        let ctx = painter.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let metrics = self.metrics_for(self.font_size * ppp);
+        let origin_px = Vec2::new((top_left.x * ppp).round(), (top_left.y * ppp).round());
+        let meshes = mesh::text_line(
+            &ctx,
+            &self.fonts,
+            &mut self.atlas,
+            metrics,
+            origin_px,
+            ppp,
+            text,
+            color,
+        );
+        for m in meshes {
+            painter.add(Shape::Mesh(Arc::new(m)));
         }
     }
 
@@ -1293,6 +1328,77 @@ impl TabView {
     }
 }
 
+/// Where a row button goes on a grid: the "back" button under the worker
+/// page's prompt box ([`crate::page::Page`]). Rows are screen rows, and
+/// nothing is drawn on a row off the screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowMarks {
+    /// `(row, used)`: a button on `row`, on its blank cells from column
+    /// `used` on: at the row's right end, or at [`Self::button_left`].
+    pub button: Option<(u16, u16)>,
+    /// The button's label starts at this column instead of the button
+    /// sitting at the row's right end.
+    pub button_left: Option<u16>,
+}
+
+/// The row button's rect and label, when `marks` ask for one and a label
+/// fits the row's blank cells with a cell to spare each side: the first of
+/// `labels` (longest first) that fits.
+pub(crate) fn row_button(
+    marks: &RowMarks,
+    labels: &'static [&'static str],
+    rect: Rect,
+    ppp: f32,
+    m: CellMetrics,
+    cols: u16,
+) -> Option<(Rect, &'static str)> {
+    let (row, used) = marks.button?;
+    if i32::from(row) >= rows_now(rect, ppp, m) {
+        return None;
+    }
+    // One cell of padding inside each end; at the right, the end one
+    // cell in; at the left, the label on the column asked for.
+    let end = cols;
+    let (free, left) = match marks.button_left {
+        Some(at) => {
+            let start = at.saturating_sub(1).max(used);
+            (end.saturating_sub(start), Some(start))
+        }
+        None => (end.saturating_sub(used), None),
+    };
+    let label = labels
+        .iter()
+        .find(|l| (l.chars().count() as u16) + 4 <= free)?;
+    let width = label.chars().count() as u16 + 2;
+    let start = left.unwrap_or(end - 1 - width);
+    let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
+    let r = Rect::from_min_size(
+        Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),
+        Vec2::new(width as f32 * cw, ch),
+    );
+    Some((r, *label))
+}
+
+/// Paint the row button at `r`: `fill`, a shade lighter while the pointer
+/// is on it (`resp`), its label in the grid's background colour `bg`.
+pub(crate) fn paint_row_button(
+    painter: &egui::Painter,
+    shared: &mut RenderShared,
+    r: Rect,
+    label: &str,
+    fill: Color32,
+    bg: Color32,
+    resp: &Response,
+) {
+    let hot = resp.hovered() || resp.is_pointer_button_down_on();
+    let fill = if hot { fill } else { fill.gamma_multiply(0.85) };
+    let cw_pt = shared.cell_size(painter.ctx().pixels_per_point()).x;
+    painter.rect_filled(r, 3.0, bg);
+    painter.rect_filled(r.shrink2(Vec2::new(0.0, 1.0)), 4.0, fill);
+    let text_at = Pos2::new(r.min.x + cw_pt, r.min.y);
+    shared.paint_text(painter, text_at, label, bg);
+}
+
 /// Visible row count for the current geometry.
 fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
     (rect.height() * ppp / m.cell_h as f32).floor() as i32
@@ -1340,7 +1446,7 @@ fn drawn_span(orders: &[(u16, RowOrder)], line: u16, start: u16, len: u16) -> (u
 }
 
 /// Pointer position → 0-based viewport cell + cell side.
-fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
+pub(crate) fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
     let x_px = ((pos.x - rect.min.x) * ppp).max(0.0);
     let y_px = ((pos.y - rect.min.y) * ppp).max(0.0);
     let col = (x_px / m.cell_w as f32).floor() as u16;

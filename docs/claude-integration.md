@@ -6,9 +6,11 @@ Verified against Claude Code **2.1.220**. Claude Code's internals change between
 
 | Path | Direction | Why |
 |---|---|---|
-| `<config>/settings.json` | write (on request) | installs the hook relay + usage statusline |
+| `<config>/settings.json` | write (on request) | installs the hook relay + usage statusline, and with the management panel on the `subagentStatusLine` ([management-panel.md](management-panel.md)) |
 | `<config>/sessions/<pid>.json` | read | live session registry: busy/idle, session id, name |
 | `<config>/projects/<munged-cwd>/<id>.jsonl` | read | transcript lookup for resume + session titles |
+| `<config>/projects/<munged-cwd>/<id>/subagents/` | read | the management panel's workers: their transcripts and metas |
+| `$GIVERNY_FEED_DIR` (`~/.config/giverny/feeds`) | read | a manager's feed and marks for the management panel ([management-panel.md](management-panel.md)) |
 | `<config>/.claude.json` (or `~/.claude.json`) | read | account identity + `cachedUsageUtilization` |
 | `~/.config/giverny/**` | write | Giverny's own state |
 
@@ -16,7 +18,7 @@ Verified against Claude Code **2.1.220**. Claude Code's internals change between
 
 ## Two state sources, merged
 
-1. **Hooks** — `giverny relay` is registered for `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`. It forwards the payload plus `$GIVERNY_TAB_ID` and `$CLAUDE_CONFIG_DIR` over a unix socket (a spool file on Windows, or when the app is closed). This gives crisp transitions and the attention taxonomy: `permission_prompt` / `elicitation_dialog` / `agent_needs_input` mean *you* are needed; `idle_prompt` / `agent_completed` / `task_completed` mean done.
+1. **Hooks** — `giverny relay` is registered for `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`. It forwards the payload plus `$GIVERNY_TAB_ID` and `$CLAUDE_CONFIG_DIR` over a unix socket (a spool file on Windows, or when the app is closed). A session that only inherited the tab's id (a `claude` inside the tab's claude, or under a `tmux` it launched) is told apart by walking up to the app's pid (`$GIVERNY_PID`), and relays nothing. This gives crisp transitions and the attention taxonomy: `permission_prompt` / `elicitation_dialog` / `agent_needs_input` mean *you* are needed; `idle_prompt` / `agent_completed` / `task_completed` mean done.
 2. **Registry** — `sessions/<pid>.json` polled about once a second, PID-liveness gated, mapped to tabs by walking process parents to the tab's shell. Needs no setup and covers sessions that started before hooks were installed.
 
 Authority is **per tab**: the registry drives a tab's state until that tab's session has actually emitted a hook, after which hooks win (the registry file can lag with a stale `busy`). Typing in a tab clears an attention flag — declining a permission prompt with Escape emits no hook at all, so the keystroke is the only evidence.

@@ -404,6 +404,18 @@ impl Theme {
         }
     }
 
+    /// How far a worker's background leans toward the theme's magenta.
+    pub const WORKER_TINT: f32 = 0.12;
+
+    /// The background of a tab while it shows a worker rather than its own
+    /// session: the worker page. A shift of this theme's own background
+    /// toward its own magenta, so it reads on light and dark themes alike,
+    /// follows a theme change (Rouen's hour included), and is not the accent
+    /// the chrome already uses for selection.
+    pub fn worker_bg(&self) -> Color32 {
+        mix(self.bg, self.ansi[5], Self::WORKER_TINT)
+    }
+
     /// Every built-in, in picker order. The names are the values of
     /// `theme.name`, and the settings schema is checked against this list.
     pub const NAMES: &'static [&'static str] = &[

@@ -165,6 +165,11 @@ impl TermSession {
         *self.term.lock().mode()
     }
 
+    /// The program in the terminal asked for pastes bracketed.
+    pub fn bracketed_paste(&self) -> bool {
+        self.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Resize grid + PTY when the geometry changed.
     pub fn resize(&mut self, size: GridSize) {
         if size == self.size || size.cols < 2 || size.rows < 2 {

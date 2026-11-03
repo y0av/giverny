@@ -264,6 +264,39 @@ fn humanize(d: std::time::Duration) -> String {
     }
 }
 
+/// Copy-on-select for egui's own labels, the terminal's
+/// behaviour: when a drag that began in `rect` ends with label text
+/// selected, the frame gets a `Copy` event, so the labels drawn after this
+/// call put their selection on the clipboard as the pointer comes up. Call
+/// after the terminal has read the frame's input and before the labels.
+/// `key` names the surface; its press origin is kept under it.
+pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
+    let (pressed_at, released, dragging) = ctx.input(|i| {
+        (
+            i.pointer
+                .primary_pressed()
+                .then(|| i.pointer.press_origin())
+                .flatten(),
+            i.pointer.primary_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+    let id = key.with("copy-on-release");
+    if let Some(p) = pressed_at {
+        ctx.data_mut(|d| d.insert_temp(id, p));
+    }
+    if !released {
+        return;
+    }
+    let origin: Option<egui::Pos2> = ctx.data_mut(|d| d.remove_temp(id));
+    let selected = ctx
+        .plugin_opt::<egui::text_selection::LabelSelectionState>()
+        .is_some_and(|p| p.lock().has_selection());
+    if dragging && selected && origin.is_some_and(|o| rect.contains(o)) {
+        ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

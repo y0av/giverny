@@ -20,9 +20,10 @@
 //! to send to, or with `management_panel.prompt_box` off, keeps the box
 //! dimmed and `read-only`.
 //!
-//! A Running worker is followed as its transcript grows; a Done one opens at
-//! its end, on its report. A Next up row's brief is drawn as the prompt its
-//! worker will be given, and opens at its top.
+//! A worker's transcript opens at its end, on its report once it has one,
+//! and is followed as it grows, a Done worker's too: a line from the box can
+//! wake it. A Next up row's brief is drawn as the prompt its worker will be
+//! given, and opens at its top.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -122,7 +123,8 @@ pub enum Content {
 /// A worker's transcript as the page shows it.
 pub struct TranscriptView {
     pub path: PathBuf,
-    /// Follow it as it grows.
+    /// The worker is at work, so an empty transcript has its first turn to
+    /// come.
     pub live: bool,
     tail: transcript::Tail,
     render: transcript::Render,
@@ -156,7 +158,8 @@ impl WorkerPage {
         page
     }
 
-    /// A worker's transcript, read now; `live` keeps following it.
+    /// A worker's transcript, read now and followed from here on; `live`
+    /// when the worker is still at work.
     pub fn transcript(tab: TabId, name: String, path: PathBuf, live: bool) -> Self {
         let mut view = TranscriptView {
             path,
@@ -279,6 +282,18 @@ impl WorkerPage {
         (out, button)
     }
 
+    /// Take in what the transcript has grown by. True for a page that shows
+    /// one, to look again later.
+    fn follow(&mut self) -> bool {
+        let Content::Transcript(v) = &mut self.content else {
+            return false;
+        };
+        if v.polled.elapsed() >= POLL && v.poll() {
+            self.generation += 1;
+        }
+        true
+    }
+
     /// Draw the page over the rest of `ui`, in the tab's terminal's place.
     /// `labels` (longest first) and `fill` are its "back" button's.
     pub fn show(
@@ -288,12 +303,7 @@ impl WorkerPage {
         labels: &'static [&'static str],
         fill: Color32,
     ) -> Drawn {
-        if let Content::Transcript(v) = &mut self.content
-            && v.live
-        {
-            if v.polled.elapsed() >= POLL && v.poll() {
-                self.generation += 1;
-            }
+        if self.follow() {
             ui.ctx().request_repaint_after(POLL);
         }
         let rect = ui.available_rect_before_wrap();
@@ -738,6 +748,67 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A worker's page opened once it was done: the line from the box and
+    /// the reply it woke show up without opening the page again.
+    #[test]
+    fn a_done_page_follows_a_line_sent_from_it() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("giverny-page-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-t.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"Count, then report."}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Counted to 8."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut page = WorkerPage::transcript(TabId(1), "counter".into(), path.clone(), false);
+        let said = |page: &WorkerPage| -> Vec<String> {
+            let rows = page.entries();
+            rows.iter().map(Row::plain).collect()
+        };
+        assert_eq!(
+            said(&page),
+            vec!["❯ Count, then report.", "● Counted to 8."]
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","isMeta":true,"origin":{{"kind":"coordinator"}},"message":{{"role":"user","content":"The coordinator sent a message while you were working:\ntestingggggggggggggg\n\nAddress this before completing your current task."}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Got it."}}]}}}}"#
+        )
+        .unwrap();
+        let generation = page.generation;
+        let Content::Transcript(v) = &mut page.content else {
+            panic!("a transcript page");
+        };
+        v.polled -= POLL;
+        assert!(page.follow());
+        assert_eq!(page.generation, generation + 1, "redrawn");
+        assert_eq!(
+            said(&page),
+            vec![
+                "❯ Count, then report.",
+                "● Counted to 8.",
+                "❯ testingggggggggggggg",
+                "● Got it.",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

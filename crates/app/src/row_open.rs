@@ -8,11 +8,10 @@
 //!   the tab (`worker_page`): it takes the terminal's place, under a header
 //!   naming the worker and with a "back" button, and draws the worker's
 //!   transcript as Claude Code draws a worker's own view
-//!   (`giverny_claude::transcript`). A Running worker's page is live,
-//!   following the transcript as it grows; a Done one's, or one whose
-//!   worker has finished ([`RowClick::finished`]), opens at its end, on the
-//!   final report. A line typed in the page's prompt box goes to the
-//!   tab's manager ([`Ask`]).
+//!   (`giverny_claude::transcript`). The page opens at the transcript's
+//!   end, on the final report once there is one, and follows it as it grows:
+//!   a worker that has finished is woken by a line typed in the page's
+//!   prompt box, which goes to the tab's manager ([`Ask`]).
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab, unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave. A Done
@@ -36,7 +35,8 @@ pub const BRIEF_MAX: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// Show a worker's transcript on its page; `live` follows it.
+    /// Show a worker's transcript on its page; `live` when the worker is
+    /// still at work.
     Watch { transcript: PathBuf, live: bool },
     /// Run the feed's `open` command in a new tab titled `title`.
     Run { title: String, command: String },
@@ -146,8 +146,8 @@ pub fn plan(click: &RowClick) -> Plan {
         .filter(|c| !c.is_empty());
     match click.stage {
         Stage::Running | Stage::Done => {
-            // A finished worker's transcript is final: opened at its end,
-            // on the report, as a Done row's is.
+            // A finished worker has no first turn to wait for, and no
+            // transcript means none will come.
             let live = click.stage == Stage::Running && !click.finished;
             if let Some(t) = &click.transcript {
                 return Plan::Watch {
@@ -288,6 +288,22 @@ mod tests {
             note: None,
             review: None,
             facts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_rows_transcript_is_watched_whatever_its_stage() {
+        let path = PathBuf::from("/tmp/agent-a1b2.jsonl");
+        let mut finished = click(Stage::Running, "acme#1", Some("a1b2"));
+        finished.finished = true;
+        for (mut row, live) in [
+            (click(Stage::Running, "acme#1", Some("a1b2")), true),
+            (click(Stage::Done, "acme#1", Some("a1b2")), false),
+            (finished, false),
+        ] {
+            row.transcript = Some(path.clone());
+            let transcript = path.clone();
+            assert_eq!(plan(&row), Plan::Watch { transcript, live });
         }
     }
 

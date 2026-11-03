@@ -24,7 +24,9 @@
 //! A tool call's `●` is green once its result is back, red when the result
 //! is an error, grey while it runs ([`settle`]). Thinking, attachments and
 //! bookkeeping lines are left out, and so is the reply to a worker's
-//! `SubagentHandback`: its report is shown as what the worker said.
+//! `SubagentHandback`: its report is shown as what the worker said. A line
+//! sent to the worker after its prompt is drawn as a prompt, in whichever
+//! shape it landed ([`Render::line`]).
 //!
 //! The worker page a row of the management panel opens draws it: a prompt
 //! whole, a tool's output folded to its first lines.
@@ -48,6 +50,22 @@ use serde_json::Value;
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+
+/// What Claude Code wraps a line in when it lands in a worker's turn as a
+/// `user` record: its parent's (`SendMessage`), then one typed in the
+/// worker's own view (Claude Code 2.1.317).
+const SENT_WRAPPERS: [(&str, &str); 2] = [
+    (
+        "The coordinator sent a message while you were working:\n",
+        "\n\nAddress this before completing your current task.",
+    ),
+    (
+        "The user sent a new message while you were working:\n",
+        "\n\nThis is how Claude Code surfaces messages the user sends mid-turn \u{2014} within \
+         the running turn, often alongside the next tool result, rather than as a separate \
+         conversation turn. Address the message above as you continue this turn.",
+    ),
+];
 
 /// Lines of a tool result shown before it is folded: Claude Code's three.
 const RESULT_LINES: usize = 3;
@@ -641,11 +659,15 @@ impl Render {
                 }
             }
             Some("user") => match v.pointer("/message/content") {
+                // A meta record is Claude Code talking to the worker, and
+                // is left out, unless it carries a line someone sent: how a
+                // message reaches a worker that `SendMessage` wakes.
                 Some(Value::String(s)) => {
-                    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
-                        return out;
+                    if v.get("isMeta").and_then(Value::as_bool) != Some(true) {
+                        entry(prompt_rows(s, None), &mut out);
+                    } else if sent(&v) {
+                        entry(prompt_rows(unwrapped(s), None), &mut out);
                     }
-                    entry(prompt_rows(s, None), &mut out);
                 }
                 Some(Value::Array(parts)) => {
                     let summary = v.get("toolUseResult").and_then(file_summary);
@@ -682,12 +704,8 @@ impl Render {
             // its parent sent it (`SendMessage`).
             Some("attachment") => {
                 let att = v.get("attachment").unwrap_or(&Value::Null);
-                let sent = matches!(
-                    att.pointer("/origin/kind").and_then(Value::as_str),
-                    Some("human" | "coordinator")
-                );
                 if att.get("type").and_then(Value::as_str) == Some("queued_command")
-                    && sent
+                    && sent(att)
                     && let Some(text) = att.get("prompt").and_then(Value::as_str)
                 {
                     entry(prompt_rows(text, None), &mut out);
@@ -697,6 +715,24 @@ impl Render {
         }
         out
     }
+}
+
+/// A record whose origin says a person typed it or the worker's parent sent
+/// it.
+fn sent(record: &Value) -> bool {
+    matches!(
+        record.pointer("/origin/kind").and_then(Value::as_str),
+        Some("human" | "coordinator")
+    )
+}
+
+/// The line inside Claude Code's wrapper. Text in no wrapper it is known to
+/// use is returned whole, so a change of its words loses nothing.
+fn unwrapped(text: &str) -> &str {
+    SENT_WRAPPERS
+        .iter()
+        .find_map(|(head, tail)| text.strip_prefix(head)?.strip_suffix(tail))
+        .unwrap_or(text)
 }
 
 /// Rows as lines of text, with a blank line before each entry but the
@@ -836,6 +872,50 @@ mod tests {
                 "❯ typed in its view",
             ]
         );
+    }
+
+    /// A worker `SendMessage` wakes after its turn ended gets the line as a
+    /// meta `user` record instead, in Claude Code's words (Claude Code
+    /// 2.1.317). The page shows the line alone, and every other meta record
+    /// stays out.
+    #[test]
+    fn a_message_that_wakes_a_finished_worker_is_its_prompt() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Count, then report."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\ntestingggggggggggggg\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\nfirst\n\nsecond\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"human"},"message":{"role":"user","content":"The user sent a new message while you were working:\ntyped in its view\n\nThis is how Claude Code surfaces messages the user sends mid-turn \u2014 within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn."}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>\nx\n</system-reminder>"}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"task-notification"},"message":{"role":"user","content":"[SYSTEM NOTIFICATION - NOT USER INPUT] a task ended"}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"peer"},"message":{"role":"user","content":"Another Claude session sent a message"}}"#,
+        ];
+        assert_eq!(
+            view(&lines),
+            vec![
+                "❯ Count, then report.",
+                "",
+                "❯ testingggggggggggggg",
+                "",
+                "❯ first",
+                "  ",
+                "  second",
+                "",
+                "❯ typed in its view",
+            ]
+        );
+    }
+
+    /// Words Claude Code may change to: the line is shown with them rather
+    /// than lost.
+    #[test]
+    fn a_sent_line_in_an_unknown_wrapper_is_shown_whole() {
+        for text in [
+            "The coordinator now says:\nhello",
+            "The coordinator sent a message while you were working:\nhello",
+            "hello\n\nAddress this before completing your current task.",
+        ] {
+            assert_eq!(unwrapped(text), text);
+        }
     }
 
     #[test]

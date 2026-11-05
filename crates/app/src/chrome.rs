@@ -116,7 +116,15 @@ impl Chrome {
     /// `opacity` is the window's: below 1.0 the panels let the desktop
     /// through, and nothing else does.
     pub fn apply(&self, ctx: &egui::Context, theme: &Theme, opacity: f32) {
-        ctx.set_visuals(self.visuals(theme, opacity));
+        // egui keeps a style for a dark system and one for a light system,
+        // and `set_visuals` writes only the one in use. On macOS the
+        // system's appearance arrives after the first frame, so a Mac in
+        // light mode switched to egui's untouched light style: a white rail
+        // under this theme's light text. Both get ours, so the chrome
+        // follows Giverny's theme and never the system's.
+        let v = self.visuals(theme, opacity);
+        ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+        ctx.set_visuals_of(egui::Theme::Light, v);
         // egui's floating scrollbars are drawn *over* the last ~10px of the
         // content, so as soon as the rail has enough tabs to scroll, the "+"
         // and close buttons at the right edge end up underneath the bar.
@@ -167,6 +175,21 @@ impl Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_appearance_does_not_change_the_chrome() {
+        for theme in [Theme::monet_dark(), Theme::by_name("monet-light")] {
+            let chrome = Chrome::from_theme(&theme);
+            let ctx = egui::Context::default();
+            chrome.apply(&ctx, &theme, 1.0);
+            for system in [egui::Theme::Light, egui::Theme::Dark] {
+                ctx.set_theme(system);
+                let v = &ctx.global_style().visuals;
+                assert_eq!(v.panel_fill, chrome.panel, "{system:?} system");
+                assert_eq!(v.widgets.noninteractive.fg_stroke.color, chrome.fg);
+            }
+        }
+    }
 
     #[test]
     fn chrome_follows_the_theme_rather_than_one_palette() {

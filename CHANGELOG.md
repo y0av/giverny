@@ -5,6 +5,9 @@
 - New theme **red-rock**, from Mark Badolato's iTerm2-Color-Schemes
   collection: pastels on terracotta, a dark theme whose background is a colour
   rather than a tint of black.
+- Fix the sidebar on macOS in light mode: it turned white under a dark
+  theme's light text, so nothing in it could be read. The sidebar now follows
+  Giverny's theme whatever the system's appearance.
 
 ## v1.7.2 — 2026-10-18
 

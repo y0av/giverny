@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.7.3 — 2026-11-05
+
 - New theme **red-rock**, from Mark Badolato's iTerm2-Color-Schemes
   collection: pastels on terracotta, a dark theme whose background is a colour
   rather than a tint of black.

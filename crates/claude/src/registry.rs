@@ -25,6 +25,18 @@ pub struct SessionEntry {
     /// mtime to tell whether this session loaded Giverny's hooks.
     #[serde(rename = "startedAt", default)]
     pub started_at_ms: u64,
+    /// The background job this interactive session handed its conversation
+    /// to and now shows (`parkedJobId`, Claude Code 2.1.292): the tab is the
+    /// job's, and so are its hooks.
+    #[serde(rename = "parkedJobId", default)]
+    pub parked_job_id: Option<String>,
+    /// `bg` for a background job's worker, which the daemon runs and no
+    /// tab does (`interactive` otherwise).
+    #[serde(default)]
+    pub kind: String,
+    /// The background job a worker runs (`jobId`).
+    #[serde(rename = "jobId", default)]
+    pub job_id: Option<String>,
     /// When the process started (`procStart`): clock ticks after boot, a
     /// decimal string, field 22 of `/proc/<pid>/stat`. A pid only names a
     /// process together with this: after a reboot pids start low again, and
@@ -38,6 +50,13 @@ impl SessionEntry {
     /// [`Self::proc_start`] as a number; `None` when absent or not one.
     pub fn proc_start_ticks(&self) -> Option<u64> {
         self.proc_start.as_deref()?.trim().parse().ok()
+    }
+
+    /// A background job's worker: the daemon's process, never a tab's. A
+    /// tab attached to the job holds the same conversation, and must not
+    /// take the worker for its own claude by it.
+    pub fn job_worker(&self) -> bool {
+        self.kind == "bg" || self.job_id.is_some()
     }
 
     /// The agent is working: thinking, or running a tool call. Measured, not
@@ -90,7 +109,7 @@ pub struct LiveSession {
 /// And a pid only means the same process while its start time does: an
 /// entry with `procStart` is live only if that pid started then, so a stale
 /// file whose pid came back after a reboot is not.
-fn entry_is_live(config_dir: &Path, entry: &SessionEntry) -> bool {
+pub fn entry_is_live(config_dir: &Path, entry: &SessionEntry) -> bool {
     let start = entry.proc_start_ticks();
     if crate::wsl::is_wsl_path(config_dir) {
         // The pids in there are the distribution's, and the last sweep asked
@@ -147,6 +166,27 @@ fn pid_alive(pid: u32, start: Option<u64>) -> bool {
     }
 }
 
+/// The config dirs a session on this machine may run under: this process's
+/// own ([`crate::continuation::config_dir`]) and every account found the
+/// way discovery finds them ([`crate::profiles::ambient_dirs`]), `extra`
+/// first when given, each once.
+pub fn ambient_config_dirs(extra: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let candidates = extra
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::continuation::config_dir())
+        .chain(crate::profiles::ambient_dirs());
+    for d in candidates {
+        let key = d.canonicalize().unwrap_or_else(|_| d.clone());
+        if seen.insert(key) {
+            out.push(d);
+        }
+    }
+    out
+}
+
 /// Scan the registries of every config dir for live sessions.
 pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> {
     let mut out = Vec::new();
@@ -175,6 +215,19 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
         }
     }
     out
+}
+
+/// The session the live claude `pid`, started at `start` (clock ticks after
+/// boot), runs: its own `sessions/<pid>.json` in the first of `config_dirs`
+/// that has one. An entry whose `procStart` is another start is another
+/// process's leftover, and no answer.
+pub fn session_of_pid(config_dirs: &[PathBuf], pid: u32, start: u64) -> Option<String> {
+    config_dirs.iter().find_map(|dir| {
+        let bytes = std::fs::read(dir.join("sessions").join(format!("{pid}.json"))).ok()?;
+        let entry = serde_json::from_slice::<SessionEntry>(&bytes).ok()?;
+        (entry.pid == pid && entry.proc_start_ticks().is_none_or(|s| s == start))
+            .then_some(entry.session_id)
+    })
 }
 
 /// Is this claude session currently live in ANY of the given config dirs?
@@ -678,6 +731,13 @@ mod tests {
         assert!(e.busy());
         assert_eq!(e.name.as_deref(), Some("dev-13"));
         assert_eq!(e.cwd, PathBuf::from("/home/u/dev"));
+        assert!(!e.job_worker());
+        let worker: SessionEntry = serde_json::from_str(
+            r#"{"pid":2209118,"sessionId":"6e7e56e0-1dca","kind":"bg","jobId":"6e7e56e0","status":"idle"}"#,
+        )
+        .unwrap();
+        assert!(worker.job_worker());
+        assert_eq!(worker.job_id.as_deref(), Some("6e7e56e0"));
     }
 
     #[test]
@@ -793,7 +853,10 @@ mod tests {
 
     #[test]
     fn finds_transcript_and_its_cwd() {
-        let dir = std::env::temp_dir().join(format!("giverny-transcript-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "giverny-registry-transcript-{}",
+            std::process::id()
+        ));
         let proj = dir.join("projects").join("-home-u-Dev-myproj");
         std::fs::create_dir_all(&proj).unwrap();
         let sid = "b263c7bf-2cc6-4ee1-b00a-948a4152f6ab";

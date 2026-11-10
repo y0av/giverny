@@ -12,11 +12,11 @@ Verified against Claude Code **2.1.220**. Claude Code's internals change between
 | `<config>/.claude.json` (or `~/.claude.json`) | read | account identity + `cachedUsageUtilization` |
 | `~/.config/giverny/**` | write | Giverny's own state |
 
-`<config>` is each account's `CLAUDE_CONFIG_DIR`. **Credential files are never read, and Giverny makes no network requests.**
+`<config>` is each account's `CLAUDE_CONFIG_DIR`. `GIVERNY_NO_ACCOUNT_SETUP=1` makes every `<config>` read-only to Giverny — for a second, test instance that must not re-point the accounts at itself (see CONTRIBUTING). **Credential files are never read, and Giverny makes no network requests.**
 
 ## Two state sources, merged
 
-1. **Hooks** — `giverny relay` is registered for `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`. It forwards the payload plus `$GIVERNY_TAB_ID` and `$CLAUDE_CONFIG_DIR` over a unix socket (a spool file on Windows, or when the app is closed). This gives crisp transitions and the attention taxonomy: `permission_prompt` / `elicitation_dialog` / `agent_needs_input` mean *you* are needed; `idle_prompt` / `agent_completed` / `task_completed` mean done.
+1. **Hooks** — `giverny relay` is registered for `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`. It forwards the payload plus `$GIVERNY_TAB_ID` and `$CLAUDE_CONFIG_DIR` over a unix socket (a spool file on Windows, or when the app is closed). A session that only inherited the tab's identity (a `claude` inside the tab's claude, or under a `tmux` it launched) is not relayed: the relay walks its parents up to the app (`$GIVERNY_PID`) and expects exactly one `claude` on the way. This gives crisp transitions and the attention taxonomy: `permission_prompt` / `elicitation_dialog` / `agent_needs_input` mean *you* are needed; `idle_prompt` / `agent_completed` / `task_completed` mean done.
 2. **Registry** — `sessions/<pid>.json` polled about once a second, PID-liveness gated, mapped to tabs by walking process parents to the tab's shell. Needs no setup and covers sessions that started before hooks were installed.
 
 Authority is **per tab**: the registry drives a tab's state until that tab's session has actually emitted a hook, after which hooks win (the registry file can lag with a stale `busy`). Typing in a tab clears an attention flag — declining a permission prompt with Escape emits no hook at all, so the keystroke is the only evidence.

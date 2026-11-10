@@ -23,6 +23,9 @@ pub const RELAY_EVENTS: &[&str] = &[
     // without it the tab reads idle through the minute it compacts.
     "PreCompact",
     "Stop",
+    // A turn ended on an API error, which Claude Code sends in place of
+    // `Stop`: the rail marks it with a ✕, not the tick.
+    "StopFailure",
     "Notification",
     "SessionEnd",
 ];
@@ -59,6 +62,11 @@ pub struct RelayMsg {
     pub emitted_at: Option<u64>,
     /// `$GIVERNY_TAB_ID` as inherited by the hook (absent outside Giverny).
     pub tab_id: Option<String>,
+    /// The background job whose session ran the hook, by short id, in place
+    /// of a tab id ([`crate::lineage::bg_job`]): the app sends it to the tab
+    /// parked on that job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     /// `$CLAUDE_CONFIG_DIR` — which account profile the session runs under.
     pub config_dir: Option<String>,
     /// The raw hook payload.
@@ -86,12 +94,62 @@ impl RelayMsg {
     pub fn prompt(&self) -> Option<&str> {
         self.event.get("prompt").and_then(|v| v.as_str())
     }
+    /// Was this hook fired by one of the session's subagents rather than the
+    /// session itself? A subagent's tool hooks arrive under its parent's
+    /// `session_id`, told apart only by the `agent_id` they carry; the
+    /// session's own calls carry none (measured on a `PostToolUse`).
+    pub fn from_subagent(&self) -> bool {
+        self.agent_id().is_some_and(|a| !a.trim().is_empty())
+    }
+
     /// The subagent a tool hook fired in. Claude Code (2.1.296) builds the
     /// tool hooks from the tool call's context, so a subagent's tool calls
     /// arrive under the parent's `session_id` with this set.
     /// `UserPromptSubmit` never carries it.
     pub fn agent_id(&self) -> Option<&str> {
         self.event.get("agent_id").and_then(|v| v.as_str())
+    }
+
+    /// The subagent whose final report this tool call delivered: a
+    /// `PostToolUse` of `SubagentHandback` from a subagent. Its last call —
+    /// the worker has ended (Claude Code 2.1.302).
+    pub fn handed_back(&self) -> Option<&str> {
+        let tool = self.event.get("tool_name").and_then(|v| v.as_str());
+        (tool == Some(HANDBACK_TOOL))
+            .then(|| self.agent_id())
+            .flatten()
+            .filter(|a| !a.trim().is_empty())
+    }
+
+    /// On the session's own `PostToolUse` of `TaskStop`: the background task
+    /// it stopped.
+    pub fn stopped_task(&self) -> Option<&str> {
+        if self.event.get("tool_name").and_then(|v| v.as_str()) != Some("TaskStop") {
+            return None;
+        }
+        let input = self.event.get("tool_input")?;
+        input
+            .get("task_id")
+            .or_else(|| input.get("shell_id"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// On `Stop`: the ids of the delegated work [`Self::delegated_work_running`]
+    /// counts, and whether any of it came without one.
+    pub fn delegated_ids(&self) -> (Vec<&str>, bool) {
+        let mut ids = Vec::new();
+        let mut unnamed = false;
+        for task in in_flight(&self.event).filter(|task| {
+            task.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| DELEGATED.contains(&t))
+        }) {
+            match task.get("id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => ids.push(id),
+                _ => unnamed = true,
+            }
+        }
+        (ids, unnamed)
     }
 
     /// On `Stop`: is work this session delegated still running as the turn
@@ -106,28 +164,102 @@ impl RelayMsg {
     /// as working are taken here. A background shell is not: the registry's
     /// `shell` already says that one, and a monitor or a cron
     /// is a watcher that may never end. No list (an older Claude Code): no.
+    ///  The list is read by [`in_flight`].
     pub fn delegated_work_running(&self) -> bool {
-        const DELEGATED: &[&str] = &[
-            "subagent",
-            "local_agent",
-            "workflow",
-            "local_workflow",
-            "teammate",
-            "in_process_teammate",
-            "cloud session",
-            "remote_agent",
-        ];
-        self.event
-            .get("background_tasks")
-            .and_then(|v| v.as_array())
-            .is_some_and(|tasks| {
-                tasks.iter().any(|task| {
-                    let field = |key| task.get(key).and_then(|v| v.as_str());
-                    field("type").is_some_and(|t| DELEGATED.contains(&t))
-                        && field("status").is_none_or(|s| matches!(s, "running" | "pending"))
-                })
-            })
+        in_flight(&self.event).any(|task| {
+            task.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| DELEGATED.contains(&t))
+        })
     }
+}
+
+/// The `background_tasks` types that are work a session delegated — a
+/// subagent, a workflow, a teammate, a cloud session — in both spellings:
+/// the friendly label Claude Code gives a type it knows and the raw type.
+pub const DELEGATED: &[&str] = &[
+    "subagent",
+    "local_agent",
+    "workflow",
+    "local_workflow",
+    "teammate",
+    "in_process_teammate",
+    "cloud session",
+    "remote_agent",
+];
+
+/// The tool a subagent delivers its final report with.
+pub const HANDBACK_TOOL: &str = "SubagentHandback";
+
+/// The tasks a turn's injected `<task-notification>`s say have ended: the
+/// `<task-id>` of each that is `completed`, `failed` or `killed` and not
+/// merely paused. Claude Code marks a subagent `completed` as soon as it
+/// stops with background work of its own still running — "is waiting on its
+/// own background work", to resume when that work reports — and drops it
+/// from every later `Stop`'s `background_tasks` while it is still alive
+/// (2.1.302). Only each notification's head is read: its
+/// `<result>` is the task's own output, model text that could spell anything.
+pub fn ended_tasks(prompt: &str) -> Vec<&str> {
+    const OPEN: &str = "<task-notification>";
+    const CLOSE: &str = "</task-notification>";
+    fn tag<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = head.find(&open)? + open.len();
+        let len = head[start..].find(&close)?;
+        Some(head[start..start + len].trim())
+    }
+    let mut out = Vec::new();
+    let mut rest = prompt;
+    while let Some(at) = rest.find(OPEN) {
+        let block = &rest[at + OPEN.len()..];
+        let end = block.find(CLOSE).unwrap_or(block.len());
+        let mut head = &block[..end];
+        if let Some(result) = head.find("<result>") {
+            head = &head[..result];
+        }
+        rest = &block[end..];
+        let ended = matches!(tag(head, "status"), Some("completed" | "failed" | "killed"));
+        let paused = head.contains("waiting on its own background work")
+            || head.contains("background work of its own still running");
+        if ended
+            && !paused
+            && let Some(id) = tag(head, "task-id").filter(|id| !id.is_empty())
+        {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// The `background_tasks` types that are commands rather than agents: a
+/// background shell (a Bash `run_in_background`, or one the person sent to
+/// the background) and a monitor, both spellings.
+pub const COMMANDS: &[&str] = &[
+    "shell",
+    "local_bash",
+    "monitor",
+    "monitor_mcp",
+    "monitor_ws",
+];
+
+/// A `Stop` or `SubagentStop` payload's `background_tasks` still in flight:
+/// running or pending, or with no status at all. No list (a Claude Code
+/// before 2.1.296): none. Claude Code fills the list from the session's one
+/// task registry, so a subagent's `SubagentStop` lists its parent's tasks
+/// and its own alike, the subagent itself among them, and no entry says
+/// whose it is (measured on 2.1.296).
+pub fn in_flight(event: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    event
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|task| {
+            task.get("status")
+                .and_then(|v| v.as_str())
+                .is_none_or(|s| matches!(s, "running" | "pending"))
+        })
 }
 
 pub fn socket_path() -> PathBuf {
@@ -143,54 +275,94 @@ pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("giverny-{uid}.sock"))
 }
 
+/// Who a hook's message is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The tab the session runs in (`$GIVERNY_TAB_ID`).
+    Tab(String),
+    /// A background job's session, by short id: the tab showing it is the
+    /// app's to find. Its inherited tab id is the daemon's, not the tab's.
+    Job(String),
+}
+
+impl Target {
+    /// This hook's addressee, or `None` when there is no one to tell:
+    /// outside Giverny, or in a session that only inherited a tab's identity
+    /// — a claude started inside the tab's claude, or under a multiplexer
+    /// the tab launched — whose hooks would move the tab's state and its
+    /// resume target.
+    pub fn of_this_process() -> Option<Target> {
+        if let Some(job) = crate::lineage::bg_job() {
+            return Some(Target::Job(job));
+        }
+        // A claude started inside a job's shell: no tab's, and the tab id it
+        // inherited is the daemon's.
+        let tab = crate::lineage::giverny_var("GIVERNY_TAB_ID")?;
+        crate::lineage::of_this_process()
+            .is_tabs()
+            .then_some(Target::Tab(tab))
+    }
+
+    /// Which account the session runs under. A background job's tab
+    /// variables are the daemon's, so its `GIVERNY_PROFILE_DIR` may name
+    /// another Giverny's view of the account; its job directory,
+    /// `<config>/jobs/<id>`, names the account itself.
+    pub fn account(&self) -> Option<String> {
+        match self {
+            Target::Tab(_) => account_dir(),
+            Target::Job(_) => account_dir(),
+        }
+    }
+
+    /// A message to the app addressed to this target.
+    pub fn msg(self, config_dir: Option<String>, event: serde_json::Value) -> RelayMsg {
+        let (tab_id, job) = match self {
+            Target::Tab(tab) => (Some(tab), None),
+            Target::Job(job) => (None, Some(job)),
+        };
+        RelayMsg {
+            provider: claude_provider(),
+            wsl_distro: None,
+            emitted_at: None,
+            tab_id,
+            job,
+            config_dir,
+            event,
+        }
+    }
+}
+
 /// The `giverny relay` entrypoint. Fast, silent, always exits successfully —
 /// a relay failure must never disturb the Claude session that ran the hook.
 pub fn run_relay(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
-    // Sessions outside Giverny tabs have no tab identity — nothing to relay
-    // (and nothing worth spooling; the stdin read above keeps claude's
-    // pipe-write happy before we bail).
-    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+    // Nothing to relay outside a tab or a background job (and nothing worth
+    // spooling; the stdin read above keeps claude's pipe-write happy before
+    // we bail).
+    let Some(target) = Target::of_this_process() else {
         return;
     };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let msg = RelayMsg {
-        provider: if std::env::args()
-            .skip_while(|s| s != "--provider")
-            .nth(1)
-            .as_deref()
-            == Some("codex")
-        {
-            "codex"
-        } else {
-            "claude"
-        }
-        .into(),
-        emitted_at: Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
-        ),
-        wsl_distro: std::env::args().skip_while(|s| s != "--wsl-distro").nth(1),
-        tab_id: Some(tab_id),
-        config_dir: if std::env::args()
-            .skip_while(|s| s != "--provider")
-            .nth(1)
-            .as_deref()
-            == Some("codex")
-        {
-            std::env::args()
-                .skip_while(|s| s != "--home")
-                .nth(1)
-                .or_else(|| std::env::var("CODEX_HOME").ok())
-        } else {
-            account_dir()
-        },
-        event,
+    let arg = |name: &str| std::env::args().skip_while(|s| s != name).nth(1);
+    let codex = arg("--provider").as_deref() == Some("codex");
+    let config_dir = if codex {
+        arg("--home").or_else(|| std::env::var("CODEX_HOME").ok())
+    } else {
+        target.account()
     };
+    let mut msg = target.msg(config_dir, event);
+    if codex {
+        msg.provider = "codex".into();
+    }
+    msg.wsl_distro = arg("--wsl-distro");
+    msg.emitted_at = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+    );
     deliver(&msg, spool);
 }
 
@@ -202,12 +374,15 @@ pub fn run_relay(spool: &Path) {
 /// session itself cannot name: `GIVERNY_PROFILE_DIR` is the tab telling us
 /// which one that is, and inside WSL it is the only way the answer crosses
 /// back at all.
+///
+/// Inside a background job the tab's word is the daemon's, so the job's
+/// directory, `<config>/jobs/<id>`, names the account instead.
 fn account_dir() -> Option<String> {
     std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
         .filter(|dir| !dir.is_empty())
-        .or_else(|| std::env::var("GIVERNY_PROFILE_DIR").ok())
-        .filter(|dir| !dir.is_empty())
+        .or_else(|| crate::lineage::job_account().map(|d| d.display().to_string()))
+        .or_else(|| crate::lineage::giverny_var("GIVERNY_PROFILE_DIR"))
 }
 
 /// Send one message to the app: unix socket when available, else append to
@@ -238,6 +413,35 @@ fn deliver(msg: &RelayMsg, spool: &Path) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Synthetic event name for `giverny manage clear-done` (not a Claude hook
+/// event): clear the management panel's Done rows in the tab it ran in.
+/// The event carries `session_id` and `at_ms`, the moment the
+/// command ran.
+pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
+
+/// Ask the app to clear the management panel's Done rows in the tab this process
+/// runs in (`$GIVERNY_TAB_ID`). `false` outside a Giverny tab, where there is
+/// no pane to clear. A closed app gets it from the spool at its next launch.
+pub fn send_clear_done(spool: &Path, session: Option<&str>, at_ms: u64) -> bool {
+    // Run from a background job's shell, the command is the job's: its
+    // tab id is the daemon's.
+    let target = match crate::lineage::bg_job() {
+        Some(job) => Target::Job(job),
+        None => match crate::lineage::giverny_var("GIVERNY_TAB_ID") {
+            Some(tab) => Target::Tab(tab),
+            None => return false,
+        },
+    };
+    let event = serde_json::json!({
+        "hook_event_name": CLEAR_DONE_EVENT,
+        "session_id": session,
+        "at_ms": at_ms,
+    });
+    let account = target.account();
+    deliver(&target.msg(account, event), spool);
+    true
 }
 
 /// Drain and clear the spool file, returning whatever it held.
@@ -653,13 +857,20 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
+/// How often Claude Code reruns our status line, seconds, besides its own
+/// events: each run pushes the session's usage to the app and tells a
+/// cache that has gone cold.
+pub const STATUSLINE_REFRESH_S: u64 = 1;
+
 /// Synthetic event name for statusline pushes (not a Claude hook event).
 pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 
 /// The `giverny statusline` entrypoint: Claude Code runs this after every
 /// assistant message and displays our stdout. We forward the payload's
 /// official `rate_limits` to the app (fresh usage without any API call) and
-/// print a compact line back.
+/// print a compact line back: model, token counts and a cold cache. The
+/// session's CPU and memory are not on it: Giverny's sidebar
+/// and management panel show them.
 pub fn run_statusline(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
@@ -677,44 +888,215 @@ pub fn run_statusline(spool: &Path) {
     if let Some(sid) = payload.get("session_id") {
         event.insert("session_id".into(), sid.clone());
     }
-    let msg = RelayMsg {
-        provider: claude_provider(),
-        wsl_distro: None,
-        emitted_at: None,
-        tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
-        config_dir: account_dir(),
-        event: serde_json::Value::Object(event),
+    // Usage is no tab's, so a session the relay would not speak for still
+    // delivers it; a background job's says which job it is.
+    let target = Target::of_this_process();
+    // The worker whose view the tab shows, as the app tells it:
+    // only the tab's own claude's line is about it, not one that inherited it.
+    let viewing = match &target {
+        Some(Target::Tab(tab)) => viewing_of(spool, tab),
+        _ => None,
+    };
+    let msg = match target {
+        Some(target) => {
+            let account = target.account();
+            target.msg(account, serde_json::Value::Object(event))
+        }
+        None => RelayMsg {
+            provider: claude_provider(),
+            wsl_distro: None,
+            emitted_at: None,
+            tab_id: crate::lineage::giverny_var("GIVERNY_TAB_ID"),
+            job: None,
+            config_dir: account_dir(),
+            event: serde_json::Value::Object(event),
+        },
     };
     deliver(&msg, spool);
 
-    // What Claude displays. Keep it short and useful.
-    let pct = |key: &str| -> Option<i64> {
-        payload
-            .get("rate_limits")?
-            .get(key)?
-            .get("used_percentage")?
-            .as_f64()
-            .map(|v| v.round() as i64)
-    };
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    println!("{}", statusline_text(&payload, viewing.as_ref(), now_ms));
+}
+
+/// What Claude Code displays for the status line payload `payload` at
+/// `now_ms`. Keep it short and useful: the model with the session's name,
+/// its tokens, and a cache gone cold. No 5h or week usage, and no CPU,
+/// memory or GPU: the sidebar shows the usage, and its tab
+/// rows and category headers and the management panel's rows the use.
+///
+/// `viewing` is the worker whose view the tab shows ([`viewing_of`]):
+/// while it is on screen the whole line is that worker's
+/// ([`worker_statusline`]). Claude Code builds the payload from the main
+/// session whatever view is shown, so nothing in `payload` says which one is.
+fn statusline_text(payload: &serde_json::Value, viewing: Option<&Viewing>, now_ms: i64) -> String {
+    if let Some(viewing) = viewing {
+        return worker_statusline(payload, viewing, &crate::feed::feed_dir());
+    }
     let mut parts: Vec<String> = Vec::new();
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let transcript = transcript_of(payload);
     if let Some(model) = payload
         .get("model")
         .and_then(|m| m.get("display_name"))
         .and_then(|d| d.as_str())
     {
-        parts.push(model.to_string());
+        let name = session_id
+            .and_then(|s| crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref()));
+        parts.push(model_segment(model, name.as_deref(), || {
+            accent_sgr(&statusline_accent_path())
+        }));
     }
-    if let Some(p) = pct("five_hour") {
-        parts.push(format!("5h {p}%"));
+    parts.extend(statusline_tokens(payload, transcript.as_deref()));
+    parts.extend(cache_cold_segment(payload, transcript.as_deref(), now_ms));
+    parts.join(crate::session_use::SEP)
+}
+
+/// The status line while a worker's view is on screen: only
+/// that worker, nothing of the whole session's.
+///
+/// * **Model:** the worker's, off its transcript's last reply
+///   ([`crate::tokens::last_model`]), named the way Claude Code names the
+///   main one (`Opus 5.5`, [`model_display`]); none until it has replied.
+/// * **Name:** its task name only ([`worker_name`]), in the accent, where
+///   the session's name stands on main.
+/// * **Tokens:** the same segments the main session gets
+///   ([`token_segments`]), counted off the worker's transcript alone:
+///   `session:` is the context it carries now, `(+<n>)` what it spent before
+///   its own compactions, `subagents:` the agents it spawned itself
+///   (their own spawns too), and `total:` those added.
+/// * **No cache-cold segment.** The main one is the manager's cache, and a
+///   worker on view is running, so its own cache is warm.
+fn worker_statusline(payload: &serde_json::Value, viewing: &Viewing, feeds: &Path) -> String {
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let transcript = worker_transcript(viewing, transcript_of(payload).as_deref(), session_id);
+    let name = worker_name(viewing, feeds, session_id);
+    let model = transcript
+        .as_deref()
+        .and_then(crate::tokens::last_model)
+        .map(|m| model_display(&m));
+    let accent = || accent_sgr(&statusline_accent_path());
+    let mut parts = vec![match model {
+        Some(model) => model_segment(&model, Some(&name), accent),
+        None => format!("{}({name}){RESET}", accent()),
+    }];
+    if let Some(t) = transcript.as_deref() {
+        // `Null`: the payload's `context_window` is the manager's.
+        let spawned = worker_subagents(t);
+        parts.extend(token_segments(&serde_json::Value::Null, Some(t), &spawned));
     }
-    if let Some(p) = pct("seven_day") {
-        parts.push(format!("wk {p}%"));
+    parts.join(crate::session_use::SEP)
+}
+
+/// The transcripts of the agents the worker at `worker` (`agent-<id>.jsonl`)
+/// spawned, and theirs in turn: beside it, by their metas' `parentAgentId`.
+fn worker_subagents(worker: &Path) -> Vec<PathBuf> {
+    use crate::subagents::{agent_transcript, list_agent_ids, read_meta};
+    let (Some(dir), Some(id)) = (
+        worker.parent(),
+        worker
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("agent-")?.strip_suffix(".jsonl")),
+    ) else {
+        return Vec::new();
+    };
+    let parents: Vec<(String, Option<String>)> = list_agent_ids(dir)
+        .into_iter()
+        .map(|a| {
+            let parent = read_meta(dir, &a).parent_id;
+            (a, parent)
+        })
+        .collect();
+    let mut family = vec![id.to_string()];
+    let mut out = Vec::new();
+    loop {
+        let before = family.len();
+        for (a, parent) in &parents {
+            if !family.contains(a) && parent.as_ref().is_some_and(|p| family.contains(p)) {
+                family.push(a.clone());
+                out.push(agent_transcript(dir, a));
+            }
+        }
+        if family.len() == before {
+            return out;
+        }
     }
-    let transcript = transcript_of(&payload);
-    parts.extend(statusline_tokens(&payload, transcript.as_deref()));
-    let now_ms = jiff::Timestamp::now().as_millisecond();
-    parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
-    println!("{}", parts.join("  ·  "));
+}
+
+/// The worker's `agent-<id>.jsonl`: the one the app named, else its agent
+/// id's in any `subagents/` dir of the session.
+fn worker_transcript(
+    viewing: &Viewing,
+    main: Option<&Path>,
+    session_id: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(t) = viewing.transcript.as_ref().filter(|t| t.is_file()) {
+        return Some(t.clone());
+    }
+    let id = viewing.agent_id.as_deref()?;
+    crate::tokens::session_subagent_dirs(main, config_dir().as_deref(), session_id)
+        .iter()
+        .map(|dir| crate::subagents::agent_transcript(dir, id))
+        .find(|p| p.is_file())
+}
+
+/// The worker's task name (`g477`), never its description: the one the app
+/// knew from the management panel's row, else the manager's feed row its
+/// agent id holds (a Running one first: a reused worker holds several),
+/// else the head of a view label shaped `g477: what it does`, else `worker`.
+fn worker_name(viewing: &Viewing, feeds: &Path, session_id: Option<&str>) -> String {
+    let from_feed = || {
+        let id = viewing.agent_id.as_deref()?;
+        let (_, feed) = crate::feed::find(feeds, session_id?)?;
+        let held: Vec<_> = feed
+            .rows
+            .iter()
+            .filter(|r| r.agent_id.as_deref() == Some(id))
+            // The `agent-<id>` key a worker with no task started its own
+            // row under names nothing.
+            .filter(|r| !(r.follows_worker && r.key.starts_with("agent-")))
+            .collect();
+        held.iter()
+            .rfind(|r| r.stage() == crate::feed::Stage::Running)
+            .or(held.last())
+            .map(|r| r.key.clone())
+    };
+    viewing
+        .task
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(from_feed)
+        .or_else(|| viewing.label.as_deref().and_then(task_of_label))
+        .unwrap_or_else(|| "worker".to_string())
+}
+
+/// The task name a label opens with: `g477` of `g477: one look`, or a label
+/// that is one short word itself. Not a description.
+fn task_of_label(label: &str) -> Option<String> {
+    let head = label.split_once(':').map_or(label, |(h, _)| h).trim();
+    (!head.is_empty() && head.chars().count() <= 24 && !head.contains(char::is_whitespace))
+        .then(|| head.to_string())
+}
+
+/// A model id as Claude Code names it on the status line: `claude-opus-5-5`
+/// → `Opus 5.5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`. An id of no
+/// known family is shown as it is.
+fn model_display(id: &str) -> String {
+    let base = id.split('[').next().unwrap_or(id).trim();
+    let mut parts = base.strip_prefix("claude-").unwrap_or(base).split('-');
+    let family = parts.next().unwrap_or_default();
+    if !["opus", "sonnet", "haiku", "fable"].contains(&family) {
+        return id.to_string();
+    }
+    let version: Vec<&str> = parts
+        .take_while(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let mut name = family[..1].to_ascii_uppercase() + &family[1..];
+    if !version.is_empty() {
+        name += " ";
+        name += &version.join(".");
+    }
+    name
 }
 
 /// Red `cache cold · next msg <n>` once the main conversation's prompt cache
@@ -757,6 +1139,126 @@ fn cache_cold_segment(
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// The model's name, and beside it the session's full name (`giverny manage
+/// name`) in the chrome's accent:
+/// `Opus 5.5 (Rotem Giverny)`. `accent` is asked only when there is a name.
+fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> String) -> String {
+    match name {
+        Some(name) => format!("{model} {}({name}){RESET}", accent()),
+        None => model.to_string(),
+    }
+}
+
+/// What the app tells a tab's status line about the worker whose view its
+/// Claude Code shows, as JSON in [`viewing_flag`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewing {
+    /// Its task name, the management-panel row's key (`g477`), when the
+    /// pane has a row for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Its Claude Code agent id: finds its transcript, and its feed row
+    /// when `task` is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Its `agent-<id>.jsonl`, when the app knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<PathBuf>,
+    /// The agent's own name, else the label Claude Code puts on the view
+    /// (the Agent call's description): only its `g477:` head is ever shown
+    /// ([`task_of_label`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The file the app leaves for tab `tab_id`'s status line while that tab's
+/// Claude Code shows a worker's view: a [`Viewing`]. Beside
+/// the spool, one per tab, like [`strip_flag`]; none while the tab is on the
+/// manager's own view.
+pub fn viewing_flag(spool: &Path, tab_id: &str) -> PathBuf {
+    viewing_dir(spool).join(tab_id)
+}
+
+fn viewing_dir(spool: &Path) -> PathBuf {
+    spool.with_file_name("viewing")
+}
+
+/// Tell tab `tab_id`'s status line which worker's view is on screen
+/// (`Some`), or that the manager's own is again (`None`). Claude Code
+/// reruns the status line every [`STATUSLINE_REFRESH_S`] seconds, so the
+/// line follows within one.
+pub fn set_viewing(spool: &Path, tab_id: &str, viewing: Option<&Viewing>) -> std::io::Result<()> {
+    let flag = viewing_flag(spool, tab_id);
+    match viewing {
+        Some(viewing) => {
+            if let Some(dir) = flag.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = flag.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&tmp, serde_json::to_vec(viewing)?)?;
+            std::fs::rename(&tmp, &flag)
+        }
+        None => match std::fs::remove_file(&flag) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Forget every tab's worker view: the app does at start, when no tab is on
+/// one yet, so a run that ended on a worker's view leaves no line naming it.
+pub fn clear_viewing(spool: &Path) {
+    let _ = std::fs::remove_dir_all(viewing_dir(spool));
+}
+
+/// The worker whose view tab `tab_id` shows, as the app last told it
+/// ([`set_viewing`]); `None` on the manager's own view. A flag from a
+/// Giverny before the [`Viewing`] JSON held the name alone: it is read as
+/// the label.
+pub fn viewing_of(spool: &Path, tab_id: &str) -> Option<Viewing> {
+    let text = std::fs::read_to_string(viewing_flag(spool, tab_id)).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(serde_json::from_str(text).unwrap_or_else(|_| Viewing {
+        label: Some(text.to_string()),
+        ..Viewing::default()
+    }))
+}
+
+/// Where the app leaves its chrome's accent colour for the status line: beside
+/// its socket, so a test instance's stays its own.
+pub fn statusline_accent_path() -> PathBuf {
+    socket_path().with_extension("accent")
+}
+
+/// Record the app's accent colour (`#rrggbb`) for the status line to draw a
+/// session's name in; the app writes it at start and on every theme change.
+pub fn write_statusline_accent(path: &Path, rgb: [u8; 3]) -> std::io::Result<()> {
+    let [r, g, b] = rgb;
+    let tmp = path.with_extension(format!("accent.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("#{r:02x}{g:02x}{b:02x}\n"))?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The SGR escape for the accent recorded at `path` (24-bit), else the
+/// terminal's bright cyan, which is the default themes' accent (no Giverny
+/// running, or one from before it recorded its accent).
+fn accent_sgr(path: &Path) -> String {
+    let rgb = std::fs::read_to_string(path).ok().and_then(|s| {
+        let hex = s.trim().strip_prefix('#')?;
+        let v = u32::from_str_radix(hex, 16)
+            .ok()
+            .filter(|_| hex.len() == 6)?;
+        Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+    });
+    match rgb {
+        Some([r, g, b]) => format!("\x1b[38;2;{r};{g};{b}m"),
+        None => "\x1b[96m".to_string(),
+    }
+}
+
 /// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the
 /// status line (giverny#22, giverny#95): this conversation's own tokens, every subagent's
 /// summed, and the two added, counted the way coo's `orchestrate-status`
@@ -765,17 +1267,27 @@ fn statusline_tokens(payload: &serde_json::Value, transcript: Option<&Path>) -> 
     use crate::tokens;
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
     let dirs = tokens::session_subagent_dirs(transcript, config_dir().as_deref(), session_id);
+    token_segments(payload, transcript, &tokens::subagent_transcripts(&dirs))
+}
+
+/// The token segments of one conversation ([`crate::tokens::segments`]):
+/// its own count off `payload` or `transcript`, what it spent before its
+/// compactions, and the `subagents` transcripts beside it. The main
+/// session's line and a worker's ([`worker_statusline`]) both draw them.
+fn token_segments(
+    payload: &serde_json::Value,
+    transcript: Option<&Path>,
+    subagents: &[PathBuf],
+) -> Vec<String> {
+    use crate::tokens;
     let session = tokens::session_tokens(payload, transcript);
     // What the session spent before its compactions: `(+<n>)` beside its own
     // count, and in the total.
     let compacted = transcript.map_or(0, |t| {
         tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
     });
-    let (_, subagents, total) = tokens::session_subagents_total(
-        session.map(|s| s.tokens),
-        compacted,
-        &tokens::subagent_transcripts(&dirs),
-    );
+    let (_, subagents, total) =
+        tokens::session_subagents_total(session.map(|s| s.tokens), compacted, subagents);
     tokens::segments(session, compacted, subagents, total)
 }
 
@@ -805,6 +1317,270 @@ fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
     })
 }
 
+// ---- subagentStatusLine: the management panel's live rows ----------------------
+
+/// Synthetic event name for relayed `subagentStatusLine` input (not a Claude
+/// hook event). The message's `event` is Claude Code's stdin verbatim —
+/// `session_id`, `tasks[]`, … — with `hook_event_name` added, so
+/// [`crate::subagents::LiveSnapshot::from_value`] reads it directly.
+pub const SUBAGENT_LINE_EVENT: &str = "GivernySubagentLine";
+
+/// The argument after `relay` that selects the subagent-line mode.
+pub const SUBAGENT_LINE_FLAG: &str = "--subagent-line";
+
+/// The `subagentStatusLine` command for one account's `settings.json`.
+pub fn subagent_line_command_for(settings_path: &Path) -> String {
+    format!("{} relay {SUBAGENT_LINE_FLAG}", exe_for(settings_path))
+}
+
+/// Is this `subagentStatusLine` command ours, whatever binary path it names?
+fn is_our_subagent_line(command: &str) -> bool {
+    command.contains("giverny") && command.trim_end().ends_with(SUBAGENT_LINE_FLAG)
+}
+
+/// How the relay has Claude Code draw its own subagent panel this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripRows {
+    /// Every row as Claude Code draws it (the management panel is off).
+    Native,
+    /// No row at all: the management panel stands in for the panel.
+    Hidden,
+    /// Every row drawn, each opened by its agent id in brackets
+    /// ([`tag_strip_row`]), for a walk to a worker's view.
+    Tagged,
+}
+
+/// What the relay prints back to Claude Code for one tick: nothing for
+/// [`StripRows::Native`], else one `{"id":…,"content":…}` line per task —
+/// `""` for [`StripRows::Hidden`], the tagged label for
+/// [`StripRows::Tagged`].
+///
+/// Claude Code 2.1.280 drops any row whose decoration is the empty string
+/// from its subagent panel, and with every row dropped the panel — `● main`
+/// included — is not drawn at all (verified in a live session).
+/// Printing nothing leaves every row undecorated, which draws it natively.
+/// A non-empty decoration takes the place of the row's type, label and
+/// stats, after its pointer and dot (2.1.283).
+pub fn subagent_line_output(payload: &serde_json::Value, rows: StripRows) -> String {
+    if rows == StripRows::Native {
+        return String::new();
+    }
+    let mut out = String::new();
+    for task in payload
+        .get("tasks")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = task.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let content = match rows {
+            StripRows::Tagged => {
+                let text = |k: &str| task.get(k).and_then(|v| v.as_str()).map(str::trim);
+                let label = text("label")
+                    .filter(|l| !l.is_empty())
+                    .or_else(|| text("description"))
+                    .unwrap_or("");
+                tag_strip_row(id, label)
+            }
+            _ => String::new(),
+        };
+        out.push_str(&serde_json::json!({ "id": id, "content": content }).to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// A strip row's text while a walk looks for a worker:
+/// `[<agent id>] <label>`. Claude Code labels a busy worker's row with a
+/// model-written summary of what it is doing (`Reading runAgent.ts`),
+/// which changes every thirty seconds and is never its description, so
+/// the id is the one stable thing to find the row by.
+pub fn tag_strip_row(id: &str, label: &str) -> String {
+    if label.is_empty() {
+        format!("[{id}]")
+    } else {
+        format!("[{id}] {label}")
+    }
+}
+
+/// The agent id a [`tag_strip_row`] text opens with, and the rest.
+pub fn strip_row_tag(text: &str) -> Option<(&str, &str)> {
+    let (id, rest) = text.strip_prefix('[')?.split_once(']')?;
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok || !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    Some((id, rest.trim()))
+}
+
+/// The message the relay forwards for one `subagentStatusLine` tick.
+pub fn subagent_line_msg(
+    payload: serde_json::Value,
+    target: Target,
+    config_dir: Option<String>,
+) -> RelayMsg {
+    let mut event = match payload {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    event.insert(
+        "hook_event_name".into(),
+        serde_json::Value::String(SUBAGENT_LINE_EVENT.into()),
+    );
+    target.msg(config_dir, serde_json::Value::Object(event))
+}
+
+/// The `giverny relay --subagent-line` entrypoint: Claude Code runs it at
+/// least every five seconds while a session has live workers, with the list
+/// on stdin. Inside a Giverny tab it forwards that list to the app (the
+/// management panel's Running rows) and, when `pane_on`, hides every row of Claude
+/// Code's own panel — or, while the app has asked for the panel
+/// ([`show_strip`]), draws each row tagged with its agent id. Outside a tab,
+/// or in a session that is not the tab's own ([`crate::lineage`]), it does
+/// nothing and prints nothing, so an account-wide install never changes a
+/// session Giverny is not showing.
+///
+/// Like `relay`, it never fails: Claude Code logs a non-zero exit and drops
+/// the tick, and a relay problem must not cost the user their panel.
+pub fn run_subagent_line(spool: &Path, pane_on: bool) {
+    let mut input = String::new();
+    let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
+    // Another session that inherited the tab's identity keeps its own panel
+    // and its workers stay out of the tab's pane ([`crate::lineage`]).
+    let Some(target) = Target::of_this_process() else {
+        return;
+    };
+    let payload: serde_json::Value =
+        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    // The strip is asked for per tab; a background job's tab is the app's
+    // to know, so its panel stays hidden.
+    let strip = match &target {
+        Target::Tab(tab) => strip_wanted(spool, tab),
+        Target::Job(_) => false,
+    };
+    let rows = match (pane_on, strip) {
+        (false, _) => StripRows::Native,
+        (true, false) => StripRows::Hidden,
+        (true, true) => StripRows::Tagged,
+    };
+    let answer = subagent_line_output(&payload, rows);
+    let account = target.account();
+    deliver(&subagent_line_msg(payload, target, account), spool);
+    print!("{answer}");
+}
+
+/// How long a [`show_strip`] request holds without being renewed. An app
+/// that dies mid-request leaves the file behind; past this the relay hides
+/// the panel again as if it were not there.
+pub const STRIP_WANTED_FOR: Duration = Duration::from_secs(90);
+
+/// The file that asks the relay to leave Claude Code's own subagent panel
+/// drawn in tab `tab_id`, though the management panel is on: beside the spool,
+/// one per tab.
+pub fn strip_flag(spool: &Path, tab_id: &str) -> PathBuf {
+    spool.with_file_name("show-strip").join(tab_id)
+}
+
+/// Ask the relay to draw Claude Code's subagent panel in `tab_id` (`on`),
+/// or to go back to hiding it. The panel is what Claude Code's keyboard
+/// path to a worker's view walks: hidden, `↓` has nothing to
+/// reach. Claude Code runs the relay about every five seconds, so the
+/// panel follows within one tick.
+pub fn show_strip(spool: &Path, tab_id: &str, on: bool) -> std::io::Result<()> {
+    let flag = strip_flag(spool, tab_id);
+    if on {
+        if let Some(dir) = flag.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&flag, b"")
+    } else {
+        match std::fs::remove_file(&flag) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether the app wants Claude Code's panel drawn in `tab_id` right now.
+pub fn strip_wanted(spool: &Path, tab_id: &str) -> bool {
+    std::fs::metadata(strip_flag(spool, tab_id))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < STRIP_WANTED_FOR)
+}
+
+/// Is the Giverny `subagentStatusLine` configured in this settings file?
+pub fn subagent_line_installed_in(settings_path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("subagentStatusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(is_our_subagent_line)
+}
+
+/// Install or remove the Giverny `subagentStatusLine` in one settings file.
+/// Returns whether the file changed.
+///
+/// The house rules for `settings.json`: a command the user configured
+/// themselves is never replaced (an error, file untouched); nothing else in
+/// the file moves; the first write leaves the same one-time backup
+/// [`install_into`] does; and writing what is already there writes nothing,
+/// so Claude Code's settings watcher is not woken for a no-op. Removing only
+/// ever removes ours.
+pub fn set_subagent_line(settings_path: &Path, enable: bool) -> anyhow::Result<bool> {
+    let mut root: serde_json::Value = match std::fs::read(settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("won't touch unparseable settings: {e}"))?,
+        Err(_) if !enable => return Ok(false),
+        Err(_) => serde_json::json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings root is not an object"))?;
+    let current = obj
+        .get("subagentStatusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    if let Some(cmd) = &current
+        && !is_our_subagent_line(cmd)
+    {
+        anyhow::bail!("a custom subagentStatusLine is already configured — leaving it alone");
+    }
+    let want = subagent_line_command_for(settings_path);
+    match (enable, current.as_deref()) {
+        (true, Some(cmd)) if cmd == want => return Ok(false),
+        (false, None) => return Ok(false),
+        _ => {}
+    }
+    let backup = settings_path.with_extension("json.giverny-bak");
+    if settings_path.exists() && !backup.exists() {
+        let _ = std::fs::copy(settings_path, &backup);
+    }
+    if enable {
+        obj.insert(
+            "subagentStatusLine".into(),
+            serde_json::json!({ "type": "command", "command": want }),
+        );
+    } else {
+        obj.remove("subagentStatusLine");
+    }
+    write_settings(settings_path, &root)?;
+    Ok(true)
+}
+
 /// Is this statusLine command ours? Giverny only ever writes its binary
 /// followed by ` statusline`. A command that just mentions giverny, like a
 /// script of the user's under `~/giverny-tools/`, is theirs.
@@ -825,15 +1601,6 @@ pub fn statusline_installed_in(settings_path: &Path) -> bool {
         .and_then(|c| c.as_str())
         .is_some_and(is_our_statusline)
 }
-
-/// How often, in seconds, Claude Code reruns the statusline while a session
-/// sits idle (the entry's `refreshInterval`). Without one it runs only when
-/// the conversation changes, so the cold-cache warning would never appear on
-/// an idle session, which is the only kind it is for. The cache it warns
-/// about expires after 5 minutes at the shortest, so being up to 30 s late
-/// costs nothing, while a short tick would launch `giverny statusline` in
-/// every open session that often for no gain.
-pub const STATUSLINE_REFRESH_S: u64 = 30;
 
 /// Does our statusline entry lack a `refreshInterval`? True only for an
 /// entry of ours (installs from before it was written), never for a foreign
@@ -856,9 +1623,10 @@ pub fn statusline_lacks_refresh(settings_path: &Path) -> bool {
 /// Install/remove the Giverny statusline. Refuses to replace a statusline
 /// the user configured themselves.
 ///
-/// Enabling over an entry of ours (a path refresh) rewrites only its `type`
-/// and `command`: a `padding`, `refreshInterval` or any other key the user
-/// set on it is kept, and the defaults fill in only what is missing.
+/// Enabling over an entry of ours (a path refresh) rewrites its `type`,
+/// `command` and `refreshInterval` ([`STATUSLINE_REFRESH_S`]: the session's
+/// use is pushed with each run, so the interval is the app's to set); a
+/// `padding` or any other key the user set on it is kept.
 pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
     let mut root: serde_json::Value = match std::fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -886,12 +1654,7 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
             statusline_command_for(settings_path).into(),
         );
         entry.entry("padding").or_insert(0.into());
-        if entry
-            .get("refreshInterval")
-            .is_none_or(serde_json::Value::is_null)
-        {
-            entry.insert("refreshInterval".into(), STATUSLINE_REFRESH_S.into());
-        }
+        entry.insert("refreshInterval".into(), STATUSLINE_REFRESH_S.into());
         obj.insert("statusLine".into(), entry.into());
     } else {
         obj.remove("statusLine");
@@ -1064,12 +1827,23 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
             })
         });
     let want_statusline = statusline_command_for(settings_path);
-    let statusline_stale = root
-        .get("statusLine")
+    let ours = root.get("statusLine").filter(|s| {
+        s.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(is_our_statusline)
+    });
+    // Ours, but another binary's, or written before it reran every second.
+    let statusline_stale = ours.is_some_and(|s| {
+        s.get("command").and_then(|c| c.as_str()) != Some(want_statusline.as_str())
+            || s.get("refreshInterval").and_then(|r| r.as_u64()) != Some(STATUSLINE_REFRESH_S)
+    });
+    let want_subagent_line = subagent_line_command_for(settings_path);
+    let subagent_line_stale = root
+        .get("subagentStatusLine")
         .and_then(|s| s.get("command"))
         .and_then(|c| c.as_str())
-        .is_some_and(|c| is_our_statusline(c) && c != want_statusline);
-    hooks_stale || statusline_stale
+        .is_some_and(|c| is_our_subagent_line(c) && c != want_subagent_line);
+    hooks_stale || statusline_stale || subagent_line_stale
 }
 
 /// Install (or refresh) the relay hooks in one profile's `settings.json`.
@@ -1133,7 +1907,14 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 }
 
 /// Remove our relay entries from one settings file.
+///
+/// The management panel's `subagentStatusLine` goes with them when it is ours: it
+/// is `relay --subagent-line`, the same relay, and a relay left behind after
+/// an uninstall runs a binary nobody asked to keep. One the user configured
+/// themselves is never touched.
 pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
+    // The `giverny` plugin's keys, where they are ours.
+    let _ = crate::plugin::set_plugin(settings_path, Path::new(""), false);
     let Ok(bytes) = std::fs::read(settings_path) else {
         return Ok(());
     };
@@ -1145,6 +1926,15 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
             }
         }
         hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
+    }
+    if let Some(obj) = root.as_object_mut()
+        && obj
+            .get("subagentStatusLine")
+            .and_then(|s| s.get("command"))
+            .and_then(|c| c.as_str())
+            .is_some_and(is_our_subagent_line)
+    {
+        obj.remove("subagentStatusLine");
     }
     let tmp = settings_path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&root)?)?;
@@ -1583,8 +2373,26 @@ mod tests {
         let path = scratch("statusline");
         set_statusline(&path, true).unwrap();
         assert!(statusline_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["statusLine"]["refreshInterval"], 1,
+            "reruns every second"
+        );
+        assert!(!needs_path_refresh(&path));
+        // Ours from before it reran every second: brought up to date.
+        let mut old = root.clone();
+        old["statusLine"]
+            .as_object_mut()
+            .unwrap()
+            .remove("refreshInterval");
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert!(needs_path_refresh(&path));
         set_statusline(&path, false).unwrap();
         assert!(!statusline_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("statusLine").is_none(), "goes with ours");
 
         std::fs::write(
             &path,
@@ -1595,6 +2403,50 @@ mod tests {
             set_statusline(&path, true).is_err(),
             "must not clobber a user statusline"
         );
+        assert!(!needs_path_refresh(&path), "nor bring a user's up to date");
+    }
+
+    #[test]
+    fn subagent_line_never_replaces_the_users_own() {
+        let path = scratch("subline-foreign");
+        let theirs = r#"{"subagentStatusLine":{"type":"command","command":"~/bin/agents.sh"}}"#;
+        std::fs::write(&path, theirs).unwrap();
+        assert!(set_subagent_line(&path, true).is_err(), "on: refused");
+        assert!(
+            set_subagent_line(&path, false).is_err(),
+            "off: not ours to remove"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs, "untouched");
+        assert!(!subagent_line_installed_in(&path));
+    }
+
+    /// Uninstalling takes the management panel's line with the hooks — it is the
+    /// same relay — and leaves a user's own line where it was.
+    #[test]
+    fn uninstall_takes_our_subagent_line_and_leaves_theirs() {
+        let path = scratch("subline-uninstall");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+        install_into(&path).unwrap();
+        set_subagent_line(&path, true).unwrap();
+        uninstall_from(&path).unwrap();
+        assert!(!installed_in(&path));
+        assert!(!subagent_line_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("subagentStatusLine").is_none());
+        assert_eq!(root["model"], "opus", "the rest of the file survives");
+
+        let theirs = scratch("subline-uninstall-theirs");
+        std::fs::write(
+            &theirs,
+            r#"{"subagentStatusLine":{"type":"command","command":"~/bin/agents.sh"}}"#,
+        )
+        .unwrap();
+        install_into(&theirs).unwrap();
+        uninstall_from(&theirs).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&theirs).unwrap()).unwrap();
+        assert_eq!(root["subagentStatusLine"]["command"], "~/bin/agents.sh");
     }
 
     fn statusline_entry(path: &Path) -> serde_json::Value {
@@ -1604,18 +2456,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_statusline_refreshes_every_30_seconds() {
+    fn a_fresh_statusline_refreshes_every_second() {
         let path = scratch("statusline-refresh-fresh");
         set_statusline(&path, true).unwrap();
         let entry = statusline_entry(&path);
         assert_eq!(entry["refreshInterval"], STATUSLINE_REFRESH_S);
-        assert_eq!(entry["refreshInterval"], 30);
+        assert_eq!(entry["refreshInterval"], 1);
         assert_eq!(entry["padding"], 0);
         assert!(!statusline_lacks_refresh(&path));
     }
 
     #[test]
-    fn a_refresh_interval_the_user_set_survives_a_path_refresh() {
+    fn a_path_refresh_keeps_the_users_keys_but_sets_the_interval() {
         let path = scratch("statusline-refresh-user");
         std::fs::write(
             &path,
@@ -1629,13 +2481,12 @@ mod tests {
         set_statusline(&path, true).unwrap();
         let entry = statusline_entry(&path);
         assert_eq!(entry["command"], statusline_command_for(&path));
-        assert_eq!(entry["refreshInterval"], 5, "the user's value is kept");
+        // The use pushed with each run keeps step with the app's sampler
+        // only at the app's interval.
+        assert_eq!(entry["refreshInterval"], STATUSLINE_REFRESH_S);
         assert_eq!(entry["padding"], 2);
         assert_eq!(entry["note"], "mine", "other keys of the user's are kept");
         assert!(!needs_path_refresh(&path));
-
-        set_statusline(&path, true).unwrap();
-        assert_eq!(statusline_entry(&path)["refreshInterval"], 5);
     }
 
     #[test]
@@ -1654,11 +2505,16 @@ mod tests {
         )
         .unwrap();
         assert!(statusline_installed_in(&path));
-        assert!(!needs_path_refresh(&path), "the path is current");
+        // The path is current, but without the app's interval the entry is
+        // stale all the same.
+        assert!(needs_path_refresh(&path));
         assert!(statusline_lacks_refresh(&path));
 
         set_statusline(&path, true).unwrap();
-        assert_eq!(statusline_entry(&path)["refreshInterval"], 30);
+        assert_eq!(
+            statusline_entry(&path)["refreshInterval"],
+            STATUSLINE_REFRESH_S
+        );
         assert!(!statusline_lacks_refresh(&path));
     }
 

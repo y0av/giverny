@@ -159,10 +159,14 @@ pub fn tab_cwds_in(distro: &str) -> Vec<(String, String)> {
 }
 
 /// Every process that belongs to a tab, with its parent and its directory.
-/// `sh`, not `bash`: this runs in whatever the distribution has.
+/// `sh`, not `bash`: this runs in whatever the distribution has. Not a
+/// background job's (`CLAUDE_JOB_DIR`): its `GIVERNY_TAB_ID` is whichever
+/// tab started the job's daemon.
 #[cfg(any(windows, test))]
 const TAB_CWD_SCRIPT: &str = r#"for d in /proc/[0-9]*; do
-id=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^GIVERNY_TAB_ID=//p' | head -n1)
+env=$(tr '\0' '\n' 2>/dev/null < "$d/environ") || continue
+case "$env" in *CLAUDE_JOB_DIR=*) continue ;; esac
+id=$(printf '%s\n' "$env" | sed -n 's/^GIVERNY_TAB_ID=//p' | head -n1)
 [ -n "$id" ] || continue
 cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
 [ -n "$cwd" ] || continue
@@ -726,7 +730,7 @@ mod tests {
 
     #[test]
     fn a_reused_pid_in_a_distribution_is_not_alive() {
-        let distro = format!("test-reused-pid-{}", std::process::id());
+        let distro = format!("test-447-{}", std::process::id());
         let dir = unc_path(&distro, "/home/u/.claude");
         assert_eq!(pid_alive_in(&dir, 3204, None), None, "no sweep yet");
         publish_live_pids(&distro, vec![(3204, Some(48254)), (77, None)]);

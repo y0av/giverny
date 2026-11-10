@@ -9,6 +9,7 @@ pub mod graphics;
 pub mod input;
 pub mod io_loop;
 pub mod pace;
+pub mod page;
 pub mod proxy;
 pub mod pty;
 pub mod render;

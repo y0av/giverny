@@ -2,11 +2,11 @@
 //! Ctrl+PageUp/PageDown (rail order), with Ctrl held between the presses.
 //!
 //! A restored tab starts lazily, when it first becomes the active one. A walk
-//! makes every tab it passes over active for a moment, so tapping through the
-//! list used to start each tab on the way — a shell, and a `claude --resume`
-//! for a Claude tab, for every tab merely looked at. While the walk is held a
-//! tab that has not started is only shown, from its saved scrollback; the one
-//! the walk ends on starts when Ctrl comes up.
+//! makes every tab it passes over active for a moment, so tapping through
+//! the list used to start each tab on the way — a shell, and a
+//! `claude --resume` for a Claude tab, for every tab merely looked at. While
+//! the walk is held a tab that has not started is only shown, from its saved
+//! scrollback; the one the walk ends on starts when Ctrl comes up.
 
 use crate::chrome::Chrome;
 use egui::{Align2, FontId, Rect, Vec2};
@@ -32,6 +32,12 @@ pub fn still_held(ctrl: bool, focused: bool) -> bool {
     ctrl && focused
 }
 
+/// What a walk's preview says of the tab it passes over.
+pub const WALKING: &str = "not started · starts when Ctrl is released";
+
+/// What a stopped tab on screen says.
+pub const STOPPED: &str = "stopped · click to start";
+
 /// What a tab the walk is passing over shows in place of its terminal: the
 /// tail of its saved scrollback, as text. Read once per tab per walk.
 pub struct Preview {
@@ -51,11 +57,18 @@ impl Preview {
 
     /// Paint it over `rect` as the terminal would show it once it starts —
     /// from the top, or its last lines when it is longer than the pane —
-    /// under a line saying why it is not live.
-    pub fn show(&self, ui: &mut egui::Ui, rect: Rect, chrome: &Chrome, font_size: f32) {
+    /// under a line saying why it is not live: `caption`, [`WALKING`] for a
+    /// walk's.
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        chrome: &Chrome,
+        font_size: f32,
+        caption: &str,
+    ) {
         let painter = ui.painter_at(rect);
         let pad = Vec2::splat(8.0);
-        let caption = "not started · starts when Ctrl is released";
         let caption_font = FontId::proportional(12.0);
         let band_h = 22.0;
         let body = Rect::from_min_max(rect.min + Vec2::new(0.0, band_h), rect.max);
@@ -142,9 +155,10 @@ fn tail(dump: &str, n: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The rule: a walk held over a tab that has not started does not start
-    /// it; the walk ending (Ctrl up, or the window losing the keyboard) does,
-    /// and only for the tab it ended on — the one still active.
+    /// The rule: a walk held over a tab that has not
+    /// started does not start it; the walk ending (Ctrl up, or the window
+    /// losing the keyboard) does, and only for the tab it ended on — the
+    /// one still active.
     #[test]
     fn a_held_walk_starts_nothing_and_its_end_starts_the_tab_it_is_on() {
         // Passing over a restored tab with Ctrl down.

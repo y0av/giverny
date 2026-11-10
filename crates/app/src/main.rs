@@ -1,26 +1,35 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod agent_open;
 mod capture;
 mod chrome;
 mod claude_watch;
 mod codex_watch;
 mod desktop;
+mod hover_open;
 mod icon;
+mod job_end;
 mod keymap;
+mod management_live;
+mod management_panel;
 mod oom;
 mod overlays;
 mod paste_image;
 mod prompt_bar;
 mod rail;
+mod sessions_load;
 mod settings_ui;
 mod splash;
+mod tab_stop;
 mod taskbar;
 mod titlebar;
 mod translucency;
 mod update;
+mod view_header;
 mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+mod worker_page;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -79,6 +88,16 @@ fn category_for_agent(ws: &mut Workspace, cwd: Option<&Path>) -> CategoryId {
         return cat.id;
     }
     ws.add_category(&name)
+}
+
+/// Leave the chrome's accent beside the socket, where each tab's status line
+/// takes the colour its manager's name is drawn in.
+fn record_accent(chrome: &chrome::Chrome) {
+    let c = chrome.accent;
+    let path = giverny_claude::hooks::statusline_accent_path();
+    if let Err(err) = giverny_claude::hooks::write_statusline_accent(&path, [c.r(), c.g(), c.b()]) {
+        tracing::debug!("accent: {}: {err}", path.display());
+    }
 }
 
 /// The theme a name means right now. Only Rouen cares when now is: its light
@@ -486,12 +505,21 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      giverny welcome [from-version]\n                     \
      print the welcome screen\n  \
      giverny update     check for a newer release\n  \
+     giverny transcript [--follow] <agent jsonl>\n                     \
+     print a worker's transcript, readable (and follow it)\n  \
+     giverny manage plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
+     write the management panel's feed (see `giverny manage --help`)\n  \
+     giverny eta <agent-id> <minutes left>\n                     \
+     give a subagent's ETA to the management panel\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
      giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
      giverny relay      (internal) agent hook entrypoint\n  \
-     giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+     giverny hook       (internal) the giverny plugin's hook\n  \
+     giverny statusline (internal) Claude Code statusline entrypoint\n  \
+     giverny relay --subagent-line\n                     \
+     (internal) Claude Code subagentStatusLine entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
 
@@ -508,10 +536,46 @@ fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
 }
 
 fn main() -> eframe::Result {
+    // The management panel's feed writer: what the `giverny` plugin's manage
+    // skill runs (as `giverny-manage`) to plan, start,
+    // re-estimate and land a manager session's tasks. It runs inside Claude Code and reads the session id Claude
+    // exported, so it goes before the markers are scrubbed.
+    // Any subagent's ETA, and the plugin's hook: inside Claude Code too.
+    match std::env::args().nth(1).as_deref() {
+        Some("eta") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(giverny_claude::agent_eta::main(&args));
+        }
+        Some("hook") => std::process::exit(giverny_claude::plugin_hook::main()),
+        _ => {}
+    }
+    if std::env::args().nth(1).as_deref() == Some("manage") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(giverny_claude::manage::main(
+            &args,
+            &Paths::default_dirs().hook_spool(),
+        ));
+    }
+    // The transcript follower runs inside a tab and starts no Claude, so it
+    // has no markers to clear — and no business announcing that it did.
+    if std::env::args().nth(1).as_deref() != Some("transcript") {
+        scrub_inherited_claude_markers();
+    }
+
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let cfg = config::load(paths.base());
+                giverny_claude::hooks::run_subagent_line(
+                    &paths.hook_spool(),
+                    management_panel_on(&cfg),
+                );
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -542,6 +606,25 @@ fn main() -> eframe::Result {
             doctor();
             return Ok(());
         }
+        // A worker's transcript, readable and live: what a Running or Done
+        // row of the management panel opens.
+        Some("transcript") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+            let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+                eprintln!("usage: giverny transcript [--follow] <agent-<id>.jsonl>");
+                std::process::exit(2);
+            };
+            let stdout = std::io::stdout();
+            if let Err(err) =
+                giverny_claude::transcript::follow(Path::new(path), follow, &mut stdout.lock())
+                && err.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                eprintln!("giverny transcript: {path}: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
         Some(wslg::PROBE_ARG) => std::process::exit(wslg::probe()),
         Some("update") => {
@@ -565,9 +648,10 @@ fn main() -> eframe::Result {
             println!("{USAGE}");
             return Ok(());
         }
-        // A word this build does not know: a typo, or a subcommand added
-        // since it was built. It must not fall through to opening a window,
-        // which would also set up the Claude accounts from this binary.
+        // A word this build does not know: most likely a subcommand added
+        // since it was built (`giverny manage …` run on an older binary). It
+        // must not fall through to opening a window, which would also set up
+        // the Claude accounts from this binary.
         Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
             eprintln!("giverny: unknown command '{arg}'\n\n{USAGE}");
             std::process::exit(2);
@@ -834,9 +918,19 @@ const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
 #[cfg(unix)]
 fn defer_to_running() -> bool {
     use giverny_claude::hooks::{self, Running};
-    if let Some(var) = [SECOND_WINDOW_ENV, claude_watch::NO_ACCOUNT_SETUP_ENV]
-        .into_iter()
-        .find(|var| std::env::var_os(var).is_some())
+    // The side-instance switch as the accounts read it: `=0` is off.
+    if let Some(var) = [
+        (
+            SECOND_WINDOW_ENV,
+            std::env::var_os(SECOND_WINDOW_ENV).is_some(),
+        ),
+        (
+            claude_watch::NO_ACCOUNT_SETUP_ENV,
+            claude_watch::side_instance(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(var, set)| set.then_some(var))
     {
         tracing::info!("{var} is set: opening a window whatever else runs");
         return false;
@@ -933,10 +1027,41 @@ pub enum Action {
     /// Attach a tab to a background agent: its directory, its account, its
     /// conversation.
     AttachJob(Box<giverny_claude::jobs::Job>),
+    /// Stop or delete a background job: `claude stop`/`claude rm` under
+    /// its account, off the UI thread. A tab showing it closes first.
+    EndJob(String, giverny_claude::jobs::End),
     /// Group the rail by categories, or by repository.
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
+    /// A row of the management panel was clicked: Running and Done open the
+    /// worker, Planned shows its brief (`agent_open`).
+    AgentRowClicked(TabId, Box<management_panel::RowClick>),
+    /// The "back to manager" button, or Esc, on the worker page a tab
+    /// shows: the tab's terminal again.
+    ClosePage(TabId),
+    /// A line typed in the prompt box of the worker page a tab shows, with
+    /// Enter: it goes to the tab's manager.
+    ForwardLine(TabId, String),
+    /// Esc, or the terminal's "back to manager" button, in a tab
+    /// showing a worker's view: walk its Claude Code back to the main view.
+    BackToMain(TabId),
+    /// The rail's `stop` / `stop all`: end what these tabs
+    /// run and keep the tabs, asking first when more than an idle prompt
+    /// would die.
+    StopTabs(Vec<TabId>),
+    /// The pause button beside a tab's ×: stop it as
+    /// [`Action::StopTabs`] does, without the confirm — the button is the
+    /// user's own click on what is running.
+    StopTabNow(TabId),
+    /// The stop confirm's answer: stop them (`true`), or leave them be.
+    ConfirmStop(bool),
+}
+
+/// A stop waiting on its confirm: the tabs, and what in them would die.
+pub struct StopConfirm {
+    pub tabs: Vec<TabId>,
+    pub lines: Vec<String>,
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -998,9 +1123,31 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// When the screen was last read for a worker's view.
+    worker_checked: Option<Instant>,
+    /// The worker whose view the tab's Claude Code shows, by the label on
+    /// its prompt's rule (the Agent call's description); `None` on main.
+    viewed: Option<String>,
+    /// [`Self::viewed`] as of the picture on screen: it stays put while
+    /// the picture is held, so the header over the terminal
+    /// changes in the same frame as the view under it.
+    shown_viewed: Option<String>,
+    /// The worker the tab's status line is about while [`Self::shown_viewed`]
+    /// is a worker's view, as last told to `giverny
+    /// statusline` ([`giverny_claude::hooks::set_viewing`]). Kept while the
+    /// tab is in the background, where the screen is not read.
+    viewing_name: Option<giverny_claude::hooks::Viewing>,
+    /// The worker view whose header was closed with its `×`; it stays
+    /// closed until the tab leaves that view.
+    header_closed: Option<String>,
     /// Which prompt the bar over the terminal pins, kept between frames.
     pub prompt_bar: prompt_bar::Owner,
 }
+
+/// How often the active tab's screen is read for a worker's view: fast
+/// enough that the tint follows `main` and ← at a glance, rare enough to
+/// cost nothing.
+const WORKER_CHECK: Duration = Duration::from_millis(200);
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
 /// tab titles, and the clamp a restored width is held to.
@@ -1033,6 +1180,45 @@ const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 struct Snapshot {
     at: Instant,
     hash: u64,
+}
+
+/// Paint `rt` on the worker background while it is a worker's tab, or while
+/// its Claude Code shows a subagent's view. The screen is read
+/// at most every [`WORKER_CHECK`], and only for the tab on screen.
+fn update_worker_bg(ctx: &egui::Context, rt: &mut TabRuntime, worker_tab: bool) {
+    if worker_tab {
+        rt.view.worker_bg = true;
+        rt.viewed = None;
+        return;
+    }
+    let Some(session) = &rt.session else {
+        rt.view.worker_bg = false;
+        rt.viewed = None;
+        return;
+    };
+    let now = Instant::now();
+    if let Some(at) = rt.worker_checked
+        && now.duration_since(at) < WORKER_CHECK
+    {
+        // A burst of frames: look once more when it is over, so the last
+        // screen of it (the view just switched) is the one read.
+        //
+        // egui brings a delayed repaint forward by its predicted frame time,
+        // so without adding it back the frame lands inside the window, asks
+        // again with less than a frame to go — which is "now" — and spins
+        // until the window closes: ~10 frames per burst, measured.
+        let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt).clamp(0.0, 0.2));
+        ctx.request_repaint_after(WORKER_CHECK - now.duration_since(at) + predicted);
+        return;
+    }
+    rt.worker_checked = Some(now);
+    let screen = session.screen_text();
+    rt.view.worker_bg = agent_open::viewing_worker(&screen);
+    rt.viewed = if rt.view.worker_bg {
+        agent_open::prompt_box(&screen, &screen).and_then(|p| p.label)
+    } else {
+        None
+    };
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -1092,8 +1278,8 @@ pub struct App {
     pub codex: codex_watch::CodexWatch,
     pub hooks_banner_dismissed: bool,
     /// WSLg lost its shared memory with Windows and the window lags:
-    /// the commands that fix it, the no-administrator one first, said in the
-    /// rail until dismissed.
+    /// the commands that fix it, the no-administrator one first, said
+    /// in the rail until dismissed.
     pub wslg_slow: Option<[&'static str; 2]>,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
@@ -1111,8 +1297,8 @@ pub struct App {
     switcher: Option<Switcher>,
     /// A Ctrl+PageUp/PageDown walk in progress: Ctrl has been held since the
     /// last press. Like `switcher`, it keeps a tab the walk passes over from
-    /// starting until Ctrl comes up; unlike it, it records nothing, since
-    /// rail-order cycling commits each step as it goes.
+    /// starting until Ctrl comes up; unlike it, it records
+    /// nothing, since rail-order cycling commits each step as it goes.
     cycling: bool,
     /// What the not-started tab a walk is on shows meanwhile: its saved
     /// scrollback, read once when the walk reaches it.
@@ -1171,7 +1357,10 @@ pub struct App {
     /// frame) or a plain shell's command. Apart from Claude's state, because
     /// it outlives it: a turn you have not seen stays unseen when the agent
     /// starts working again, and the rail wears its tick beside the spinner.
-    unseen_done: HashSet<TabId>,
+    /// Each with whether that finish failed — a turn that died on an API
+    /// error, a command that exited non-zero — which the rail marks with a
+    /// ✕ in place of the tick. The latest finish says.
+    unseen_done: HashMap<TabId, bool>,
     /// Whether each tab's shell had a command in front at the last
     /// foreground poll (`track_foreground`), as seen this run: the persisted
     /// `Tab::foreground` is a restored tab's last command, not a live one,
@@ -1183,6 +1372,15 @@ pub struct App {
     /// the shell marks its prompts, which the two-second foreground poll
     /// would miss for an `ls`.
     osc_running: HashSet<TabId>,
+    /// The command each tab's shell has in front, as the foreground poll saw
+    /// it, and since when: what a stop's confirm names.
+    fg_since: HashMap<TabId, (String, Instant)>,
+    /// A stop asked for that waits on its confirm.
+    pub stop_confirm: Option<StopConfirm>,
+    /// The tab stopped while it was the one on screen: it stays stopped,
+    /// showing its saved scrollback, until it is clicked or chosen again.
+    /// Any other stopped tab starts as a restored one does.
+    held: Option<TabId>,
     /// Each tab's input count (`Session::input_seq`) when its last command
     /// finished. A finish with nothing typed since is none you ran: the rc
     /// file's own `$(dircolors)` as a shell starts, a prompt hook's helper
@@ -1194,6 +1392,8 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    /// Background jobs being stopped or deleted from the rail.
+    pub job_ends: job_end::JobEnds,
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
@@ -1208,6 +1408,45 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
+    /// Each tab's management panel view state (`claude.management_panel`); the rows
+    /// are `claude.agents`'.
+    pub agent_views: management_panel::Views,
+    /// This frame's use reading, the sampler's newest
+    /// (`sessions_load::latest`): taken once a frame so the sidebar and the
+    /// management panel draw the same one.
+    pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
+    /// The worker page a tab shows in its terminal's place
+    /// (`worker_page`): a worker Claude Code has no view of, or a Next up
+    /// row's brief. A second click on its row closes it.
+    pub brief: Option<worker_page::WorkerPage>,
+    /// Tabs opened for a worker (a Done row's follower, a row's open
+    /// command): painted on the worker background, like a subagent view.
+    worker_tabs: HashSet<TabId>,
+    /// A Running management-panel row being attached: keys typed into its parent
+    /// tab's Claude Code, one per frame, to open the worker's view.
+    attach: Option<AttachJob>,
+    /// A line typed in a worker page's box, being put at its manager's
+    /// prompt.
+    forward: Option<ForwardJob>,
+    /// A line went to the manager from a worker page: what it asked for —
+    /// the worker running again, or the Next up task's worker started — is
+    /// waited for while the page stays up, and the tab then walked into
+    /// that worker's view.
+    awaiting: Option<Awaiting>,
+    /// Tabs whose relay is asked to leave Claude Code's agent strip drawn
+    /// (`hooks::show_strip`), and when the ask was last written: the
+    /// strip is the keyboard path into a worker's view, which the management
+    /// panel otherwise hides.
+    strip_asks: HashMap<TabId, Instant>,
+    /// The pointer over the active tab's management panel, as the pane saw it
+    /// last frame (`Views::take_hover`), and the watch deciding when a
+    /// rest on a Running row starts its open early.
+    hover: Option<(TabId, Option<management_panel::RowClick>)>,
+    hover_watch: Option<(TabId, hover_open::Watch)>,
+    /// Since when the active tab's screen has held still.
+    screen_still: Option<(TabId, hover_open::Still)>,
+    /// A hover's early strip ask, holding its tab's picture.
+    prearm: Option<PrearmJob>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -1224,6 +1463,125 @@ pub struct App {
     /// set up from it; the first reload that parses does that.
     accounts_unset: bool,
 }
+
+/// A tab's Claude Code being walked to a worker's view or back to main:
+/// which tab is typed into, and the driver deciding each key from that
+/// tab's screen (`agent_open::Walk`).
+struct AttachJob {
+    tab: TabId,
+    /// The row's title, for a note if the walk stops short.
+    title: String,
+    driver: agent_open::Walk,
+    /// When the walk began: the tab's picture is held from here until the
+    /// view is final, and never longer than [`HOLD_MAX`].
+    started: Instant,
+    /// Once the walk is done: waiting for the view's final screen.
+    settle: Option<agent_open::Settle>,
+    /// Brings the relay's next run forward while its answer is waited on.
+    nudge: agent_open::Nudge,
+    /// The walk's phase last frame, for the timing log.
+    phase: &'static str,
+    /// When each phase began, from [`Self::started`], and the keys typed:
+    /// the timing line a finished walk logs.
+    times: Vec<(&'static str, Duration)>,
+    keys: usize,
+    /// The relay has been told it may hide the strip's rows again, and
+    /// the nudge set on bringing that forward.
+    hide_asked: bool,
+}
+
+impl AttachJob {
+    fn new(tab: TabId, title: String, driver: agent_open::Walk) -> AttachJob {
+        // The way in waits on the strip: the pty stays narrow until it is
+        // drawn, so Claude Code's timer runs from the first frame on.
+        let mut nudge = agent_open::Nudge::default();
+        nudge.ask_held();
+        AttachJob {
+            tab,
+            title,
+            driver,
+            started: Instant::now(),
+            settle: None,
+            nudge,
+            phase: "start",
+            times: vec![("start", Duration::ZERO)],
+            keys: 0,
+            hide_asked: false,
+        }
+    }
+
+    /// The walk's phases with how long each took, and the keys it typed:
+    /// `start 18ms, strip 330ms, attach 140ms, landing 61ms, focus 120ms,
+    /// settle 70ms; 9 keys`. A phase is named for what it waits on: `strip`
+    /// for Claude Code's strip to be drawn, `attach` for the steps to the
+    /// row and its Enter, `landing` for the view, `focus` for its prompt,
+    /// `settle` for the final screen, after which the picture is let go.
+    fn timing(&self) -> String {
+        let end = self.started.elapsed();
+        let parts: Vec<String> = self
+            .times
+            .iter()
+            .enumerate()
+            .map(|(i, &(phase, at))| {
+                let next = self.times.get(i + 1).map_or(end, |t| t.1);
+                format!("{phase} {:.0?}", next.saturating_sub(at))
+            })
+            .collect();
+        format!("{}; {} keys", parts.join(", "), self.keys)
+    }
+
+    /// Whether the tab's picture is still held.
+    fn holds(&self, now: Instant) -> bool {
+        now < self.started + HOLD_MAX
+    }
+
+    /// Whether the relay is asked to draw Claude Code's strip.
+    fn wants_strip(&self) -> bool {
+        self.settle.is_none() && self.driver.wants_strip()
+    }
+}
+
+/// A line from a worker page's box on its way to the manager's prompt.
+struct ForwardJob {
+    tab: TabId,
+    /// What was typed, put back in the box if it cannot be sent.
+    text: String,
+    driver: agent_open::Forward,
+}
+
+/// What a line sent from a worker page waits for.
+struct Awaiting {
+    tab: TabId,
+    ask: agent_open::Ask,
+    /// The page's row.
+    row: management_panel::RowClick,
+}
+
+/// A Running row's open started on the hover: which tab's
+/// strip is asked for, and the pre-arm holding that tab's picture.
+struct PrearmJob {
+    tab: TabId,
+    arm: hover_open::Prearm,
+    started: Instant,
+}
+
+/// The longest a tab's picture is held while a walk runs: a
+/// walk this slow is shown as it goes rather than as a frozen screen.
+const HOLD_MAX: Duration = Duration::from_secs(6);
+
+/// The tab's id as its shell sees it (`GIVERNY_TAB_ID`, set where the
+/// session is spawned), and as the relay reports it back.
+fn tab_env_id(id: TabId) -> String {
+    format!("giverny-{}", id.0)
+}
+
+/// How often a standing ask to show the strip is written again: well
+/// inside `hooks::STRIP_WANTED_FOR`, after which the relay forgets it.
+const STRIP_ASK_RENEW: Duration = Duration::from_secs(30);
+
+/// The terminal's back button, longest first: the first that
+/// fits the blank cells where the strip's `main` was is drawn.
+const BACK_LABELS: &[&str] = &["↺ back to manager", "↺ manager", "↺ back"];
 
 /// Automated per-tab injections. All stand down once the user has typed.
 #[derive(Debug, Clone)]
@@ -1256,24 +1614,53 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
     ))
 }
 
+/// Is the management panel on? Read by its settings key rather than a struct
+/// field, so the relay and the installer follow whatever the settings table
+/// declares — and read as off in a build that does not declare it.
+fn management_panel_on(cfg: &config::Config) -> bool {
+    bool_setting(cfg, "claude.management_panel")
+}
+
+/// With the management panel on, log what the machine sleeps through, so
+/// its clocks stop for it ([`giverny_claude::sleeps`]). Once per process.
+fn watch_sleeps(cfg: &config::Config) {
+    if management_panel_on(cfg) {
+        giverny_claude::sleeps::watch(giverny_claude::feed::feed_dir());
+    }
+}
+
+/// Does the management panel's plugin carry the manage skill?
+fn manage_skill_on(cfg: &config::Config) -> bool {
+    cfg.management_panel.manage_skill
+}
+
+/// Is every session given a name at its start?
+fn names_on(cfg: &config::Config) -> bool {
+    cfg.management_panel.ask_names
+}
+
 /// Can account setup follow this config? Not when a value it reads — the
 /// `[claude]` section — is one that did not fit and was stood in for.
 fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode.
+/// Bring every account in line with the config at startup: auto mode, and
+/// the management panel's subagent line and plugin.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
-/// following those would rewrite accounts against what the user configured.
-/// Once the file parses again, the hot reload applies what it says. Hook
-/// paths and the status line read nothing from the config, so
+/// following those would rewrite accounts against what the user configured:
+/// turn the management panel's subagent line and plugin on where they were
+/// turned off, or (in a build whose default is off) strip them from every
+/// account. Once the file parses again, the hot reload applies what it says.
+/// Hook paths and the status line read nothing from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
 fn set_up_accounts(
     claude: &mut claude_watch::ClaudeWatch,
     cfg: &config::Config,
     config_read: bool,
+    base: &Path,
 ) {
     if !config_read {
         tracing::warn!(
@@ -1284,7 +1671,25 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
+    claude.set_management_panel(
+        management_panel_on(cfg),
+        manage_skill_on(cfg),
+        names_on(cfg),
+        base,
+    );
 }
+
+fn bool_setting(cfg: &config::Config, key: &str) -> bool {
+    giverny_core::settings::by_key(key)
+        .and_then(|def| giverny_core::settings::current(cfg, def))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// `GIVERNY_FEED_DIR` as `%WSLENV%` lists it: `/p` translates the Windows
+/// path into the distribution's terms going in (`C:\…` → `/mnt/c/…`), so a
+/// feed writer inside WSL writes where the app reads.
+const FEED_DIR_WSLENV: &str = "GIVERNY_FEED_DIR/p";
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
@@ -1452,6 +1857,57 @@ fn resume_plan(
     }
 }
 
+/// What a tab types to attach to background agent `job`: `claude attach
+/// <id>`, under the job's account named as the resume command names one
+/// ([`resume_plan`]). `None` for a job that is not running or whose id is
+/// not one.
+fn attach_command(job: &giverny_claude::jobs::Job) -> Option<String> {
+    job.live
+        .then(|| attach_line(&job.id, Some(&job.config_dir), true))
+        .flatten()
+}
+
+/// `command claude attach <id>`, under the account at `config_dir`, for a
+/// tab showing background job `id`.
+///
+/// `exit` (a tab opened from BACKGROUND, its `bg_job`) adds `&& exit`: the
+/// tab is the job's for as long as it shows it, so when the attach ends —
+/// detached, quit, Ctrl+C — the shell ends with it and the tab closes
+/// ([`closes_on_exit`]), the job going back to BACKGROUND. An
+/// attach that fails (the job is gone) exits nonzero: the shell stays, with
+/// the error on screen. A tab of one's own that held a job's conversation
+/// attaches without it, and keeps its shell when the attach ends.
+fn attach_line(id: &str, config_dir: Option<&Path>, exit: bool) -> Option<String> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !ok {
+        return None;
+    }
+    let mut command = String::new();
+    if let Some(dir) = config_dir
+        && giverny_claude::profiles::must_be_named(dir)
+    {
+        let named = match wsl::split_unc(dir) {
+            Some((_, unix)) => unix,
+            None => dir.display().to_string(),
+        };
+        command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
+    }
+    // `command` bypasses shell wrapper functions named `claude`.
+    let then = if exit { " && exit" } else { "" };
+    command.push_str(&format!("command claude attach {id}{then}\r"));
+    Some(command)
+}
+
+/// Does a tab close by itself when its shell ends this way? Only one opened
+/// from BACKGROUND, and only on a clean exit — its attach ended — never on
+/// a failure or a kill (Giverny closing takes every shell down, and the
+/// tab is restored next time).
+fn closes_on_exit(tab: &giverny_core::tabs::Tab, exit: Option<std::process::ExitStatus>) -> bool {
+    tab.bg_job.is_some() && exit.is_some_and(|s| s.success())
+}
+
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
 /// to survive the crossing, added to whatever the user already shares.
 ///
@@ -1476,13 +1932,15 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
                 .collect()
         })
         .unwrap_or_default();
-    for name in ours.iter().copied() {
-        // An entry may carry a flag (`VAR/p`); the name before it is the key.
+    for entry in ours.iter().copied() {
+        // An entry may carry a flag (`VAR/p`), ours or theirs; the name
+        // before it is the key.
+        let name = entry.split('/').next().unwrap_or(entry);
         if !parts
             .iter()
             .any(|p| p.split('/').next().is_some_and(|n| n == name))
         {
-            parts.push(name.to_string());
+            parts.push(entry.to_string());
         }
     }
     parts.join(":")
@@ -1522,11 +1980,18 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        // What Giverny runs, read once for the sidebar, the management panel and
+        // every tab's status line.
+        sessions_load::start(&cc.egui_ctx);
         giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
         let see_through = see_through && translucency::confirm(cc);
         shared.opacity = opacity_for(see_through, &cfg);
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name), shared.opacity);
+        record_accent(&chrome);
+        // No tab is on a worker's view yet: a status line left naming one
+        // by a run that ended there names the manager again.
+        giverny_claude::hooks::clear_viewing(&paths.hook_spool());
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -1561,6 +2026,10 @@ impl App {
             .unwrap_or_default();
         let mut ws = restored
             .map(|st| st.workspace)
+            .map(|mut ws| {
+                ws.drop_background_tabs();
+                ws
+            })
             .filter(|ws| !ws.tabs.is_empty())
             .unwrap_or_default();
 
@@ -1647,15 +2116,14 @@ impl App {
         // second window, or a side instance trying out a build, must not end
         // the msrdc the first one's window lives in, nor end it twice.
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-        let wslg_watchdog = (claude.relay_listening()
-            && std::env::var_os(claude_watch::NO_ACCOUNT_SETUP_ENV).is_none())
-        .then(|| {
-            let ctx = cc.egui_ctx.clone();
-            wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
-                ctx.request_repaint()
+        let wslg_watchdog = (claude.relay_listening() && !claude_watch::side_instance())
+            .then(|| {
+                let ctx = cc.egui_ctx.clone();
+                wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
+                    ctx.request_repaint()
+                })
             })
-        })
-        .flatten();
+            .flatten();
         let codex = codex_watch::CodexWatch::new(
             &cfg.codex,
             Some(paths.base().join("state/codex-usage.json")),
@@ -1705,9 +2173,12 @@ impl App {
             wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
-            unseen_done: HashSet::new(),
+            unseen_done: HashMap::new(),
             fg_running: HashMap::new(),
             osc_running: HashSet::new(),
+            fg_since: HashMap::new(),
+            stop_confirm: None,
+            held: None,
             finish_input: HashMap::new(),
             repo_cache: HashMap::new(),
             repo_rx: None,
@@ -1717,6 +2188,7 @@ impl App {
             update_rx,
             welcome,
             update_dismissed: false,
+            job_ends: job_end::JobEnds::default(),
             exe_mtime: update::binary_mtime(),
             update_job: None,
             update_installed: false,
@@ -1726,6 +2198,18 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
+            agent_views: management_panel::Views::default(),
+            use_now: None,
+            brief: None,
+            worker_tabs: HashSet::new(),
+            attach: None,
+            forward: None,
+            awaiting: None,
+            strip_asks: HashMap::new(),
+            hover: None,
+            hover_watch: None,
+            screen_still: None,
+            prearm: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1741,7 +2225,8 @@ impl App {
         }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
-        set_up_accounts(&mut app.claude, &app.cfg, config_read);
+        set_up_accounts(&mut app.claude, &app.cfg, config_read, app.paths.base());
+        watch_sleeps(&app.cfg);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1869,6 +2354,12 @@ impl App {
                 // recent stack yet. Commit the walk first, so closing the
                 // previewed tab goes back to it.
                 self.end_switch();
+                // A closed tab's status line names no worker.
+                let _ = giverny_claude::hooks::set_viewing(
+                    &self.paths.hook_spool(),
+                    &tab_env_id(id),
+                    None,
+                );
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
@@ -1896,10 +2387,16 @@ impl App {
                 }
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
+                self.agent_views.forget(id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
                 self.end_switch();
+                // A stopped tab clicked starts.
+                if self.held == Some(id) {
+                    self.held = None;
+                    self.walk_preview = None;
+                }
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
                 self.mark_seen(id);
@@ -1921,6 +2418,10 @@ impl App {
                 self.layout.rail_view = view;
                 self.state_dirty = true;
             }
+            Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
+            Action::ClosePage(tab) => self.close_page(tab),
+            Action::ForwardLine(tab, text) => self.forward_line(ctx, tab, text),
+            Action::BackToMain(tab) => self.back_to_main(ctx, tab),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -1942,7 +2443,7 @@ impl App {
                         .ws
                         .tab(*id)
                         // What they see, not the raw title behind it.
-                        .map(|t| t.display_title(&self.cfg.titles))
+                        .map(|t| self.shown_title(t))
                         .unwrap_or_default(),
                     RenameTarget::Category(id) => self
                         .ws
@@ -1972,15 +2473,52 @@ impl App {
                     }
                 }
             }
+            Action::StopTabs(tabs) => {
+                let tabs: Vec<TabId> = tabs.into_iter().filter(|&t| self.stoppable(t)).collect();
+                if tabs.is_empty() {
+                    return;
+                }
+                let lines = self.what_dies(&tabs);
+                if lines.is_empty() {
+                    self.stop_tabs(&tabs);
+                } else {
+                    self.stop_confirm = Some(StopConfirm { tabs, lines });
+                }
+            }
+            Action::StopTabNow(id) => {
+                if self.stoppable(id) {
+                    self.stop_tabs(&[id]);
+                }
+            }
+            Action::ConfirmStop(yes) => {
+                if let Some(asked) = self.stop_confirm.take()
+                    && yes
+                {
+                    self.stop_tabs(&asked.tabs);
+                }
+                self.focus_terminal = true;
+            }
             Action::Respawn(id) => {
+                if self.held == Some(id) {
+                    self.held = None;
+                }
                 self.spawn_session(ctx, id, None);
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => match self.claude.install_hooks() {
-                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                Err(e) => tracing::error!("hook install: {e}"),
-            },
+            Action::InstallHooks => {
+                match self.claude.install_hooks() {
+                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                    Err(e) => tracing::error!("hook install: {e}"),
+                }
+                // The hooks are the consent the management panel's keys wait for.
+                self.claude.set_management_panel(
+                    management_panel_on(&self.cfg),
+                    manage_skill_on(&self.cfg),
+                    names_on(&self.cfg),
+                    self.paths.base(),
+                );
+            }
             Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
             Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
             Action::ConfirmCodexResume(id) => {
@@ -2073,34 +2611,77 @@ impl App {
                 }
             }
             Action::AttachJob(job) => {
-                let Some(sid) = job.resume_target().map(str::to_string) else {
-                    tracing::warn!("job {} has no conversation to attach to", job.id);
+                // A running agent is attached to, wherever the daemon runs
+                // it: `claude --resume` refuses a conversation live
+                // elsewhere, and a job resumed from another one has no
+                // conversation of its own on disk yet.
+                // Its tab, when it has one, is where it is.
+                if let Some(id) = self
+                    .ws
+                    .tabs
+                    .iter()
+                    .find(|t| t.bg_job.as_deref() == Some(job.id.as_str()))
+                    .map(|t| t.id)
+                {
+                    self.apply(ctx, Action::Select(id));
+                    return;
+                }
+                let Some(cmd) = attach_command(&job) else {
+                    tracing::warn!("job {}: nothing to attach to", job.id);
                     return;
                 };
+                // The tab lives in the BACKGROUND list, as the agent's row;
+                // its category only has to exist, and is not opened for it.
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
+                let collapsed = self.ws.category_mut(cat).map(|c| c.collapsed);
                 let id = self.new_tab(cat);
-                if let Some(tab) = self.ws.tab_mut(id) {
-                    // The agent's own directory: `claude --resume` only finds a
-                    // conversation from where it ran.
-                    tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
-                    tab.custom_title = Some(job.name.clone());
+                if let (Some(was), Some(c)) = (collapsed, self.ws.category_mut(cat)) {
+                    c.collapsed = was;
                 }
-                // A conversation that is not on disk cannot be resumed, and a
-                // shell opening on an empty screen looks like a tab that did
-                // nothing. Say what happened, in the agent's own directory.
-                if giverny_claude::registry::find_transcript(&job.config_dir, &sid).is_none() {
-                    tracing::info!("job {}: no transcript for {sid}", job.id);
-                    self.spawn_session(
-                        ctx,
-                        id,
-                        Some(format!(
-                            "\x1b[2mgiverny:\x1b[0m no conversation on disk for this agent\r\n                             \x1b[2m         {sid}\r\n                                      this tab is its directory; the agent itself is still                              wherever it is running.\x1b[0m\r\n\r\n"
-                        )),
-                    );
-                    return;
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
+                    tab.bg_job = Some(job.id.clone());
+                    // A restart attaches to the job again ([`queue_resume`]);
+                    // the conversation is what the tab holds meanwhile.
+                    tab.claude_session = job.resume_target().map(str::to_string);
+                    tab.claude_config_dir = Some(job.config_dir.clone());
                 }
                 self.spawn_session(ctx, id, None);
-                self.apply(ctx, Action::ResumeSpecific(id, sid, job.config_dir.clone()));
+                // Same deferred injection the resume path uses: give the
+                // shell time to be ready before typing into it.
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(1300),
+                    id,
+                    Inject::Raw(cmd.into_bytes()),
+                ));
+                self.focus_terminal = true;
+                self.state_dirty = true;
+            }
+            Action::EndJob(id, how) => {
+                let tab = self
+                    .ws
+                    .tabs
+                    .iter()
+                    .find(|t| t.bg_job.as_deref() == Some(id.as_str()));
+                let tab_id = tab.map(|t| t.id);
+                // The job's own account, as the scan found it; else the one
+                // its tab was opened under.
+                let Some(dir) = self
+                    .claude
+                    .job(&id)
+                    .map(|j| j.config_dir.clone())
+                    .or_else(|| tab.and_then(|t| t.claude_config_dir.clone()))
+                else {
+                    tracing::warn!("job {id}: no account to {} it under", how.verb());
+                    return;
+                };
+                // The tab only showed the job: with the job ending it has
+                // nothing left to show. Closed first, its attach goes
+                // quietly instead of reporting the job gone under it.
+                if let Some(t) = tab_id {
+                    self.apply(ctx, Action::CloseTab(t));
+                }
+                self.job_ends.start(ctx, id, dir, how);
             }
             Action::EditConfig => {
                 let editor = std::env::var("VISUAL")
@@ -2189,6 +2770,11 @@ impl App {
                 self.state_dirty = true;
             }
             Action::ReorderTab(tab, category, index) => {
+                // A background agent's tab dragged into a category becomes
+                // one of its tabs.
+                if let Some(t) = self.ws.tab_mut(tab) {
+                    t.bg_job = None;
+                }
                 self.ws.reorder_tab(tab, category, index);
             }
             Action::RunUpdate => {
@@ -2266,7 +2852,8 @@ impl App {
     }
 
     /// How this tab's shell is started so it keeps its own history:
-    /// arguments for it and environment for Giverny's init file there. `None` when the setting is off, or the shell is not one that
+    /// arguments for it and environment for Giverny's init file there.
+    /// `None` when the setting is off, or the shell is not one that
     /// can be steered this way or already has arguments of its own. `env` is
     /// what the tab already adds on top of ours.
     fn history_steer(
@@ -2321,13 +2908,12 @@ impl App {
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
-        let profile_dir = self
-            .ws
-            .tab(id)
-            .and_then(|t| self.ws.category(t.category))
-            .and_then(|c| c.profile_dir.clone());
+        let category = self.ws.tab(id).and_then(|t| self.ws.category(t.category));
+        let profile_dir = category.and_then(|c| c.profile_dir.clone());
+        // The category's name, the surname a session born in this tab takes.
+        let category = category.map(|c| c.name.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, category, was_in.as_deref());
         if let Some(saved) = self.ws.tab(id).and_then(|t| t.agent_session.as_ref())
             && let Some(distro) = &saved.wsl_distro
         {
@@ -2382,6 +2968,11 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    worker_checked: None,
+                    viewed: None,
+                    shown_viewed: None,
+                    viewing_name: None,
+                    header_closed: None,
                     prompt_bar: prompt_bar::Owner::default(),
                 });
                 entry.session = Some(session);
@@ -2411,10 +3002,13 @@ impl App {
         }
     }
 
-    fn drain_events(&mut self) {
+    /// Apply what each tab's session reported. Returns the tabs to close: a
+    /// BACKGROUND tab whose attach ended ([`closes_on_exit`]).
+    fn drain_events(&mut self) -> Vec<TabId> {
         let mut cwd_updates: Vec<(TabId, PathBuf)> = Vec::new();
         let mut prompt_marks: Vec<(TabId, PromptMark)> = Vec::new();
         let mut ended: Vec<TabId> = Vec::new();
+        let mut close = Vec::new();
         for (&id, rt) in &self.rt {
             let Some(session) = &rt.session else { continue };
             while let Ok(ev) = session.events.try_recv() {
@@ -2440,10 +3034,14 @@ impl App {
                     TabEvent::ChildExit(status) => {
                         tracing::info!("tab {id:?} child exited: {status:?}");
                     }
-                    TabEvent::LoopDone(_) => {
+                    TabEvent::LoopDone(exit) => {
                         ended.push(id);
                         if let Some(tab) = self.ws.tab_mut(id) {
                             tab.exited = true;
+                            if closes_on_exit(tab, exit) {
+                                tracing::info!("tab {id:?}: attach ended, closing");
+                                close.push(id);
+                            }
                         }
                     }
                 }
@@ -2459,9 +3057,18 @@ impl App {
                 }
                 // `D` ends it; a shell that skips `D` ends it with the next
                 // prompt's `A`.
-                PromptMark::CommandDone(_) | PromptMark::PromptStart => {
+                PromptMark::CommandDone(exit) => {
                     if self.osc_running.remove(&id) {
-                        self.command_finished(id);
+                        self.command_finished(id, failed_exit(exit));
+                    } else if failed_exit(exit) {
+                        // The foreground poll saw it end first: the finish
+                        // it noted failed.
+                        self.command_failed(id);
+                    }
+                }
+                PromptMark::PromptStart => {
+                    if self.osc_running.remove(&id) {
+                        self.command_finished(id, false);
                     }
                 }
                 PromptMark::CommandStart => {}
@@ -2486,6 +3093,7 @@ impl App {
                 }
             }
         }
+        close
     }
 
     /// Notice a session that stopped because the account ran out of limit,
@@ -2829,6 +3437,32 @@ impl App {
         self.limited.get(&id).and_then(|w| w.reopens)
     }
 
+    /// The place this Claude tab is titled after, if it is:
+    /// see [`rail::place_title`].
+    pub fn tab_place(&self, t: &giverny_core::tabs::Tab) -> Option<&str> {
+        rail::place_title(
+            self.cfg.rail.place_titles,
+            t.custom_title.as_deref(),
+            self.claude
+                .tabs
+                .get(&t.id)
+                .and_then(|c| c.session_id.as_deref()),
+            t.claude_session.as_deref(),
+            &self.claude.places,
+        )
+    }
+
+    /// A tab's title as the rail shows it: its place, else
+    /// its title tidied per `[titles]`. A worker's view on screen does not
+    /// change it: the tab is still the manager's place; the
+    /// status line names the worker.
+    pub fn shown_title(&self, t: &giverny_core::tabs::Tab) -> String {
+        match self.tab_place(t) {
+            Some(place) => place.to_string(),
+            None => t.display_title(&self.cfg.titles),
+        }
+    }
+
     /// Is this tab stopped by a usage limit at all, reset time known or not?
     pub fn is_limited(&self, id: TabId) -> bool {
         self.limited.contains_key(&id)
@@ -2989,7 +3623,7 @@ impl App {
                 self.apply_config(ctx, parsed.config);
                 if read && std::mem::take(&mut self.accounts_unset) {
                     tracing::info!("config.toml parses again: setting up Claude accounts");
-                    set_up_accounts(&mut self.claude, &self.cfg, true);
+                    set_up_accounts(&mut self.claude, &self.cfg, true, self.paths.base());
                 }
             }
             Err(err) => tracing::error!("config.toml ignored ({err}); keeping previous settings"),
@@ -3009,6 +3643,7 @@ impl App {
         // around a Gruvbox grid.
         self.chrome = chrome::Chrome::from_theme(&theme);
         self.chrome.apply(ctx, &theme, self.shared.opacity);
+        record_accent(&self.chrome);
     }
 
     /// Adopt a freshly loaded config, applying what can be applied live.
@@ -3024,6 +3659,18 @@ impl App {
         }
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
+        }
+        if management_panel_on(&cfg) != management_panel_on(&self.cfg)
+            || manage_skill_on(&cfg) != manage_skill_on(&self.cfg)
+            || names_on(&cfg) != names_on(&self.cfg)
+        {
+            self.claude.set_management_panel(
+                management_panel_on(&cfg),
+                manage_skill_on(&cfg),
+                names_on(&cfg),
+                self.paths.base(),
+            );
+            watch_sleeps(&cfg);
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
@@ -3348,8 +3995,17 @@ impl App {
             // A command seen in front last time and gone now has finished.
             // Only one seen this run: see `fg_running`.
             let running = cmd.is_some();
+            match &cmd {
+                Some(line) if self.fg_since.get(&id).is_none_or(|(was, _)| was != line) => {
+                    self.fg_since.insert(id, (line.clone(), Instant::now()));
+                }
+                Some(_) => {}
+                None => {
+                    self.fg_since.remove(&id);
+                }
+            }
             if self.fg_running.insert(id, running) == Some(true) && !running {
-                self.command_finished(id);
+                self.command_finished(id, false);
             }
             if let Some(tab) = self.ws.tab_mut(id)
                 && tab.foreground != cmd
@@ -3367,7 +4023,11 @@ impl App {
     /// Only a command typed: one with no input since the last finish (or
     /// since the shell started) was the shell's own doing — its rc file, its
     /// prompt — and finishes nothing you asked for (see `finish_input`).
-    fn command_finished(&mut self, id: TabId) {
+    ///
+    /// `failed`: its exit code said so ([`failed_exit`]), and the rail wears
+    /// a ✕ in place of the tick. Only OSC 133 `D` carries the
+    /// code; the foreground poll's finish has none.
+    fn command_finished(&mut self, id: TabId, failed: bool) {
         let Some(seq) = self
             .rt
             .get(&id)
@@ -3380,13 +4040,38 @@ impl App {
             return;
         }
         if self.ws.active != Some(id) {
-            self.unseen_done.insert(id);
+            self.unseen_done.insert(id, failed);
+        }
+    }
+
+    /// The command whose finish tab `id` already noted, from the foreground
+    /// poll that has no exit code, ended with a `D` saying it failed: its
+    /// unseen finish, if it is still unseen, failed.
+    fn command_failed(&mut self, id: TabId) {
+        let noted = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .map(|s| s.input_seq());
+        if noted.is_some()
+            && self.finish_input.get(&id).copied() == noted
+            && let Some(failed) = self.unseen_done.get_mut(&id)
+        {
+            *failed = true;
         }
     }
 
     /// The user looked at tab `id`: its done-markers clear, Claude's tick and
-    /// the unseen-finish badge alike.
+    /// the unseen-finish badge alike. A look at a tab that wore
+    /// the tick flashes its management panel's rows that landed since the
+    /// last one.
     fn mark_seen(&mut self, id: TabId) {
+        let ticked = self.unseen_done.contains_key(&id)
+            || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen
+            || self.codex.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
+        if ticked {
+            self.agent_views.flash_new_done(id);
+        }
         self.claude.mark_viewed(id);
         self.codex.attended(id);
         self.unseen_done.remove(&id);
@@ -3400,10 +4085,12 @@ impl App {
             if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
                 || self.codex.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
             {
-                self.unseen_done.insert(t.id);
+                // The latest turn says whether its finish failed: a
+                // turn that ended well after one that died is good news.
+                self.unseen_done.insert(t.id, self.claude.turn_failed(t.id));
             }
         }
-        self.unseen_done.retain(|id| self.ws.tab(*id).is_some());
+        self.unseen_done.retain(|id, _| self.ws.tab(*id).is_some());
     }
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
@@ -3527,8 +4214,161 @@ impl App {
         ));
     }
 
+    /// Can tab `id` be stopped: it is started, and is no
+    /// BACKGROUND agent's tab — that agent runs in Claude Code's daemon, not
+    /// in the tab, and its tab has `stop agent` and closes back to the list.
+    pub fn stoppable(&self, id: TabId) -> bool {
+        self.rt.contains_key(&id) && self.ws.tab(id).is_some_and(|t| t.bg_job.is_none())
+    }
+
+    /// What stopping `tabs` would end beyond an idle prompt, one line each
+    /// for the confirm: a command in front (`cargo build (3m)`), a Claude
+    /// working or with workers, `manage run` commands, Codex working. Empty
+    /// when every one of them idles, and the stop goes without asking.
+    fn what_dies(&self, tabs: &[TabId]) -> Vec<String> {
+        use claude_watch::ClaudeState;
+        let several = tabs.len() > 1;
+        let runs_dir = giverny_claude::run_live::runs_dir(&giverny_claude::resources::ledger_path(
+            &giverny_claude::feed::feed_dir(),
+        ));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut out = Vec::new();
+        for &id in tabs {
+            let Some(tab) = self.ws.tab(id) else { continue };
+            let mut what = Vec::new();
+            let ct = self.claude.tabs.get(&id);
+            let claude_here =
+                ct.is_some_and(|c| c.session_id.is_some() || c.state != ClaudeState::None);
+            if let Some((line, since)) = self.fg_since.get(&id)
+                && self.fg_running.get(&id) == Some(&true)
+                && !claude_here
+                && !tab_stop::is_agent(line)
+            {
+                what.push(format!(
+                    "{} ({})",
+                    tab_stop::command(line, 40),
+                    tab_stop::took(since.elapsed())
+                ));
+            }
+            if let Some(c) = ct {
+                let workers = self.claude.agents.running_workers(id);
+                if workers > 0 {
+                    let s = if workers == 1 { "" } else { "s" };
+                    what.push(format!("claude: {workers} worker{s} running"));
+                } else if c.agents {
+                    what.push("claude: workers running".into());
+                }
+                if c.state == ClaudeState::Busy {
+                    what.push("claude: working".into());
+                }
+                if c.background {
+                    what.push("claude: background shell running".into());
+                }
+                if let Some(sid) = c.session_id.as_deref() {
+                    for (task, run) in giverny_claude::run_live::session_runs(&runs_dir, sid) {
+                        let cmd = run
+                            .cmd
+                            .as_deref()
+                            .map_or_else(|| "run".to_string(), |c| tab_stop::command(c, 32));
+                        let took = run
+                            .started_ms
+                            .map(|at| {
+                                let ran = Duration::from_millis(now_ms.saturating_sub(at));
+                                format!(" ({})", tab_stop::took(ran))
+                            })
+                            .unwrap_or_default();
+                        what.push(format!("{task}: {cmd}{took}"));
+                    }
+                }
+            }
+            if self.codex.state_of(id) == giverny_core::agent::AgentState::Busy {
+                what.push("codex: working".into());
+            }
+            let title = several.then(|| self.shown_title(tab));
+            out.extend(tab_stop::lines_for(title.as_deref(), what));
+        }
+        out
+    }
+
+    /// Stop each of `tabs` ([`App::stop_tab`]).
+    fn stop_tabs(&mut self, tabs: &[TabId]) {
+        for &id in tabs {
+            self.stop_tab(id);
+        }
+        self.state_dirty = true;
+    }
+
+    /// End what tab `id` runs and keep the tab: back to the
+    /// state a tab restored after a restart is in — not started, its saved
+    /// scrollback, its folder, title, account and the conversation it
+    /// resumes — so the next focus starts it the way a restored tab starts
+    /// ([`App::queue_resume`]). What runs ends as closing a tab ends it, and
+    /// what outlives that is terminated ([`tab_stop::end`]).
+    fn stop_tab(&mut self, id: TabId) {
+        if !self.stoppable(id) {
+            return;
+        }
+        // What the restart's tab would come back with.
+        self.snapshot_tab(id);
+        let Some(rt) = self.rt.remove(&id) else {
+            return;
+        };
+        if let Some(session) = rt.session {
+            let mut tree = session.child_pid.map(tab_stop::tree).unwrap_or_default();
+            // A `manage run` command outside the tab's tree still goes:
+            // it was the session's.
+            if let Some(sid) = self.claude.tabs.get(&id).and_then(|c| c.session_id.clone()) {
+                let runs_dir = giverny_claude::run_live::runs_dir(
+                    &giverny_claude::resources::ledger_path(&giverny_claude::feed::feed_dir()),
+                );
+                for (_, run) in giverny_claude::run_live::session_runs(&runs_dir, &sid) {
+                    if !tree.iter().any(|p| p.pid == run.pid) {
+                        tree.extend(tab_stop::tree(run.pid));
+                    }
+                }
+            }
+            tracing::info!("tab {id:?}: stopping ({} process(es))", tree.len());
+            tab_stop::end(session, tree, move || {
+                tracing::info!("tab {id:?}: stopped");
+            });
+        }
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.exited = false;
+        }
+        self.fg_running.remove(&id);
+        self.osc_running.remove(&id);
+        self.fg_since.remove(&id);
+        // A stopped tab's status line names no worker, as a closed one's.
+        let _ = giverny_claude::hooks::set_viewing(&self.paths.hook_spool(), &tab_env_id(id), None);
+        self.claude.stopped(id);
+        self.codex.tabs.remove(&id);
+        if self.ws.active == Some(id) {
+            self.held = Some(id);
+            self.walk_preview = None;
+        }
+    }
+
     /// Queue the auto-resume command for a freshly restored tab.
     fn queue_resume(&mut self, id: TabId, ctx: &egui::Context) {
+        // A tab opened from BACKGROUND is not restored after a restart
+        // (`drop_background_tabs`); one respawned goes back to its job the
+        // way it first did, and closes the same way when the attach ends.
+        // Resuming the conversation instead is refused while the job runs it.
+        if let Some(tab) = self.ws.tab(id)
+            && let Some(job) = &tab.bg_job
+        {
+            if let Some(cmd) = attach_line(job, tab.claude_config_dir.as_deref(), true) {
+                tracing::info!("tab {id:?}: attaching to background job {job}");
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(1300),
+                    id,
+                    Inject::Raw(cmd.into_bytes()),
+                ));
+            }
+            return;
+        }
         if let Some(session) = self.ws.tab(id).and_then(|t| t.agent_session.clone())
             && session.provider == giverny_core::agent::AgentKind::Codex
         {
@@ -3580,8 +4420,21 @@ impl App {
     /// across profiles (self-heals a lost account association), and the
     /// conversation's own recorded cwd (`claude --resume` only finds a
     /// session from the directory it ran in).
+    ///
+    /// A conversation a running background job holds is attached to
+    /// instead. `claude --resume` of it makes Claude Code fork the client's
+    /// own fresh session into a new, empty job and park on that: one more
+    /// row in BACKGROUND for every restart.
     fn resume_command(&self, sid: &str, id: TabId) -> Option<Vec<u8>> {
         let tab = self.ws.tab(id)?;
+        if let Some(job) = self.claude.live_job_holding(sid) {
+            tracing::info!(
+                "tab {id:?}: {sid} is background job {}'s; attaching",
+                job.id
+            );
+            return attach_line(&job.id, Some(&job.config_dir), tab.bg_job.is_some())
+                .map(String::into_bytes);
+        }
         let all_dirs: Vec<PathBuf> = self
             .claude
             .profiles
@@ -3686,8 +4539,25 @@ impl App {
     /// environment does not reach a process in a distribution at all unless
     /// `%WSLENV%` lists it, which is how the tab identity the hooks report
     /// gets there.
-    fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
+    fn tab_shape(
+        &self,
+        profile_dir: Option<PathBuf>,
+        category: Option<String>,
+        was_in: Option<&Path>,
+    ) -> TabShape {
         let mut env = self.claude_env();
+        // Where a manager in this tab writes its management-panel feed
+        // (`docs/management-panel.md`) — the directory this app reads.
+        env.push((
+            giverny_claude::feed::DIR_ENV.into(),
+            giverny_claude::feed::feed_dir().display().to_string(),
+        ));
+        // The rail category the tab sits in as its shell starts: a session
+        // born there is named after it. Not a path, so it
+        // crosses into a distribution as it is.
+        if let Some(name) = category.filter(|n| !n.trim().is_empty()) {
+            env.push((giverny_claude::names::CATEGORY_ENV.into(), name));
+        }
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
@@ -3764,6 +4634,14 @@ impl App {
             // only what we set, since listing a name we did not set is what
             // put an empty CLAUDE_CONFIG_DIR in front of Claude Code.
             .filter(|name| name.starts_with("GIVERNY_") || name.starts_with("CLAUDE_"))
+            // A path, so it crosses translated.
+            .map(|name| {
+                if name == giverny_claude::feed::DIR_ENV {
+                    FEED_DIR_WSLENV
+                } else {
+                    name
+                }
+            })
             // These two come from the spawn itself rather than from here.
             .chain(["GIVERNY_TAB_ID", "GIVERNY_NONCE"])
             .collect();
@@ -3783,10 +4661,941 @@ impl App {
         }
     }
 
+    /// A click on a management-panel row of tab `parent`: the worker overlay
+    /// (Running live, Done at its end), or a Planned row's brief.
+    fn open_agent_row(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &management_panel::RowClick,
+    ) {
+        // The row the tab already shows, clicked again, is the way back to
+        // the manager.
+        let page = self
+            .brief
+            .as_ref()
+            .filter(|p| p.tab == parent)
+            .and_then(|p| p.row.as_ref());
+        let viewed = self.viewed_worker(parent);
+        let toggle = management_panel::toggle(click, viewed.as_deref(), page);
+        tracing::info!("management panel: row {} clicked: {toggle:?}", click.name);
+        match toggle {
+            management_panel::Toggle::Open => {
+                // Whatever is opened next takes the tab: a page up in it
+                // gives way, as a worker's view gives way to another's.
+                if self.brief.as_ref().is_some_and(|p| p.tab == parent) {
+                    self.close_page(parent);
+                }
+            }
+            management_panel::Toggle::Close => {
+                self.close_page(parent);
+                return;
+            }
+            management_panel::Toggle::Home => {
+                self.walk_home(ctx, parent);
+                return;
+            }
+        }
+        // A Done row whose `open` resumes a conversation that is running in
+        // a Giverny tab goes to that tab.
+        if let Some(sid) = agent_open::done_resumes(click)
+            && let Some(id) = self.live_holder(&sid)
+        {
+            self.apply(ctx, Action::Select(id));
+            return;
+        }
+        // A Running worker opens straight into its view. Giverny's page of
+        // it is what is left when that cannot start, and what a finished
+        // worker not yet landed opens at once: Claude Code lists it no
+        // more, so there is no view to walk to.
+        if let (giverny_claude::feed::Stage::Running, Some(agent_id)) =
+            (click.stage, click.agent_id.as_deref())
+            && matches!(
+                agent_open::offer(click),
+                agent_open::Offer::OpenInClaude { .. }
+            )
+        {
+            let title = agent_open::title_of(click);
+            let agent_id = agent_id.to_string();
+            if self.start_attach(ctx, parent, &title, &agent_id, click) {
+                return;
+            }
+        }
+        let plan = agent_open::plan(click);
+        self.carry_out_open(ctx, parent, plan, click);
+    }
+
+    /// The page `tab` shows goes, and its terminal is back.
+    fn close_page(&mut self, tab: TabId) {
+        if self.brief.as_ref().is_some_and(|p| p.tab == tab) {
+            self.brief = None;
+            self.focus_terminal = true;
+        }
+    }
+
+    /// The worker whose view `tab` shows, or is on its way to: its id in the
+    /// tab's tracker. What its pane row is marked for, and what a second
+    /// click on that row walks away from.
+    fn viewed_worker(&self, tab: TabId) -> Option<String> {
+        let job = self.attach.as_ref().filter(|j| j.tab == tab);
+        let label = match job.map(|j| &j.driver.goal) {
+            Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
+            Some(agent_open::Goal::Main) => None,
+            None => self.rt.get(&tab).and_then(|rt| rt.viewed.clone()),
+        };
+        self.worker_id(tab, label.as_deref()?)
+    }
+
+    /// The id of `tab`'s worker that Claude Code's view `label` names: a
+    /// running one first.
+    fn worker_id(&self, tab: TabId, label: &str) -> Option<String> {
+        let rows = self.claude.agents.tracker(tab)?.rows();
+        let names = |r: &&giverny_claude::subagents::SubagentRow| {
+            r.description
+                .as_deref()
+                .is_some_and(|d| agent_open::label_matches(label, d))
+        };
+        rows.iter()
+            .filter(|r| r.running())
+            .find(names)
+            .or_else(|| rows.iter().find(names))
+            .map(|r| r.id.clone())
+    }
+
+    /// A second click on the viewed worker's row: walk the tab home. A walk
+    /// still on its way into that worker gives way first.
+    fn walk_home(&mut self, ctx: &egui::Context, tab: TabId) {
+        if let Some(job) = &self.attach
+            && job.tab == tab
+            && matches!(job.driver.goal, agent_open::Goal::Worker { .. })
+        {
+            let old = self.attach.take().expect("checked above");
+            if old.nudge.is_narrow()
+                && let Some(session) = self.rt.get(&tab).and_then(|rt| rt.session.as_ref())
+            {
+                session.nudge_width(false);
+            }
+            self.release_picture(tab);
+            self.sync_strip_asks();
+        }
+        if self.ws.active != Some(tab) {
+            self.apply(ctx, Action::Select(tab));
+        }
+        self.back_to_main(ctx, tab);
+    }
+
+    /// The Giverny tab running conversation `sid`, when it is live.
+    fn live_holder(&self, sid: &str) -> Option<TabId> {
+        let dirs: Vec<PathBuf> = self
+            .claude
+            .profiles
+            .iter()
+            .map(|p| p.config_dir.clone())
+            .collect();
+        if !giverny_claude::registry::session_is_live(dirs, sid) {
+            return None;
+        }
+        self.ws
+            .tabs
+            .iter()
+            .find(|t| t.claude_session.as_deref() == Some(sid))
+            .map(|t| t.id)
+    }
+
+    /// Whether `tab` has a live terminal to type into.
+    fn tab_is_live(&self, tab: TabId) -> bool {
+        self.rt.get(&tab).is_some_and(|rt| rt.session.is_some())
+            && self.ws.tab(tab).is_some_and(|t| !t.exited)
+    }
+
+    /// The Agent call's description for a worker of `parent` — what Claude
+    /// Code's list shows, and what an attach finds it by.
+    fn worker_description(
+        &self,
+        parent: TabId,
+        agent_id: &str,
+        click: &management_panel::RowClick,
+    ) -> Option<String> {
+        self.claude
+            .agents
+            .tracker(parent)
+            .and_then(|t| t.get(agent_id))
+            .and_then(|r| r.description.clone())
+            .or_else(|| {
+                let dir = click.transcript.as_deref()?.parent()?;
+                giverny_claude::subagents::read_meta(dir, agent_id).description
+            })
+            .filter(|d| !d.trim().is_empty())
+    }
+
+    /// Attach a running worker: show its parent tab and start
+    /// typing Claude Code's key path to the worker's view into it. False
+    /// when it cannot start — no live terminal in the tab, or no description
+    /// to find the worker by in Claude Code's list.
+    fn start_attach(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        agent_id: &str,
+        click: &management_panel::RowClick,
+    ) -> bool {
+        if !self.tab_is_live(parent) {
+            return false;
+        }
+        // The Agent call's description is what Claude Code's list shows.
+        let Some(description) = self.worker_description(parent, agent_id, click) else {
+            tracing::info!("management panel: no description for {agent_id}");
+            return false;
+        };
+        // What the strip may call the worker when its rows are not tagged
+        // with ids (an older relay): the found row is checked against the
+        // view's prompt rule, which names the description. With the management
+        // panel on, the relay tags each row with its agent id while the
+        // walk asks for the strip, and the id finds it.
+        let aliases: Vec<String> = self
+            .claude
+            .agents
+            .tracker(parent)
+            .and_then(|t| t.get(agent_id))
+            .and_then(|r| r.activity.clone())
+            .into_iter()
+            .collect();
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        self.reveal_terminal();
+        // A hover's early ask is the click's now: the strip it asked for
+        // is the one the walk waits on, and the picture it held stays held.
+        // Its narrow pty is left narrow; the walk's own
+        // nudge keeps it so until the strip is drawn.
+        if let Some(pre) = self.prearm.take() {
+            tracing::debug!(
+                "hover open: clicked +{:?} after arming, strip drawn {:?}, letting go {:?}",
+                pre.started.elapsed(),
+                pre.arm.drawn,
+                pre.arm.letting_go()
+            );
+            if pre.tab != parent
+                && pre.arm.is_narrow()
+                && let Some(session) = self.rt.get(&pre.tab).and_then(|rt| rt.session.as_ref())
+            {
+                session.nudge_width(false);
+            }
+        }
+        // A walk under way gives way; its pty width goes back first.
+        if let Some(old) = self.attach.take()
+            && old.nudge.is_narrow()
+            && let Some(session) = self.rt.get(&old.tab).and_then(|rt| rt.session.as_ref())
+        {
+            session.nudge_width(false);
+        }
+        self.attach = Some(AttachJob::new(
+            parent,
+            title.to_string(),
+            agent_open::Walk::open(description, aliases, Instant::now()).by_id(agent_id),
+        ));
+        // Asked now, not next frame: every frame of the relay's tick counts.
+        self.sync_strip_asks();
+        // And nudged now, for the same reason.
+        if self.cfg.claude.management_panel
+            && let Some(job) = &mut self.attach
+            && let Some(session) = self.rt.get(&parent).and_then(|rt| rt.session.as_ref())
+            && job.nudge.tick(Instant::now(), true) == Some(agent_open::Width::Narrow)
+        {
+            tracing::debug!("walk +{:?}: nudge narrow", job.started.elapsed());
+            session.nudge_width(true);
+        }
+        ctx.request_repaint();
+        true
+    }
+
+    /// Esc or the back button in a tab on a worker's view:
+    /// walk it back to the manager's view. A walk already under way
+    /// finishes first.
+    fn back_to_main(&mut self, ctx: &egui::Context, tab: TabId) {
+        if self.attach.is_some() || !self.tab_is_live(tab) {
+            return;
+        }
+        self.attach = Some(AttachJob::new(
+            tab,
+            "Back to the manager".into(),
+            agent_open::Walk::home(Instant::now()),
+        ));
+        ctx.request_repaint();
+    }
+
+    /// Keep the relay's asks to show Claude Code's agent strip
+    /// in step with what needs it: a walk on its way into a worker's view,
+    /// until it is done. Everything else leaves the strip to the management
+    /// panel — a Running worker opens straight into its view,
+    /// and the walk brings the relay's run forward itself (`Nudge`).
+    fn sync_strip_asks(&mut self) {
+        let mut want: HashSet<TabId> = HashSet::new();
+        if !self.cfg.claude.management_panel {
+            // The relay hides nothing: there is nothing to ask for.
+        } else {
+            if let Some(job) = &self.attach
+                && job.wants_strip()
+            {
+                want.insert(job.tab);
+            }
+            if let Some(pre) = &self.prearm
+                && pre.arm.wants_strip()
+            {
+                want.insert(pre.tab);
+            }
+        }
+        let spool = self.paths.hook_spool();
+        let now = Instant::now();
+        for &tab in &want {
+            let due = self
+                .strip_asks
+                .get(&tab)
+                .is_none_or(|at| now.duration_since(*at) >= STRIP_ASK_RENEW);
+            if due {
+                match giverny_claude::hooks::show_strip(&spool, &tab_env_id(tab), true) {
+                    Ok(()) => {
+                        self.strip_asks.insert(tab, now);
+                    }
+                    Err(err) => {
+                        tracing::warn!("management panel: could not ask for the strip: {err}")
+                    }
+                }
+            }
+        }
+        let done: Vec<TabId> = self
+            .strip_asks
+            .keys()
+            .filter(|t| !want.contains(t))
+            .copied()
+            .collect();
+        for tab in done {
+            self.strip_asks.remove(&tab);
+            if let Err(err) = giverny_claude::hooks::show_strip(&spool, &tab_env_id(tab), false) {
+                tracing::warn!("management panel: could not hide the strip again: {err}");
+            }
+        }
+    }
+
+    /// One frame of an attach: read the parent's screen, maybe type a key;
+    /// once the walk is done, wait for the view's final screen before the
+    /// tab's picture is let go.
+    fn process_attach(&mut self, ctx: &egui::Context) {
+        use agent_open::Tick;
+        let pane_on = self.cfg.claude.management_panel;
+        let Some(job) = &mut self.attach else {
+            return;
+        };
+        // Switched away: stop typing into a tab nobody is looking at.
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        let (Some(session), true) = (session, self.ws.active == Some(job.tab)) else {
+            if let Some(session) = session
+                && job.nudge.is_narrow()
+            {
+                session.nudge_width(false);
+            }
+            self.attach = None;
+            return;
+        };
+        let now = Instant::now();
+        let screen = session.screen_text();
+        // The relay's answer still to come: the strip, on the way in; the
+        // strip's rows gone again, once the focus is off them. The way in
+        // keeps the pty narrow until Enter is on the worker's row
+        // (`ask_held`): Claude Code's next run is 300 ms after the width
+        // comes back, so it comes just after the walk lets the strip go,
+        // and answers that with no second nudge.
+        let to_worker = matches!(job.driver.goal, agent_open::Goal::Worker { .. });
+        let waiting = pane_on
+            && to_worker
+            && match &job.settle {
+                None if !job.hide_asked && job.driver.entering() => true,
+                _ => job.hide_asked && !agent_open::strip_agents(&screen).is_empty(),
+            };
+        let at = job.started.elapsed();
+        match job.nudge.tick(now, waiting) {
+            Some(agent_open::Width::Narrow) => {
+                tracing::debug!("walk +{at:?}: nudge narrow");
+                session.nudge_width(true)
+            }
+            Some(agent_open::Width::Restore) => {
+                tracing::debug!("walk +{at:?}: nudge restore");
+                session.nudge_width(false)
+            }
+            None => {}
+        }
+        let mut finished = false;
+        if let Some(settle) = &mut job.settle {
+            // The view is shown with the strip's rows still under it (not
+            // drawn, `row_marks`), once the relay's run that takes them
+            // away is on its way: the pty's width back, and a run due
+            // after the ask was withdrawn. Nothing has to stay to see it
+            // through.
+            finished = !job.nudge.is_narrow()
+                && (!waiting || job.nudge.answer_due())
+                && settle.done(now, &screen);
+        } else {
+            let undimmed = session.screen_text_undimmed();
+            let look = agent_open::Look {
+                screen: &screen,
+                undimmed: &undimmed,
+                cursor: session.cursor_row(),
+            };
+            let tick = job.driver.tick(now, look);
+            let phase = job.driver.phase_name();
+            if phase != job.phase {
+                tracing::debug!("walk +{at:?}: {} -> {phase}", job.phase);
+                job.phase = phase;
+                job.times.push((phase, at));
+            }
+            // The focus is off the strip: the relay may hide its rows now
+            // (`sync_strip_asks`, this frame), while the walk finishes.
+            if to_worker && !job.hide_asked && !job.driver.wants_strip() {
+                tracing::debug!("walk +{at:?}: strip may go");
+                job.hide_asked = true;
+                job.nudge.ask(now);
+            }
+            match tick {
+                Tick::Send(key) | Tick::Repeat(key, _) => {
+                    let n = match tick {
+                        Tick::Repeat(_, n) => n,
+                        _ => 1,
+                    };
+                    tracing::debug!("walk +{at:?}: key {key:?} x{n}");
+                    job.keys += usize::from(n);
+                    let mode = session.mode();
+                    let bytes = agent_open::keystroke_bytes(key, |k, m| {
+                        giverny_term::input::encode_key(k, m, mode)
+                    });
+                    session.write(bytes.repeat(usize::from(n)));
+                }
+                Tick::Wait => {}
+                Tick::Done => {
+                    tracing::debug!("walk +{at:?}: done, settling");
+                    job.times.push(("settle", at));
+                    job.settle = Some(agent_open::Settle::new(&job.driver.goal, now));
+                    if !job.hide_asked {
+                        job.hide_asked = true;
+                        job.nudge.ask(now);
+                    }
+                }
+                Tick::Stuck(why) => {
+                    tracing::info!("management panel: walk stopped: {why:?}");
+                    if job.nudge.is_narrow() {
+                        session.nudge_width(false);
+                    }
+                    let text = match job.driver.goal {
+                        agent_open::Goal::Main => format!(
+                            "Giverny could not walk this tab back to the manager's view \
+                             ({why:?}). Press ↓ at the prompt until the agent list under it is \
+                             selected, then Enter on `main`."
+                        ),
+                        agent_open::Goal::Worker { .. } => why.explain(job.driver.target()),
+                    };
+                    let title = job.title.clone();
+                    let tab = job.tab;
+                    self.attach = None;
+                    self.settings = None;
+                    self.keys_overlay = None;
+                    self.brief = Some(worker_page::WorkerPage::text(tab, title, text));
+                    self.release_picture(tab);
+                    return;
+                }
+            }
+        }
+        if finished {
+            let tab = job.tab;
+            tracing::info!(
+                "management panel: walk to {} shown after {:?} ({})",
+                job.driver.target(),
+                job.started.elapsed(),
+                job.timing()
+            );
+            self.attach = None;
+            self.release_picture(tab);
+        }
+        if self.attach.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    /// One frame of the hover pre-arm: while the pointer
+    /// rests on a Running row of the active tab's pane, on a screen that
+    /// has held still, ask for the strip and nudge now, holding the tab's
+    /// picture, so a click finds the strip already drawn. Off the row, the
+    /// ask is withdrawn and the picture let go once the screen is back to
+    /// the one it held; a click hands both to the walk (`start_attach`).
+    fn process_hover(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let hover = self.hover.take();
+        let active = self.ws.active;
+        // The Running row under the pointer, if its click would walk into
+        // the worker's view: not the worker already on view (that click
+        // goes home), not with a walk or an overlay up.
+        let free =
+            self.cfg.claude.management_panel && self.attach.is_none() && self.brief.is_none();
+        let on_pane = hover
+            .as_ref()
+            .filter(|(tab, _)| Some(*tab) == active && self.tab_is_live(*tab))
+            .map(|(tab, row)| (*tab, row.clone()));
+        let row_id = on_pane.as_ref().filter(|_| free).and_then(|(tab, row)| {
+            let row = row.as_ref()?;
+            let id = row.agent_id.as_deref()?;
+            (row.stage == giverny_claude::feed::Stage::Running
+                && matches!(
+                    agent_open::offer(row),
+                    agent_open::Offer::OpenInClaude { .. }
+                )
+                && self.viewed_worker(*tab).as_deref() != Some(id))
+            .then(|| id.to_string())
+        });
+        // The watch lasts while the pointer is on the pane, a walk and all:
+        // a row clicked and still under the pointer is not armed again.
+        match (&on_pane, &self.hover_watch) {
+            (None, _) => self.hover_watch = None,
+            (Some((tab, _)), Some((t, _))) if t == tab => {}
+            (Some((tab, _)), _) => self.hover_watch = Some((*tab, hover_open::Watch::default())),
+        }
+
+        // Since when the active tab's screen has held still: read every
+        // frame, pointer or not, so a rest on a row can arm at once. A walk
+        // or a pre-arm changes the screen itself; the count starts after.
+        let tracked = active.filter(|_| {
+            self.cfg.claude.management_panel && self.attach.is_none() && self.prearm.is_none()
+        });
+        let session = tracked.and_then(|t| self.rt.get(&t)?.session.as_ref());
+        let (Some(tab), Some(session)) = (tracked, session) else {
+            self.screen_still = None;
+            return self.tick_prearm(ctx, now, row_id, on_pane);
+        };
+        let screen = session.screen_text();
+        let key = hover_open::screen_key(&screen);
+        let still = match &mut self.screen_still {
+            Some((t, still)) if *t == tab => still.look(now, key),
+            _ => {
+                let still = hover_open::Still::new(now, key);
+                let since = still.look_since();
+                self.screen_still = Some((tab, still));
+                since
+            }
+        };
+
+        // Arm.
+        if let Some((t, watch)) = &mut self.hover_watch
+            && *t == tab
+            && !watch.spent()
+        {
+            // A blinking cursor would stop mid-blink under a held picture.
+            let blinking = self
+                .rt
+                .get(&tab)
+                .is_some_and(|rt| rt.view.cursor_blinking(ctx.input(|i| i.time)));
+            let still = still.filter(|_| !blinking);
+            if watch.ready(now, still, row_id.as_deref()) {
+                watch.spend();
+                if let Some(arm) = hover_open::Prearm::new(now, &screen) {
+                    tracing::debug!(
+                        "hover open: armed on {:?}, screen still {:?}",
+                        row_id,
+                        still.map(|s| now - s)
+                    );
+                    self.prearm = Some(PrearmJob {
+                        tab,
+                        arm,
+                        started: now,
+                    });
+                }
+            } else if let Some(wait) = watch.wake(now, still) {
+                ctx.request_repaint_after(wait.max(Duration::from_millis(16)));
+            }
+        }
+        self.tick_prearm(ctx, now, row_id, on_pane);
+    }
+
+    /// One frame of a pre-arm under way (`process_hover`).
+    fn tick_prearm(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        row_id: Option<String>,
+        on_pane: Option<(TabId, Option<management_panel::RowClick>)>,
+    ) {
+        let Some(pre) = &mut self.prearm else {
+            return;
+        };
+        let session = self.rt.get(&pre.tab).and_then(|rt| rt.session.as_ref());
+        let Some(session) = session else {
+            self.prearm = None;
+            return;
+        };
+        // The pointer left the tab's Running rows, or something else took
+        // the tab: let go.
+        let still_on = row_id.is_some() && on_pane.as_ref().is_some_and(|(t, _)| *t == pre.tab);
+        if !still_on {
+            pre.arm.leave(now, hover_open::LetGo::Left);
+        }
+        let screen = session.screen_text();
+        let at = pre.started.elapsed();
+        let (width, over) = pre.arm.tick(now, &screen);
+        match width {
+            Some(agent_open::Width::Narrow) => {
+                tracing::debug!("hover open +{at:?}: nudge narrow");
+                session.nudge_width(true);
+            }
+            Some(agent_open::Width::Restore) => {
+                tracing::debug!("hover open +{at:?}: nudge restore");
+                session.nudge_width(false);
+            }
+            None => {}
+        }
+        if over {
+            if pre.arm.is_narrow() {
+                session.nudge_width(false);
+            }
+            tracing::debug!(
+                "hover open +{at:?}: let go ({:?}), strip drawn {:?}",
+                pre.arm.letting_go(),
+                pre.arm.drawn
+            );
+            let tab = pre.tab;
+            self.prearm = None;
+            self.release_picture(tab);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    /// A walk in `tab` is over: its screen is read afresh this frame, so the
+    /// pane, the header and the picture all change together.
+    fn release_picture(&mut self, tab: TabId) {
+        if let Some(rt) = self.rt.get_mut(&tab) {
+            rt.worker_checked = None;
+        }
+    }
+
+    /// Carry out a management-panel plan: the worker page in `parent`, or
+    /// (a Running row with only an `open` command) a new tab.
+    fn carry_out_open(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        plan: agent_open::Plan,
+        click: &management_panel::RowClick,
+    ) {
+        use agent_open::{Body, Plan};
+        use worker_page::WorkerPage;
+        let page = match plan {
+            Plan::Watch {
+                title,
+                transcript,
+                live,
+            } => WorkerPage::transcript(parent, title, transcript, live),
+            Plan::Show { title, body } => match body {
+                // A brief is what the worker will be given: drawn as its
+                // prompt, as Claude Code draws one.
+                Body::File(path) => {
+                    let text = agent_open::read_brief(&path);
+                    let rows = giverny_claude::transcript::prompt_rows(&text, None);
+                    WorkerPage::rows(parent, title, rows)
+                }
+                Body::Unbriefed { prompt, hint } => {
+                    use giverny_claude::transcript::{Row, Tone, prompt_rows};
+                    let mut rows = prompt_rows(&prompt, None);
+                    let mut hint = Row::one(Tone::Dim, format!("  {hint}"));
+                    hint.starts = true;
+                    rows.push(hint);
+                    WorkerPage::rows(parent, title, rows)
+                }
+                Body::Text(text) => WorkerPage::text(parent, title, text),
+            },
+            Plan::Run { title, command } => {
+                // The same guard a resume has: two claudes on one
+                // conversation interleave its transcript.
+                if let Some(sid) = agent_open::resumed_session(&command) {
+                    let dirs: Vec<PathBuf> = self
+                        .claude
+                        .profiles
+                        .iter()
+                        .map(|p| p.config_dir.clone())
+                        .collect();
+                    if giverny_claude::registry::session_is_live(dirs, &sid) {
+                        if let Some(id) = self.live_holder(&sid) {
+                            self.apply(ctx, Action::Select(id));
+                            return;
+                        }
+                        WorkerPage::text(
+                            parent,
+                            title,
+                            format!(
+                                "This worker's conversation is already running outside \
+                                 Giverny ({sid}). Resuming it here as well would put two \
+                                 claudes on one transcript, so nothing was opened.\n\n\
+                                 The row's open command:\n  {command}"
+                            ),
+                        )
+                    } else {
+                        self.open_worker_tab(ctx, parent, &title, command);
+                        return;
+                    }
+                } else {
+                    self.open_worker_tab(ctx, parent, &title, command);
+                    return;
+                }
+            }
+        };
+        let name = self.task_name(parent, click);
+        self.settings = None;
+        self.keys_overlay = None;
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        // A worker whose turn ended, or a Next up row: what is typed in the
+        // page's box goes to the manager.
+        let ask = agent_open::Ask::of(click, &name);
+        self.brief = Some(page.of_row(click.clone(), name).with_input(ask));
+    }
+
+    /// A line typed in `tab`'s worker page goes to the tab's manager: put
+    /// at its Claude Code's prompt, as typed there, and submitted
+    /// (`agent_open::Forward`). Only the user's own line is ever sent.
+    fn forward_line(&mut self, ctx: &egui::Context, tab: TabId, text: String) {
+        use worker_page::Sending;
+        let live = self.tab_is_live(tab);
+        let busy = self.forward.is_some();
+        let Some(page) = self.brief.as_mut().filter(|p| p.tab == tab) else {
+            return;
+        };
+        let Some(ask) = page.ask().cloned() else {
+            return;
+        };
+        if busy || !live {
+            let why = if busy {
+                "Not sent: another line is still on its way to a manager. Press Enter again in                  a moment."
+            } else {
+                "Not sent: this tab's manager has no live terminal to type into."
+            };
+            page.set_sending(Sending::Refused(why.into()), Some(&text));
+            return;
+        }
+        let line = ask.line(&text);
+        tracing::info!("management panel: forwarding to the manager: {line}");
+        self.forward = Some(ForwardJob {
+            tab,
+            text,
+            driver: agent_open::Forward::new(line, Instant::now()),
+        });
+        ctx.request_repaint();
+    }
+
+    /// One frame of a forward: read the manager's screen, maybe type into
+    /// it. A walk in that tab goes first.
+    fn process_forward(&mut self, ctx: &egui::Context) {
+        use agent_open::Put;
+        use worker_page::Sending;
+        let Some(job) = &mut self.forward else {
+            return;
+        };
+        if self.attach.as_ref().is_some_and(|a| a.tab == job.tab) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        let put = match session {
+            Some(session) => {
+                let screen = session.screen_text();
+                let undimmed = session.screen_text_undimmed();
+                let look = agent_open::Look {
+                    screen: &screen,
+                    undimmed: &undimmed,
+                    cursor: session.cursor_row(),
+                };
+                job.driver.tick(Instant::now(), look)
+            }
+            None => Put::Stuck(agent_open::Stuck::NoPrompt),
+        };
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        match put {
+            Put::Key(key) | Put::Keys(key, _) => {
+                let n = match put {
+                    Put::Keys(_, n) => n,
+                    _ => 1,
+                };
+                if let Some(session) = session {
+                    let mode = session.mode();
+                    let bytes = agent_open::keystroke_bytes(key, |k, m| {
+                        giverny_term::input::encode_key(k, m, mode)
+                    });
+                    session.write(bytes.repeat(usize::from(n)));
+                }
+            }
+            Put::Text(text) => {
+                if let Some(session) = session {
+                    // The user's own words, typed by them in the page.
+                    session.note_user_input();
+                    session.write(text.into_bytes());
+                }
+            }
+            Put::Wait => {}
+            Put::Done | Put::Stuck(_) => {
+                let job = self.forward.take().expect("checked above");
+                let page = self
+                    .brief
+                    .as_mut()
+                    .filter(|p| p.tab == job.tab && p.ask().is_some());
+                let (Some(page), done) = (page, put == Put::Done) else {
+                    return;
+                };
+                let ask = page.ask().cloned().expect("filtered");
+                if done {
+                    tracing::info!("management panel: the manager has the line");
+                    let what = match &ask {
+                        agent_open::Ask::Revive { .. } => {
+                            "Sent to the manager, to pass on to this worker. The tab goes to                              the worker's view once it runs again."
+                        }
+                        agent_open::Ask::Start { .. } => {
+                            "Sent to the manager, to start this task with it. The tab goes to                              the worker's view once it runs."
+                        }
+                    };
+                    page.set_sending(Sending::Sent(what.into()), None);
+                    if let Some(row) = page.row.clone() {
+                        self.awaiting = Some(Awaiting {
+                            tab: job.tab,
+                            ask,
+                            row,
+                        });
+                    }
+                } else if let Put::Stuck(why) = put {
+                    tracing::info!("management panel: forward stopped: {why:?}");
+                    let why = why.explain("main");
+                    page.set_sending(Sending::Refused(why), Some(&job.text));
+                }
+                ctx.request_repaint();
+                return;
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// One frame of a sent line's wait: once the worker it asked for runs
+    /// (woken, or the Next up task's started), the page gives way and the
+    /// tab walks into that worker's view, as a click on its Running row
+    /// would. Only while the page is still up, on the tab in view: a page
+    /// left, or another tab, is not walked away from under the user.
+    fn process_awaiting(&mut self, ctx: &egui::Context) {
+        let Some(a) = &self.awaiting else {
+            return;
+        };
+        let still = self
+            .brief
+            .as_ref()
+            .and_then(|p| p.row.as_ref().filter(|_| p.tab == a.tab))
+            .is_some_and(|r| r.same_row(&a.row));
+        if !still {
+            self.awaiting = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        if self.ws.active != Some(a.tab) || self.attach.is_some() || self.forward.is_some() {
+            return;
+        }
+        let tab = a.tab;
+        let row = match &a.ask {
+            agent_open::Ask::Revive { agent_id, .. } => {
+                let mut row = a.row.clone();
+                row.agent_id = Some(agent_id.clone());
+                Some(row)
+            }
+            agent_open::Ask::Start { task } => self
+                .agent_views
+                .row_keyed(tab, task)
+                .filter(|r| r.stage == giverny_claude::feed::Stage::Running && !r.finished)
+                .cloned(),
+        };
+        let Some(mut row) = row else {
+            return;
+        };
+        let Some(id) = row.agent_id.clone().filter(|i| !i.is_empty()) else {
+            return;
+        };
+        let running = self
+            .claude
+            .agents
+            .tracker(tab)
+            .and_then(|t| t.get(&id))
+            .is_some_and(|r| r.running());
+        if !running {
+            return;
+        }
+        tracing::info!("management panel: {id} runs again: into its view");
+        self.awaiting = None;
+        row.stage = giverny_claude::feed::Stage::Running;
+        row.finished = false;
+        row.asleep = false;
+        self.close_page(tab);
+        let title = agent_open::title_of(&row);
+        if !self.start_attach(ctx, tab, &title, &id, &row) {
+            let plan = agent_open::plan(&row);
+            self.carry_out_open(ctx, tab, plan, &row);
+        }
+    }
+
+    /// The task's name for `click`'s row, as the header over a worker gives
+    /// it: its feed key, or its worker's description up to
+    /// the first `:`.
+    fn task_name(&self, parent: TabId, click: &management_panel::RowClick) -> String {
+        let mut line_click = click.clone();
+        if line_click.name.trim().is_empty()
+            && let Some(id) = click.agent_id.as_deref()
+            && let Some(d) = self.worker_description(parent, id, click)
+        {
+            line_click.name = d;
+        }
+        view_header::name_of(&line_click, "", &agent_open::title_of(click))
+    }
+
+    /// A new tab beside `parent` — its category, its directory — titled for
+    /// a worker, that runs `command` once its shell is up.
+    fn open_worker_tab(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        command: String,
+    ) -> TabId {
+        let cwd = self.ws.tab(parent).and_then(|t| t.cwd.clone());
+        let cat = match self.ws.tab(parent) {
+            Some(t) => t.category,
+            None => category_for_agent(&mut self.ws, cwd.as_deref()),
+        };
+        let id = self.new_tab(cat);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.cwd = cwd.or_else(dirs::home_dir);
+            tab.custom_title = Some(title.to_string());
+        }
+        self.worker_tabs.insert(id);
+        self.spawn_session(ctx, id, None);
+        // The deferred injection the other tab-opening paths use: give the
+        // shell time to be ready before typing into it.
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(900),
+            id,
+            Inject::Raw(format!("{command}\r").into_bytes()),
+        ));
+        self.apply(ctx, Action::Select(id));
+        id
+    }
+
     /// Picking a tab means "show me that tab": the settings screen and the
     /// key list take the terminal's place, so a tab clicked in the rail while
     /// one of them is open used to look like a click that did nothing — the
     /// only way back was the button that opened it.
+    ///
+    /// A worker page is the tab's own, as a worker's view in its Claude
+    /// Code is, and stays.
     fn reveal_terminal(&mut self) {
         self.settings = None;
         self.keys_overlay = None;
@@ -3802,8 +5611,8 @@ impl App {
 
     /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
     /// and only now does it count as seen. Any keyboard walk ends here, so
-    /// the tab it is on may start: Ctrl coming up, and every other way of
-    /// choosing a tab, which starts it at once as ever.
+    /// the tab it is on may start: Ctrl coming up, and every
+    /// other way of choosing a tab, which starts it at once as ever.
     fn end_switch(&mut self) {
         self.cycling = false;
         self.walk_preview = None;
@@ -3819,6 +5628,9 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        // A worker page takes the keyboard while its tab shows it: Esc and
+        // the scroll keys, and nothing typed reaches the shell underneath.
+        actions.extend(worker_page::keys(self, ctx));
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
@@ -3924,9 +5736,13 @@ impl eframe::App for App {
                 self.capture = None;
             }
         }
-        self.drain_events();
+        let ended = self.drain_events();
 
         let ctx = ui.ctx().clone();
+        for id in ended {
+            self.apply(&ctx, Action::CloseTab(id));
+            self.state_dirty = true;
+        }
         // A close asked for through the window and one asked for with a
         // signal end the same way, but only the first arrives as an event.
         // Both are written down here: the state file's clean-shutdown marker
@@ -3947,6 +5763,11 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.deliver_pasted_images();
         self.process_pending(&ctx);
+        self.process_attach(&ctx);
+        self.process_forward(&ctx);
+        self.process_awaiting(&ctx);
+        self.process_hover(&ctx);
+        self.sync_strip_asks();
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
@@ -3963,8 +5784,17 @@ impl eframe::App for App {
             .ws
             .tabs
             .iter()
-            .map(|t| (t.id, t.display_title(&self.cfg.titles)))
+            .map(|t| (t.id, self.shown_title(t)))
             .collect();
+        // The sessions whose place the rail titles their tab after,
+        // looked up by the next scan; none while that is off.
+        self.claude.place_sessions = self.cfg.rail.place_titles.then(|| {
+            self.ws
+                .tabs
+                .iter()
+                .filter_map(|t| t.claude_session.clone())
+                .collect()
+        });
         // Typing in a tab counts as attending to it: declining a permission
         // prompt (Escape) emits no hook, so nothing else would clear the flag.
         for (&id, rt) in &self.rt {
@@ -3983,7 +5813,25 @@ impl eframe::App for App {
             }
         }
 
-        let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        // A tab opened from BACKGROUND shows its job from the start, before
+        // the process scan sees its `claude attach`.
+        let opened: HashMap<TabId, String> = self
+            .ws
+            .tabs
+            .iter()
+            .filter_map(|t| Some((t.id, t.bg_job.clone()?)))
+            .collect();
+        let effects = self
+            .claude
+            .tick(&shell_pids, self.ws.active, &titles, &opened);
+        let claude = &self.claude;
+        self.job_ends
+            .poll(|id| claude.job(id).is_some_and(|j| j.worth_watching()));
+        // What each manager tab's rows ask of its manager, for the plugin's
+        // hook to tell it.
+        if self.cfg.claude.management_panel {
+            self.agent_views.keep_chores(self.claude.agents.all_shown());
+        }
         for msg in effects.codex {
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(&msg) else {
                 continue;
@@ -4041,6 +5889,12 @@ impl eframe::App for App {
         self.watch_for_limits();
         self.note_unseen_turns();
         for (id, session, config_dir) in effects.captured {
+            // The `SessionEnd` of a Claude a stop ended: the
+            // tab keeps the conversation it resumes, as a restart's tab does.
+            if session.is_none() && !self.rt.contains_key(&id) {
+                self.claude.tabs.remove(&id);
+                continue;
+            }
             if let Some(tab) = self.ws.tab_mut(id) {
                 if session.is_some() {
                     tab.agent_session = None;
@@ -4096,6 +5950,11 @@ impl eframe::App for App {
                     titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
                 });
         }
+
+        // The use figures this frame draws, read before the rail and the
+        // pane so both show the same reading: the newest, since the status
+        // line no longer shows one to follow.
+        self.use_now = sessions_load::latest(&ctx);
 
         egui::Panel::left("rail")
             .resizable(true)
@@ -4175,7 +6034,7 @@ impl eframe::App for App {
                 let into = self
                     .ws
                     .tab(target)
-                    .map(|t| t.display_title(&self.cfg.titles))
+                    .map(|t| self.shown_title(t))
                     .unwrap_or_default();
                 let what = match hovering {
                     0 => "drop into".to_string(),
@@ -4209,11 +6068,17 @@ impl eframe::App for App {
             // keyboard walk is held over it: the walk may only be passing
             // through, and the tab it stops on starts when Ctrl comes up.
             let walking = self.walking();
-            if walk::starts_now(
-                self.rt.contains_key(&active),
-                self.ws.tab(active).is_some_and(|t| t.exited),
-                walking,
-            ) {
+            // A tab stopped on screen is held only until another is chosen.
+            if self.held.is_some_and(|h| h != active) {
+                self.held = None;
+            }
+            if self.held != Some(active)
+                && walk::starts_now(
+                    self.rt.contains_key(&active),
+                    self.ws.tab(active).is_some_and(|t| t.exited),
+                    walking,
+                )
+            {
                 let preseed = state::load_snapshot(&self.paths, active)
                     .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
@@ -4223,28 +6088,187 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
+            // What the tab shows: read first, so the pane, the header and
+            // the picture below agree in every frame.
+            let now = Instant::now();
+            let job = self.attach.as_ref().filter(|j| j.tab == active);
+            let holding = job.is_some_and(|j| j.holds(now))
+                || self.prearm.as_ref().is_some_and(|p| p.tab == active);
             if let Some(rt) = self.rt.get_mut(&active) {
-                if let Some(session) = &mut rt.session {
+                update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
+                // Held: the picture stays the view it was, and
+                // so does everything drawn about it.
+                if !holding {
+                    rt.shown_viewed = rt.viewed.clone();
+                }
+                if rt.shown_viewed.is_none() {
+                    rt.header_closed = None;
+                }
+            }
+            // The worker whose view the tab shows, or is on its way to: its
+            // pane row is marked, from the click on.
+            // The worker whose view is in the picture: what the header over
+            // the terminal is about, unless its `×` closed it, and who the
+            // tab's status line names.
+            let shown_label = self.rt.get(&active).and_then(|rt| rt.shown_viewed.clone());
+            let header_closed = self.rt.get(&active).is_some_and(|rt| {
+                rt.header_closed.is_some() && rt.header_closed == rt.shown_viewed
+            });
+            let viewed = self.viewed_worker(active);
+            let shown_id = shown_label
+                .as_deref()
+                .and_then(|l| self.worker_id(active, l));
+            // A worker page up in the tab is the worker it shows, as a
+            // worker's view in its Claude Code is.
+            let page_row = self
+                .brief
+                .as_ref()
+                .filter(|p| p.tab == active)
+                .and_then(|p| p.row.clone());
+            let on_view = match &page_row {
+                Some(row) => Some(management_panel::Shown::Row(row)),
+                None => viewed.as_deref().map(management_panel::Shown::Worker),
+            };
+            let on_header = match &page_row {
+                Some(row) => Some(management_panel::Shown::Row(row)),
+                None => shown_id.as_deref().map(management_panel::Shown::Worker),
+            };
+            // The management panel takes the bottom of the terminal's area.
+            let mut header = None;
+            let mut shown_row = None;
+            if self.cfg.claude.management_panel {
+                let (click, line) = management_panel::show(
+                    &mut self.agent_views,
+                    active,
+                    self.use_now.as_deref(),
+                    // Only once the tab's session is up.
+                    self.claude.agents.shown(active),
+                    on_view,
+                    on_header,
+                    management_panel::limit_for(
+                        &self.claude,
+                        active,
+                        self.limited.get(&active).map(|w| w.reopens),
+                        jiff::Timestamp::now(),
+                    ),
+                    &self.cfg.management_panel,
+                    &self.chrome,
+                    &mut self.shared,
+                    ui,
+                );
+                if let Some(click) = click {
+                    actions.push(Action::AgentRowClicked(active, Box::new(click)));
+                }
+                self.hover = self.agent_views.take_hover(active).map(|row| (active, row));
+                shown_row = line.clone();
+                header = line.filter(|_| !header_closed);
+            }
+            let shown_agent = shown_id.as_deref().and_then(|id| {
+                self.claude
+                    .agents
+                    .tracker(active)?
+                    .rows()
+                    .iter()
+                    .find(|r| r.id == id)
+            });
+            let name = agent_open::viewed(
+                shown_label.as_deref(),
+                shown_row.as_ref().map(|l| &l.click),
+                shown_agent,
+            );
+            if let Some(rt) = self.rt.get_mut(&active)
+                && rt.viewing_name != name
+            {
+                // Told to the status line, which Claude Code reruns every
+                // second (`STATUSLINE_REFRESH_S`): it follows within one.
+                let spool = self.paths.hook_spool();
+                match giverny_claude::hooks::set_viewing(&spool, &tab_env_id(active), name.as_ref())
+                {
+                    Ok(()) => {
+                        tracing::debug!("tab {active:?}: status line names {name:?}");
+                        rt.viewing_name = name;
+                    }
+                    Err(err) => tracing::debug!("tab {active:?}: viewing: {err}"),
+                }
+            }
+
+            if let Some(rt) = self.rt.get_mut(&active) {
+                // With the management panel on, Giverny stands in for Claude
+                // Code's strip: its `main` row is not drawn, and a worker's
+                // view gets a way back.
+                rt.view.marks_for = self
+                    .cfg
+                    .claude
+                    .management_panel
+                    .then_some(agent_open::row_marks as fn(&str) -> _);
+                rt.view.button_labels = BACK_LABELS;
+                rt.view.button_fill = self.chrome.accent;
+                rt.view.hold = holding;
+                if let Some(page) = self.brief.as_mut().filter(|p| p.tab == active) {
+                    // The tab shows a worker page in its terminal's place,
+                    // as it shows a worker's view: the same
+                    // grid, header and button, and nothing reaches the
+                    // terminal under it.
+                    let drawn = page.show(ui, &mut self.shared, BACK_LABELS, self.chrome.accent);
+                    grid_rect = Some(drawn.rect);
+                    if drawn.back {
+                        actions.push(Action::ClosePage(active));
+                    }
+                    if page.header_closed {
+                        page.header_h = 0.0;
+                    } else {
+                        let head = match &shown_row {
+                            Some(line) => view_header::Head::of(line),
+                            None => view_header::Head::titled(&page.name),
+                        };
+                        let band = view_header::show(ui, drawn.rect, &head, &self.chrome, active);
+                        // The rows under it are the banner's: a header that
+                        // grew moves the entries down, next frame.
+                        if (band.height - page.header_h).abs() > 0.5 {
+                            page.header_h = band.height;
+                            ctx.request_repaint();
+                        }
+                        if band.closed {
+                            page.header_closed = true;
+                        }
+                    }
+                    prompt_bar::hide(&ctx, active);
+                } else if let Some(session) = &mut rt.session {
                     // The wheel over the closed prompt bar scrolls the
                     // terminal under it.
                     rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
+                    if rt.view.button_pressed {
+                        actions.push(Action::BackToMain(active));
+                    }
                     if rt.view.paste_image {
                         self.paste_image.request(&ctx, active);
                     }
-                    // Typing goes to the terminal. egui drops a widget's
-                    // focus on any press outside it — the rail, the
-                    // taskbar, a header button — and the keys typed after
-                    // that went nowhere until the terminal was clicked
-                    // again. So it takes the keyboard back whenever nothing
-                    // else is meant to hold it: a text field (the search
-                    // bar, a settings input) or an overlay that reads keys
-                    // of its own. Only when it has lost it, since each
-                    // request interrupts IME input.
+                    // Over the top of the terminal, on the worker's view:
+                    // what it is working on, in full.
+                    if let Some(line) = &header {
+                        let head = view_header::Head::of(line);
+                        let band =
+                            view_header::show(ui, response.rect, &head, &self.chrome, active);
+                        if band.closed {
+                            rt.header_closed = rt.shown_viewed.clone();
+                            self.focus_terminal = true;
+                        }
+                    }
+                    // Typing goes to the terminal. egui drops
+                    // a widget's focus on any press outside it — a pane
+                    // row, the rail, the taskbar, a header button — and
+                    // the keys typed after that went nowhere until the
+                    // terminal was clicked again. So it takes the keyboard
+                    // back whenever nothing else is meant to hold it: a
+                    // text field (the search bar, a settings input) or an
+                    // overlay that reads keys of its own. Only when it has
+                    // lost it, since each request interrupts IME input.
                     let overlay = self.palette.is_some()
                         || self.session_picker.is_some()
                         || self.keys_overlay.is_some()
+                        || self.stop_confirm.is_some()
                         || self.rename.is_some();
                     if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
@@ -4252,20 +6276,26 @@ impl eframe::App for App {
                     }
                     // The prompt whose turn is in view, once its own row
                     // has scrolled out of sight.
-                    let pinned = self.claude.prompts_of(active).and_then(|history| {
-                        rt.prompt_bar
-                            .get(session.content_seq(), history, || {
-                                let rows = session.viewport_rows();
-                                prompt_bar::owner(history, &rows, |matches| {
-                                    session.find_above(
-                                        prompt_bar::SEARCH_ABOVE,
-                                        &prompt_bar::PROMPT_MARKS,
-                                        |row, shaded| matches(row, shaded),
-                                    )
+                    // Not over a worker's view: its header is up there, and
+                    // the prompts are the main session's.
+                    let pinned = self
+                        .claude
+                        .prompts_of(active)
+                        .filter(|_| header.is_none())
+                        .and_then(|history| {
+                            rt.prompt_bar
+                                .get(session.content_seq(), history, || {
+                                    let rows = session.viewport_rows();
+                                    prompt_bar::owner(history, &rows, |matches| {
+                                        session.find_above(
+                                            prompt_bar::SEARCH_ABOVE,
+                                            &prompt_bar::PROMPT_MARKS,
+                                            |row, shaded| matches(row, shaded),
+                                        )
+                                    })
                                 })
-                            })
-                            .map(|i| history[i].as_str())
-                    });
+                                .map(|i| history[i].as_str())
+                        });
                     match pinned {
                         Some(prompt) => {
                             let row = session.size().cell_height as f32 / ctx.pixels_per_point();
@@ -4288,16 +6318,30 @@ impl eframe::App for App {
                         ui.label("no session");
                     });
                 }
-            } else if walking {
+            } else if walking || self.held == Some(active) {
                 // A walk passing over a tab that has not started: its saved
                 // scrollback, read-only, until Ctrl comes up.
+                // A tab stopped while on screen shows the same until it is
+                // clicked.
                 if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
                     let dump = state::load_snapshot(&self.paths, active);
                     self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
                 }
                 if let Some(preview) = &self.walk_preview {
                     let rect = ui.available_rect_before_wrap();
-                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
+                    let caption = if walking {
+                        walk::WALKING
+                    } else {
+                        walk::STOPPED
+                    };
+                    preview.show(ui, rect, &self.chrome, self.shared.font_size, caption);
+                    if !walking
+                        && ui
+                            .interact(rect, ui.id().with("stopped-tab"), egui::Sense::click())
+                            .clicked()
+                    {
+                        actions.push(Action::Select(active));
+                    }
                 }
             }
         });
@@ -4320,6 +6364,7 @@ impl eframe::App for App {
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
+        actions.extend(overlays::stop_confirm_ui(self, &ctx));
 
         for action in actions {
             self.apply(&ctx, action);
@@ -4349,6 +6394,11 @@ impl Drop for App {
         // closed or the compositor died under it, so `closing` is what tells
         // the two apart in the state file.
         self.persist_all();
+        // The relay goes back to hiding Claude Code's strip everywhere.
+        let spool = self.paths.hook_spool();
+        for (tab, _) in self.strip_asks.drain() {
+            let _ = giverny_claude::hooks::show_strip(&spool, &tab_env_id(tab), false);
+        }
         for (_, rt) in self.rt.drain() {
             if let Some(session) = rt.session {
                 session.shutdown();
@@ -4950,15 +7000,36 @@ fn fresh_nonce(salt: u64) -> String {
     format!("{:x}{:x}{:x}", nanos, std::process::id(), salt)
 }
 
+/// Whether a command's exit code, from OSC 133 `D`, says it failed:
+/// anything but 0, except 130, a Ctrl-C you pressed, and
+/// 141, a SIGPIPE such as `… | head` leaves, which end what you meant to
+/// end. No code says nothing.
+fn failed_exit(exit: Option<i32>) -> bool {
+    exit.is_some_and(|code| !matches!(code, 0 | 130 | 141))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that exited non-zero failed; Ctrl-C, SIGPIPE and a `D`
+    /// with no code did not.
+    #[test]
+    fn a_non_zero_exit_fails_but_ctrl_c_and_sigpipe_do_not() {
+        assert!(failed_exit(Some(1)));
+        assert!(failed_exit(Some(127)));
+        assert!(failed_exit(Some(2)));
+        assert!(!failed_exit(Some(0)));
+        assert!(!failed_exit(Some(130)));
+        assert!(!failed_exit(Some(141)));
+        assert!(!failed_exit(None));
+    }
 
     /// A bare word the binary does not know is a command, and is refused;
     /// flags and anything that reads as a path still open the window.
     #[test]
     fn unknown_words_are_commands_but_paths_and_flags_are_not() {
-        for word in ["doctr", "upgrade", "plan", "help", "status-line"] {
+        for word in ["pss", "pass2", "plan", "help", "subagent-line"] {
             assert!(is_unknown_subcommand(word, false), "{word}");
         }
         for not_a_command in [
@@ -4987,14 +7058,18 @@ mod tests {
     fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
         let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
         assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
-        assert!(accounts_readable(&parse("[claude]\nauto_mode = false\n")));
-        assert!(!accounts_readable(&parse("[claude]\nauto_mode = \"no\"\n")));
+        assert!(accounts_readable(&parse(
+            "[claude]\nmanagement_panel = false\n"
+        )));
+        assert!(!accounts_readable(&parse(
+            "[claude]\nmanagement_panel = \"no\"\n"
+        )));
         assert!(!accounts_readable(&parse("claude = 5\n")));
     }
 
-    /// A config that cannot be parsed leaves every account as it was —
-    /// here one auto mode would otherwise be written into — while a parsed
-    /// one is followed.
+    /// A config that cannot be parsed leaves every account as it was — here
+    /// one read as having the management panel off, which would otherwise strip the
+    /// account's `subagentStatusLine` — while a parsed one is followed.
     #[test]
     fn an_unparseable_config_leaves_the_accounts_alone() {
         let root = std::env::temp_dir().join(format!(
@@ -5003,9 +7078,10 @@ mod tests {
             jiff::Timestamp::now().as_nanosecond()
         ));
         let account = root.join("claude");
+        let base = root.join("giverny");
         std::fs::create_dir_all(&account).unwrap();
         let settings = account.join("settings.json");
-        let before = r#"{"theme":"dark"}"#;
+        let before = r#"{"subagentStatusLine":{"type":"command","command":"/opt/giverny relay --subagent-line"},"permissions":{"defaultMode":"default"}}"#;
         std::fs::write(&settings, before).unwrap();
 
         let mut watch = claude_watch::ClaudeWatch::for_tests();
@@ -5015,22 +7091,24 @@ mod tests {
             email: None,
             account_uuid: None,
         }];
-        let mut auto = config::Config::default();
-        auto.claude.auto_mode = true;
+        let mut pane_off = config::Config::default();
+        pane_off.claude.management_panel = false;
+        assert!(!management_panel_on(&pane_off));
 
-        set_up_accounts(&mut watch, &auto, false);
+        set_up_accounts(&mut watch, &pane_off, false, &base);
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+        assert!(!base.exists(), "nothing written for the plugin either");
 
         // The same settings from a config that was read: the account follows.
-        set_up_accounts(&mut watch, &auto, true);
+        set_up_accounts(&mut watch, &pane_off, true, &base);
         let after = std::fs::read_to_string(&settings).unwrap();
-        assert!(after.contains("defaultMode"), "{after}");
+        assert!(!after.contains("subagentStatusLine"), "{after}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A press on anything else — here a button, as the rail
-    /// would be — takes egui's focus off the terminal, and
+    /// A press on anything else — here a button, as a pane
+    /// row or the rail would be — takes egui's focus off the terminal, and
     /// the terminal is then told to take it back; a text field keeps it.
     #[test]
     fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
@@ -5087,23 +7165,6 @@ mod tests {
     }
 
     #[test]
-    fn the_backdrop_tiles_around_the_grid_exactly() {
-        let outer = egui::Rect::from_min_max(egui::pos2(240.0, 0.0), egui::pos2(1280.0, 820.0));
-        let grid = egui::Rect::from_min_max(egui::pos2(248.0, 14.0), egui::pos2(1272.0, 812.0));
-        let parts = around(outer, Some(grid));
-        assert_eq!(parts.len(), 4);
-        let area: f32 = parts.iter().map(|r| r.area()).sum();
-        assert_eq!(area, outer.area() - grid.area(), "gaps or overlaps");
-        for (i, a) in parts.iter().enumerate() {
-            assert!(!a.intersects(grid.shrink(0.01)), "part {i} covers the grid");
-            for b in &parts[i + 1..] {
-                assert!(!a.shrink(0.01).intersects(b.shrink(0.01)), "parts overlap");
-            }
-        }
-        assert_eq!(around(outer, None), vec![outer]);
-    }
-
-    #[test]
     fn software_gl_renderers_are_told_from_gpus() {
         assert!(is_software_gl("llvmpipe (LLVM 20.1.2, 256 bits)"));
         assert!(is_software_gl("GDI Generic"));
@@ -5154,6 +7215,23 @@ mod tests {
                 "{gpu:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_backdrop_tiles_around_the_grid_exactly() {
+        let outer = egui::Rect::from_min_max(egui::pos2(240.0, 0.0), egui::pos2(1280.0, 820.0));
+        let grid = egui::Rect::from_min_max(egui::pos2(248.0, 14.0), egui::pos2(1272.0, 812.0));
+        let parts = around(outer, Some(grid));
+        assert_eq!(parts.len(), 4);
+        let area: f32 = parts.iter().map(|r| r.area()).sum();
+        assert_eq!(area, outer.area() - grid.area(), "gaps or overlaps");
+        for (i, a) in parts.iter().enumerate() {
+            assert!(!a.intersects(grid.shrink(0.01)), "part {i} covers the grid");
+            for b in &parts[i + 1..] {
+                assert!(!a.shrink(0.01).intersects(b.shrink(0.01)), "parts overlap");
+            }
+        }
+        assert_eq!(around(outer, None), vec![outer]);
     }
 
     #[test]
@@ -5330,6 +7408,13 @@ mod tests {
 
         // Windows Terminal exports a trailing colon; an empty entry there
         // would list a variable with no name.
+        // Ours may carry a flag too: the feed dir is a path, translated with
+        // `/p` — and a name they already share is still not listed twice.
+        let feed = wslenv(None, &[FEED_DIR_WSLENV, "GIVERNY_TAB_ID"]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR/p:GIVERNY_TAB_ID");
+        let feed = wslenv(Some("GIVERNY_FEED_DIR".into()), &[FEED_DIR_WSLENV]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR", "theirs wins: {feed}");
+
         let theirs = wslenv(Some("WT_SESSION:WT_PROFILE_ID:".into()), &["GIVERNY_NONCE"]);
         assert_eq!(theirs, "WT_SESSION:WT_PROFILE_ID:GIVERNY_NONCE");
         assert!(!theirs.contains("::"), "{theirs}");

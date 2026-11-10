@@ -95,7 +95,16 @@ pub struct Job {
     pub config_dir: PathBuf,
     /// The daemon is running a worker for it right now.
     pub live: bool,
+    /// The conversation the job was resumed from, for a job started by
+    /// resuming one (`/resume`, `claude --resume` handed to the daemon): its
+    /// earlier workers live under that id, not the job's own.
+    pub forked_from: Option<String>,
     pub pinned: bool,
+    /// Nothing has been asked of it: no name and no intent. What Claude
+    /// Code makes of a client's own fresh session when that client is
+    /// pointed at another job (a `claude --resume` of a job's conversation):
+    /// a placeholder to park on, not an agent.
+    pub untouched: bool,
 }
 
 impl Job {
@@ -106,8 +115,12 @@ impl Job {
     /// agents that finished, crashed, or were last seen days ago — and a row
     /// reading "working" for something with no process is a lie that costs
     /// whoever clicks it a terminal with nothing in it.
+    ///
+    /// Nor one nothing was ever asked of ([`Job::untouched`]): a placeholder
+    /// a resumed client parked on outlives that client, idle, waiting for a
+    /// first prompt nobody will send it.
     pub fn worth_watching(&self) -> bool {
-        self.live && self.state != JobState::Done
+        self.live && self.state != JobState::Done && !self.untouched
     }
 
     /// What to resume to attach a tab to this agent.
@@ -128,6 +141,36 @@ struct Roster {
 struct RosterWorker {
     #[serde(default)]
     pid: u32,
+    #[serde(default)]
+    dispatch: Option<Dispatch>,
+}
+
+/// How the daemon started a worker, as far as it matters here.
+#[derive(Debug, Deserialize)]
+struct Dispatch {
+    #[serde(default)]
+    launch: Option<Launch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Launch {
+    #[serde(default)]
+    mode: String,
+    /// The conversation resumed: an id, or the path of its transcript.
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
+}
+
+impl RosterWorker {
+    fn forked_from(&self) -> Option<String> {
+        let launch = self.dispatch.as_ref()?.launch.as_ref()?;
+        if launch.mode != "resume" {
+            return None;
+        }
+        let named = launch.session_id.as_deref()?.trim();
+        let stem = Path::new(named).file_stem()?.to_string_lossy().into_owned();
+        (!stem.is_empty()).then_some(stem)
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -152,20 +195,24 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Ids the daemon is currently running a worker for, with a live process.
-fn live_ids(config_dir: &Path) -> Vec<String> {
+/// The jobs the daemon is currently running a worker for, with a live
+/// process, each with the conversation it was resumed from.
+fn live_workers(config_dir: &Path) -> HashMap<String, Option<String>> {
     let path = config_dir.join("daemon").join("roster.json");
     let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
+        return HashMap::new();
     };
     let Ok(roster) = serde_json::from_slice::<Roster>(&bytes) else {
-        return Vec::new();
+        return HashMap::new();
     };
     roster
         .workers
         .into_iter()
         .filter(|(_, w)| pid_alive(w.pid))
-        .map(|(id, _)| id)
+        .map(|(id, w)| {
+            let from = w.forked_from();
+            (id, from)
+        })
         .collect()
 }
 
@@ -188,7 +235,7 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
         let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
             continue;
         };
-        let live = live_ids(&dir);
+        let live = live_workers(&dir);
         let pinned = pinned_ids(&dir);
         for entry in entries.flatten() {
             let path = entry.path();
@@ -215,8 +262,11 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
                 session_id: as_str(&v, "sessionId"),
                 resume_session_id: as_str(&v, "resumeSessionId"),
                 updated_at_ms: as_millis(&v, "updatedAt"),
-                live: live.contains(&id),
+                live: live.contains_key(&id),
+                forked_from: live.get(&id).cloned().flatten(),
                 pinned: pinned.contains(&id),
+                untouched: as_str(&v, "name").is_none()
+                    && as_str(&v, "intent").is_none_or(|i| i.trim().is_empty()),
                 config_dir: dir.clone(),
                 id,
             });
@@ -229,6 +279,100 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
             .then(b.updated_at_ms.cmp(&a.updated_at_ms))
     });
     out
+}
+
+/// Ending a background job, as Claude Code's own CLI does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// `claude stop <id>`: the worker goes, the conversation stays —
+    /// `claude attach <id>` or `--resume` brings it back.
+    Stop,
+    /// `claude rm <id>`: the job and its worktree go for good.
+    Delete,
+}
+
+impl End {
+    fn subcommand(self) -> &'static str {
+        match self {
+            End::Stop => "stop",
+            End::Delete => "rm",
+        }
+    }
+
+    /// The word for it in the rail.
+    pub fn verb(self) -> &'static str {
+        match self {
+            End::Stop => "stop",
+            End::Delete => "delete",
+        }
+    }
+}
+
+/// Is `id` a job id, safe to hand to a command line? Claude Code's are
+/// short hex; anything else came from a file that surprised us.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// End background job `id` of the account at `config_dir`.
+///
+/// Blocking — Claude Code talks to its daemon, which takes a moment — so
+/// call it off the UI thread. Bounded: a CLI that never answers is killed,
+/// not waited on. The error carries what the CLI said, for the row to show.
+pub fn end(config_dir: &Path, id: &str, how: End) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    if !valid_id(id) {
+        anyhow::bail!("not a job id: {id:?}");
+    }
+    let mut child = crate::usage::claude_command(config_dir)?
+        .arg(how.subcommand())
+        .arg(id)
+        // Not a tab's claude: its hooks must not land on one.
+        .env_remove("GIVERNY_TAB_ID")
+        .env_remove("GIVERNY_NONCE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("cannot run claude: {e}"))?;
+    // Read both pipes as the CLI writes, so a chatty answer cannot fill
+    // one and stall the process the deadline is waiting on.
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(o) = out.as_mut() {
+            let _ = o.read_to_string(&mut text);
+        }
+        if let Some(e) = err.as_mut() {
+            let _ = e.read_to_string(&mut text);
+        }
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("claude {} {id} did not answer in 30 s", how.subcommand());
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let said = reader.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    let said = said.trim();
+    if said.is_empty() {
+        anyhow::bail!("claude {} {id} exited with {status}", how.subcommand());
+    }
+    anyhow::bail!("{said}")
 }
 
 #[cfg(test)]
@@ -293,10 +437,26 @@ mod tests {
     #[test]
     fn only_a_running_agent_is_worth_watching() {
         let config = scratch("finished");
-        write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
-        write_job(&config, "bbbb2222", r#"{ "state": "blocked" }"#);
-        write_job(&config, "cccc3333", r#"{ "state": "done" }"#);
-        write_job(&config, "dddd4444", r#"{ "state": "working" }"#);
+        write_job(
+            &config,
+            "aaaa1111",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "bbbb2222",
+            r#"{ "state": "blocked", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "cccc3333",
+            r#"{ "state": "done", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "dddd4444",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
         // The daemon is running workers for three of them; the fourth has a
         // state file and nothing behind it.
         let me = std::process::id();

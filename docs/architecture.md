@@ -55,11 +55,30 @@ egui, which draws the rail and the prompt bar, has no bidi pass, but it shapes e
 
 Hebrew glyphs come from Cascadia Mono, bundled in `crates/term/fonts`: monospace Hebrew designed for a coding font, where most systems have only proportional faces or Miriam Mono. They serve the Hebrew block and nothing else, so no other character changes face.
 
+## Splits and windows
+
+A rail row is a tab, or a **group**: several tabs laid out by a binary split
+tree (`core/panes.rs`, bspwm style; each split has an axis and a ratio). A
+tab stays one terminal throughout, so hooks, watchers, snapshots and
+`GIVERNY_TAB_ID` never learned about splits. Group members sit next to each
+other in `Workspace::tabs`, which is all the rail needs to draw a group once;
+moving or reordering acts on the whole block. `ws.active` is the focused
+terminal, and "seen" means visible: every terminal of the active row.
+
+More windows are egui immediate viewports. Each shows the same workspace with
+its own focus. Drawing one swaps its `Focus` (active tab and recency) and its
+on-screen geometry into `App`, runs the same `window_ui` the first window runs,
+and swaps back, so every tab operation works in every window with no second
+copy. Immediate viewports draw whenever the root does; output in any terminal
+repaints the root and with it every window. A row is shown in at most one
+window, since a terminal has one size: choosing it in one window takes it from
+the others (`windows::settle`). Overlays belong to the window they opened in.
+
 ## Persistence (`crates/core`)
 
 `~/.config/giverny/state/tabs.json` (versioned, atomic tmp+rename, corruption sidelined) plus per-tab ANSI scrollback dumps. Restore **pre-seeds** the fresh `Term` with the dump before the shell spawns — scrollback returns with colors and re-wraps naturally because dumps store *logical* lines (WRAPLINE rows joined). Alt-screen content is never snapshotted. Sessions spawn lazily on first focus.
 
-Window size, maximized state and rail width live in the same file under `layout`, read by `state::load_layout` *before* the window is built so the size is what the window opens at rather than a resize the user watches happen. The size comes from egui's viewport rect, not `ViewportInfo::inner_rect` — the latter is computed from the window's position, which Wayland never reports to clients, so it is `None` on the primary platform. Window *position* is not persisted for the same reason: Wayland gives clients no way to place their own windows.
+Window size, maximized state and rail width live in the same file under `layout`, read by `state::load_layout` *before* the window is built so the size is what the window opens at rather than a resize the user watches happen. The size comes from egui's viewport rect, not `ViewportInfo::inner_rect` — the latter is computed from the window's position, which Wayland never reports to clients, so it is `None` on the primary platform. Window *position* is not persisted for the same reason: Wayland gives clients no way to place their own windows. Extra windows keep their focus, size and rail state under `windows`.
 
 ## Claude integration (`crates/claude` + `app/claude_watch.rs`)
 

@@ -212,7 +212,10 @@ pub fn load(paths: &Paths) -> Option<SaveState> {
     let path = paths.state_file();
     let bytes = std::fs::read(&path).ok()?;
     match serde_json::from_slice::<SaveState>(&bytes) {
-        Ok(state) if state.version <= STATE_VERSION => Some(state),
+        Ok(mut state) if state.version <= STATE_VERSION => {
+            state.workspace.normalize();
+            Some(state)
+        }
         Ok(state) => {
             tracing::warn!(
                 "state version {} is newer than {}",

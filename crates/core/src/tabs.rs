@@ -113,6 +113,16 @@ impl Tab {
     }
 }
 
+/// What one window is showing: its current tab and the ones before it.
+/// The workspace holds the focus of the window being drawn; the others
+/// park theirs here until their turn ([`Workspace::swap_focus`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Focus {
+    pub active: Option<TabId>,
+    #[serde(default)]
+    pub recent: Vec<TabId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     next_id: u64,
@@ -275,6 +285,13 @@ impl Workspace {
 
     pub fn tabs_in(&self, category: CategoryId) -> impl Iterator<Item = &Tab> {
         self.tabs.iter().filter(move |t| t.category == category)
+    }
+
+    /// Trade the focus being used for `other`'s: how a second window gets
+    /// the same tab operations as the first, each with its own selection.
+    pub fn swap_focus(&mut self, other: &mut Focus) {
+        std::mem::swap(&mut self.active, &mut other.active);
+        std::mem::swap(&mut self.recent, &mut other.recent);
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -1213,6 +1230,28 @@ mod tests {
         ws.normalize();
         assert!(ws.groups.is_empty());
         assert_eq!(ws.tab(a).unwrap().group, None);
+    }
+
+    #[test]
+    fn swapping_focus_trades_selection_and_history() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let mut other = Focus {
+            active: Some(a),
+            recent: vec![],
+        };
+        ws.swap_focus(&mut other);
+        assert_eq!(ws.active, Some(a));
+        assert_eq!(other.active, Some(b));
+        assert_eq!(
+            other.recent,
+            vec![a],
+            "the first window's history went with it"
+        );
+        ws.swap_focus(&mut other);
+        assert_eq!(ws.active, Some(b));
     }
 
     #[test]

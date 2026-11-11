@@ -400,6 +400,8 @@ struct RowData {
     unseen: bool,
     /// Terminals in the row: more than one for a split.
     panes: usize,
+    /// The number of another window this row is on screen in.
+    elsewhere: Option<usize>,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -516,6 +518,7 @@ fn row_data(
         unseen: app.unseen_done.contains(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
         panes: 1,
+        elsewhere: app.shown_elsewhere(t.id),
     }
 }
 
@@ -1104,7 +1107,9 @@ fn category_header(
     };
 
     // Inline rename?
-    if let Some((RenameTarget::Category(id), buf)) = &mut app.rename
+    let here = app.overlay_here();
+    if here
+        && let Some((RenameTarget::Category(id), buf)) = &mut app.rename
         && as_category == Some(*id)
     {
         let id = *id;
@@ -1781,7 +1786,9 @@ fn tab_row(
     draw_mark(app, ui, &p, rect, dot, row, dim);
 
     // Inline rename?
-    if let Some((RenameTarget::Tab(id), buf)) = &mut app.rename
+    let here = app.overlay_here();
+    if here
+        && let Some((RenameTarget::Tab(id), buf)) = &mut app.rename
         && *id == row.id
     {
         let edit_rect = Rect::from_min_size(
@@ -1810,17 +1817,21 @@ fn tab_row(
     // A split says so at the row's end, where the close button would be
     // when hovered: how its terminals are laid out matters less than that
     // there are several behind one row.
-    let glyph_w = if row.panes > 1 && !hovered {
-        split_glyph(
-            &p,
-            Pos2::new(rect.max.x - 22.0, rect.min.y + 13.0),
-            row.panes,
-            dim,
-        );
-        14.0
-    } else {
-        0.0
-    };
+    let mut glyph_w = 0.0;
+    if !hovered {
+        let mut x = rect.max.x - 22.0;
+        if row.panes > 1 {
+            split_glyph(&p, Pos2::new(x, rect.min.y + 13.0), row.panes, dim);
+            glyph_w += 18.0;
+            x -= 18.0;
+        }
+        // On screen in another window: that window's number, in a frame,
+        // so clicking here is known to bring it over.
+        if let Some(n) = row.elsewhere {
+            window_badge(&p, Pos2::new(x, rect.min.y + 13.0), n, dim);
+            glyph_w += 18.0;
+        }
+    }
     // Title (char-budget truncation; the rail is monospace).
     let char_budget = ((width - 68.0 - glyph_w) / 7.2).max(4.0) as usize;
     p.text(
@@ -1896,6 +1907,26 @@ fn tab_row(
                 }
             }
         });
+        if ui.button("open in new window").clicked() {
+            actions.push(Action::MoveToWindow(row.id, None));
+            ui.close();
+        }
+        let here = app.window_number();
+        let others: Vec<usize> = app
+            .window_numbers()
+            .into_iter()
+            .filter(|&n| n != here)
+            .collect();
+        if !others.is_empty() {
+            ui.menu_button("move to window", |ui| {
+                for n in others {
+                    if ui.button(format!("window {n}")).clicked() {
+                        actions.push(Action::MoveToWindow(row.id, Some(n)));
+                        ui.close();
+                    }
+                }
+            });
+        }
         ui.separator();
         let label = if row.panes > 1 {
             format!("close all {} terminals", row.panes)
@@ -1930,6 +1961,19 @@ fn tab_row(
         );
     }
     rect
+}
+
+/// A window's number in a small frame, centred on `at`.
+fn window_badge(p: &egui::Painter, at: Pos2, n: usize, color: Color32) {
+    let r = Rect::from_center_size(at, Vec2::new(13.0, 11.0));
+    p.rect_stroke(r, 2.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+    p.text(
+        r.center() + Vec2::new(0.0, 0.5),
+        Align2::CENTER_CENTER,
+        n.to_string(),
+        FontId::monospace(9.0),
+        color,
+    );
 }
 
 /// The rail's close for `row`: the terminal, or a split's every terminal.
@@ -3093,6 +3137,7 @@ mod tests {
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
             panes: 1,
+            elsewhere: None,
         }
     }
 

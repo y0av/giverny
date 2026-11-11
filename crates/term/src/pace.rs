@@ -124,6 +124,13 @@ pub fn note_frame(focused: bool, predicted_dt: f32) {
     PREDICTED_DT.store(dt_ms(predicted_dt), Ordering::Relaxed);
 }
 
+/// Whether any of the app's windows has focus, said once a frame after all
+/// of them are drawn: each terminal's [`note_frame`] only knows its own
+/// window, and with several the last one drawn would decide for all.
+pub fn note_focus(focused: bool) {
+    FOCUSED.store(focused, Ordering::Relaxed);
+}
+
 fn dt_ms(predicted_dt: f32) -> u64 {
     // Bounded: a wild prediction must not stall the clock.
     (predicted_dt.max(0.0) * 1000.0).ceil().min(200.0) as u64

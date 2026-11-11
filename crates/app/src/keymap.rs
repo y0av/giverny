@@ -92,6 +92,16 @@ pub const BINDINGS: &[Binding] = &[
         scope: Scope::Global,
     },
     Binding {
+        chord: "Ctrl+Shift+N",
+        action: "new window (for another monitor), on a new terminal",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+B",
+        action: "hide or show the rail in this window",
+        scope: Scope::Global,
+    },
+    Binding {
         chord: "Ctrl+,",
         action: "settings",
         scope: Scope::Global,
@@ -148,7 +158,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "right-click",
-        action: "tab and category menus (move, colour, account, sessions)",
+        action: "tab and category menus (move, window, colour, account, sessions)",
         scope: Scope::Rail,
     },
 ];

@@ -22,6 +22,7 @@ mod update;
 mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+mod windows;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -974,6 +975,12 @@ pub enum Action {
     ToggleZoom(TabId),
     /// Take a terminal out of its split onto a row of its own.
     Detach(TabId),
+    /// A new window on a new terminal.
+    NewWindow,
+    /// Show `tab`'s row in window `n` (1 is the first), or a new one.
+    MoveToWindow(TabId, Option<usize>),
+    /// Fold the rail away in this window, or bring it back.
+    ToggleRail,
     /// Put `tab`'s row into `onto`'s split, beside it.
     Join {
         tab: TabId,
@@ -1181,6 +1188,21 @@ pub struct App {
     pub pane_rects: Vec<(egui::Rect, TabId)>,
     /// The same, as the layout's own areas, for moving focus by direction.
     pub pane_areas: Vec<(TabId, giverny_core::panes::Area)>,
+    /// Windows besides the first ([`windows`]).
+    windows: Vec<windows::Extra>,
+    /// The extra window being drawn, whose focus is in `ws` right now; `None`
+    /// for the first.
+    current_window: Option<usize>,
+    next_window_key: u64,
+    /// The rail folded away in the window being drawn.
+    rail_hidden: bool,
+    /// The window an overlay (palette, settings, keys, rename) was opened
+    /// in, which is the only one that shows it.
+    overlay_owner: Option<usize>,
+    /// Whether Ctrl is still held for a keyboard walk, as seen by whichever
+    /// window has the keyboard this frame; `None` when none has, which is
+    /// also how output pacing learns no window is focused.
+    walk_held: Option<bool>,
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -1611,6 +1633,10 @@ impl App {
             .as_ref()
             .map(|st| st.layout.clone())
             .unwrap_or_default();
+        let saved_windows: Vec<state::WindowSave> = restored
+            .as_ref()
+            .map(|st| st.windows.clone())
+            .unwrap_or_default();
         let mut ws = restored
             .map(|st| st.workspace)
             .filter(|ws| !ws.tabs.is_empty())
@@ -1743,6 +1769,16 @@ impl App {
             row_rects: Vec::new(),
             pane_rects: Vec::new(),
             pane_areas: Vec::new(),
+            windows: saved_windows
+                .iter()
+                .enumerate()
+                .map(|(i, w)| windows::Extra::restore(i as u64 + 1, w))
+                .collect(),
+            current_window: None,
+            next_window_key: saved_windows.len() as u64 + 1,
+            rail_hidden: layout.rail_hidden,
+            overlay_owner: None,
+            walk_held: None,
             attention: 0,
             #[cfg(unix)]
             coming_forward: None,
@@ -1891,6 +1927,7 @@ impl App {
             workspace: self.ws.clone(),
             font_size: self.shared.font_size,
             layout: self.layout.clone(),
+            windows: self.windows.iter().map(windows::Extra::save).collect(),
         };
         if let Err(err) = state::save(&self.paths, &st) {
             tracing::error!("state save failed: {err:#}");
@@ -1957,6 +1994,15 @@ impl App {
                     g.zoomed = !g.zoomed;
                 }
                 self.focus_terminal = true;
+            }
+            Action::NewWindow => self.open_window(ctx, None),
+            Action::MoveToWindow(tab, Some(n)) => self.move_to_window(ctx, tab, n),
+            Action::MoveToWindow(tab, None) => self.open_window(ctx, Some(tab)),
+            Action::ToggleRail => {
+                self.rail_hidden = !self.rail_hidden;
+                if self.current_window.is_none() {
+                    self.layout.rail_hidden = self.rail_hidden;
+                }
             }
             Action::Detach(id) => {
                 self.ws.detach(id);
@@ -2061,6 +2107,7 @@ impl App {
                 }
             }
             Action::StartRename(target) => {
+                self.overlay_owner = self.current_window;
                 let current = match &target {
                     RenameTarget::Tab(id) => self
                         .ws
@@ -2160,6 +2207,7 @@ impl App {
             },
             Action::RefreshUsage => self.claude.refresh_stale_usage(0, true),
             Action::ToggleSettings => {
+                self.overlay_owner = self.current_window;
                 self.settings = match self.settings.take() {
                     Some(_) => None,
                     // Back on the section last looked at, not the first.
@@ -2175,6 +2223,7 @@ impl App {
                 self.focus_terminal = self.settings.is_none();
             }
             Action::ToggleKeys => {
+                self.overlay_owner = self.current_window;
                 self.keys_overlay = match self.keys_overlay.take() {
                     Some(_) => None,
                     None => Some(keymap::KeysOverlay::default()),
@@ -2252,6 +2301,7 @@ impl App {
                 }
             }
             Action::TogglePalette => {
+                self.overlay_owner = self.current_window;
                 self.palette = if self.palette.is_some() {
                     None
                 } else {
@@ -2259,6 +2309,7 @@ impl App {
                 };
             }
             Action::OpenSessions(id) => {
+                self.overlay_owner = self.current_window;
                 let cwd = self
                     .rt
                     .get(&id)
@@ -4069,10 +4120,11 @@ impl App {
                 // bar, a settings input) or an overlay that reads keys
                 // of its own. Only when it has lost it, since each
                 // request interrupts IME input.
-                let overlay = self.palette.is_some()
-                    || self.session_picker.is_some()
-                    || self.keys_overlay.is_some()
-                    || self.rename.is_some();
+                let overlay = self.overlay_owner == self.current_window
+                    && (self.palette.is_some()
+                        || self.session_picker.is_some()
+                        || self.keys_overlay.is_some()
+                        || self.rename.is_some());
                 if focused && (self.focus_terminal || terminal_lost_keys(ctx, response.id, overlay))
                 {
                     response.request_focus();
@@ -4131,6 +4183,416 @@ impl App {
         grid_rect
     }
 
+    /// One window's frame: titlebar, rail, terminals, overlays, and the
+    /// actions they produced. Drawn for the first window and again, with
+    /// its focus swapped in, for each other ([`windows`]).
+    fn window_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // The first window's drops are taken with the rest of its frame;
+        // another window's arrive in its own input. (Wayland drags are
+        // tracked for the first window only: `wayland_dnd`.)
+        if self.current_window.is_some() {
+            let paths: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            self.deliver_drop(&ctx, paths, None);
+        }
+        let mut actions = self.shortcuts(&ctx);
+
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        if let Some(cursors) = &mut self.cursors {
+            cursors.keep();
+        }
+        if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            self.maximize.update(&ctx);
+            let maximized = self.maximize.is_on(&ctx);
+            titlebar::resize_edges(&ctx, maximized);
+            titlebar::outline(&ctx, &self.chrome, maximized);
+            let title = match self.current_window {
+                Some(k) => format!("Giverny {}", k + 2),
+                None if self.attention > 0 => format!("Giverny ({})", self.attention),
+                None => "Giverny".to_string(),
+            };
+            egui::Panel::top(self.panel_id("titlebar"))
+                .exact_size(titlebar::HEIGHT)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
+                });
+        }
+
+        if !self.rail_hidden {
+            egui::Panel::left(self.panel_id("rail"))
+                .resizable(true)
+                .default_size(
+                    self.layout
+                        .rail_width_in(RAIL_MIN..=RAIL_MAX)
+                        .unwrap_or(240.0),
+                )
+                .size_range(RAIL_MIN..=RAIL_MAX)
+                .show(ui, |ui| {
+                    actions.extend(rail::show(self, ui));
+                });
+        }
+        if self.current_window.is_none() {
+            self.track_layout(&ctx);
+        }
+
+        for action in actions.drain(..) {
+            self.apply(&ctx, action);
+        }
+
+        // A see-through window paints the area around the grid itself, so
+        // that no pixel has two translucent layers on it: the panel's fill
+        // under the grid's would show the desktop through both at once.
+        let opacity = self.shared.opacity;
+        let mut central = egui::CentralPanel::default();
+        if opacity < 1.0 {
+            central =
+                central.frame(egui::Frame::central_panel(ui.style()).fill(Color32::TRANSPARENT));
+        }
+        let mut backdrop = None;
+        let mut grid_rects: Vec<egui::Rect> = Vec::new();
+        let mut solid = false;
+        let panel = central.show(ui, |ui| {
+            if opacity < 1.0 {
+                backdrop = Some((ui.painter().add(egui::Shape::Noop), ui.painter().clone()));
+            }
+            // Settings take the terminal's place, so the rail stays visible
+            // and changes to it can be watched landing. The shell behind is
+            // untouched and keeps running.
+            if self.settings.is_some() && self.overlay_here() {
+                // Solid: a screen of text and controls read against the
+                // wallpaper would be the hardest thing in the app to read.
+                solid = true;
+                let acts = settings_ui::settings_ui(self, ui);
+                actions.extend(acts);
+                return;
+            }
+            let Some(active) = self.ws.active else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(if self.current_window.is_some() {
+                        "pick a row in the rail to show it here, or Ctrl+Shift+T for a new one"
+                    } else {
+                        "no tabs — Ctrl+Shift+T opens one"
+                    });
+                });
+                return;
+            };
+
+            // Category accent strip above the pane: you always know where you
+            // are. A split's headers carry it instead, on the focused one.
+            let split = self.ws.group_of(active).is_some();
+            let accent = self
+                .ws
+                .tab(active)
+                .and_then(|t| self.ws.category(t.category))
+                .map(|c| self.chrome.category(c.color_index))
+                .unwrap_or(Color32::GRAY);
+            if !split {
+                let (strip, _) = ui.allocate_exact_size(
+                    egui::Vec2::new(ui.available_width(), 3.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(strip, 0.0, accent);
+            }
+
+            // Files hovering over the window: say what a drop will do, so a
+            // drag is not a guess. On X11 winit counts the files but reports
+            // no position, so the destination is the active tab; on Wayland
+            // we track the drag ourselves and can name the tab under the
+            // pointer instead.
+            let hovering = ctx.input(|i| i.raw.hovered_files.len());
+            if hovering > 0 || self.drag_hover.is_some() {
+                let target = self
+                    .drag_hover
+                    .and_then(|p| self.tab_at(p).or_else(|| self.pane_at(p)))
+                    .unwrap_or(active);
+                let into = self
+                    .ws
+                    .tab(target)
+                    .map(|t| t.display_title(&self.cfg.titles))
+                    .unwrap_or_default();
+                let what = match hovering {
+                    0 => "drop into".to_string(),
+                    1 => "drop 1 path into".to_string(),
+                    n => format!("drop {n} paths into"),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{what}  {into}"))
+                            .font(egui::FontId::monospace(11.0))
+                            .color(self.chrome.accent),
+                    );
+                });
+            }
+
+            let area = ui.available_rect_before_wrap();
+            let panes = panes::layout(self, area);
+            self.pane_rects = panes.iter().map(|p| (p.body, p.tab)).collect();
+            self.pane_areas = panes
+                .iter()
+                .map(|p| {
+                    let r = p.header.map_or(p.body, |h| h.union(p.body));
+                    (
+                        p.tab,
+                        giverny_core::panes::Area::new(r.min.x, r.min.y, r.width(), r.height()),
+                    )
+                })
+                .collect();
+            for pane in &panes {
+                let focused = pane.tab == active;
+                if let Some(h) = pane.header {
+                    panes::header(self, ui, h, pane.tab, focused, &mut actions);
+                }
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(pane.body)
+                        .id_salt(("pane", pane.tab.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                if let Some(r) =
+                    self.show_terminal(&ctx, &mut child, pane.tab, focused, &mut actions)
+                {
+                    grid_rects.push(r);
+                }
+            }
+            panes::dividers(self, ui, area);
+            self.rail_drop_on_panes(ui, &panes, &mut actions);
+            ui.advance_cursor_after_rect(area);
+        });
+        if let Some((slot, painter)) = backdrop {
+            let outer = panel.response.rect;
+            let shape = if solid {
+                egui::Shape::rect_filled(outer, 0.0, self.chrome.panel)
+            } else {
+                let fill = giverny_term::render::opacity::see_through(self.chrome.panel, opacity);
+                egui::Shape::Vec(
+                    around(outer, &grid_rects)
+                        .into_iter()
+                        .map(|r| egui::Shape::rect_filled(r, 0.0, fill))
+                        .collect(),
+                )
+            };
+            painter.with_clip_rect(outer).set(slot, shape);
+        }
+
+        // A rail drag released anywhere neither the rail nor a terminal
+        // took it ends here.
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.dragging = None;
+        }
+        if self.overlay_here() {
+            actions.extend(overlays::palette_ui(self, &ctx));
+            actions.extend(overlays::sessions_ui(self, &ctx));
+            actions.extend(keymap::overlay_ui(self, &ctx));
+        }
+
+        for action in actions {
+            self.apply(&ctx, action);
+        }
+        self.settle_windows();
+
+        // The window with the keyboard says whether a walk's Ctrl is held.
+        let (focused, ctrl) = ctx.input(|i| (i.focused, i.modifiers.ctrl));
+        if focused {
+            self.walk_held = Some(walk::still_held(ctrl, true));
+        }
+    }
+
+    /// An id for one of a window's panels: the bare name in the first
+    /// window, where egui has remembered the rail's width under it all
+    /// along, and salted with the window in the others so each keeps its own.
+    fn panel_id(&self, name: &'static str) -> egui::Id {
+        match self.current_window {
+            None => egui::Id::new(name),
+            Some(k) => egui::Id::new((name, self.windows[k].key)),
+        }
+    }
+
+    /// Whether the window being drawn is the one showing the open overlay.
+    pub fn overlay_here(&self) -> bool {
+        self.overlay_owner == self.current_window
+    }
+
+    /// Trade the window being drawn for extra window `k`, or back.
+    fn swap_window(&mut self, k: usize) {
+        let w = &mut self.windows[k];
+        self.ws.swap_focus(&mut w.focus);
+        std::mem::swap(&mut self.row_rects, &mut w.row_rects);
+        std::mem::swap(&mut self.pane_rects, &mut w.pane_rects);
+        std::mem::swap(&mut self.pane_areas, &mut w.pane_areas);
+        std::mem::swap(&mut self.focus_terminal, &mut w.focus_terminal);
+        std::mem::swap(&mut self.maximize, &mut w.maximize);
+        std::mem::swap(&mut self.rail_hidden, &mut w.rail_hidden);
+        self.current_window = match self.current_window {
+            Some(c) if c == k => None,
+            _ => Some(k),
+        };
+    }
+
+    /// A row chosen in the window being drawn leaves every other window.
+    fn settle_windows(&mut self) {
+        let mut parked: Vec<&mut giverny_core::tabs::Focus> =
+            self.windows.iter_mut().map(|w| &mut w.focus).collect();
+        windows::settle(&self.ws, &mut parked);
+    }
+
+    /// The number a window goes by: 1 for the first, then in opening order.
+    pub fn window_number(&self) -> usize {
+        self.current_window.map_or(1, |k| k + 2)
+    }
+
+    /// The other window showing `tab`'s row, by number, if one does.
+    pub fn shown_elsewhere(&self, tab: TabId) -> Option<usize> {
+        self.windows.iter().enumerate().find_map(|(j, w)| {
+            let a = w.focus.active?;
+            self.ws.same_row(a, tab).then(|| {
+                if self.current_window == Some(j) {
+                    1
+                } else {
+                    j + 2
+                }
+            })
+        })
+    }
+
+    /// Every window's number, for "move to window" menus.
+    pub fn window_numbers(&self) -> Vec<usize> {
+        (1..=self.windows.len() + 1).collect()
+    }
+
+    /// Draw each extra window, its focus swapped in for the length of it.
+    fn draw_extra_windows(&mut self, ctx: &egui::Context) {
+        let mut k = 0;
+        while k < self.windows.len() {
+            let vid = self.windows[k].viewport_id();
+            let size = self.windows[k].size.unwrap_or([1100.0, 760.0]);
+            let mut builder = egui::ViewportBuilder::default()
+                .with_app_id("giverny")
+                .with_title(format!("Giverny {}", k + 2))
+                .with_icon(icon::icon_data(16))
+                .with_min_inner_size([480.0, 320.0])
+                .with_decorations(!self.frameless);
+            // Sized once, when it opens: a size set every frame would undo
+            // every resize.
+            if !ctx.memory(|m| {
+                m.data
+                    .get_temp::<bool>(egui::Id::new(("opened", vid)))
+                    .unwrap_or(false)
+            }) {
+                builder = builder.with_inner_size(size);
+                ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(("opened", vid)), true));
+            }
+            if self.see_through {
+                builder = builder.with_transparent(true);
+            }
+            let pending = std::mem::take(&mut self.windows[k].pending);
+            self.swap_window(k);
+            for action in pending {
+                self.apply(ctx, action);
+            }
+            ctx.show_viewport_immediate(vid, builder, |ui, _class| {
+                if let Some(cap) = &mut self.windows[k].capture {
+                    cap.on_frame(ui.ctx());
+                    if cap.done() {
+                        self.windows[k].capture = None;
+                    }
+                }
+                self.window_ui(ui);
+                let zoom = ui.ctx().zoom_factor();
+                let (close, rect) = ui
+                    .ctx()
+                    .input(|i| (i.viewport().close_requested(), i.viewport_rect()));
+                let size = rect.size() * zoom;
+                if size.x > 0.0 && size.y > 0.0 && self.windows[k].size != Some([size.x, size.y]) {
+                    self.windows[k].size = Some([size.x, size.y]);
+                    self.state_dirty = true;
+                }
+                if close {
+                    self.windows[k].closing = true;
+                }
+            });
+            self.swap_window(k);
+            if self.windows[k].closing {
+                self.close_window(k);
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    /// Close extra window `k`. Its rows stay in the rail, shown nowhere
+    /// until picked.
+    fn close_window(&mut self, k: usize) {
+        self.windows.remove(k);
+        self.overlay_owner = match self.overlay_owner {
+            Some(o) if o == k => None,
+            Some(o) if o > k => Some(o - 1),
+            o => o,
+        };
+        self.state_dirty = true;
+    }
+
+    /// Open a window. With a row, that row moves into it; without, it opens
+    /// on a new terminal in the category of the current one.
+    fn open_window(&mut self, ctx: &egui::Context, row: Option<TabId>) {
+        let key = self.next_window_key;
+        self.next_window_key += 1;
+        let mut w = windows::Extra::new(key, None);
+        match row {
+            Some(tab) => w.pending.push(Action::Select(self.ws.row_target(tab))),
+            None => {
+                let category = self
+                    .ws
+                    .active_tab()
+                    .map(|t| t.category)
+                    .or_else(|| self.ws.categories.first().map(|c| c.id));
+                if let Some(category) = category {
+                    w.pending.push(Action::NewTab {
+                        category,
+                        cwd: None,
+                    });
+                }
+            }
+        }
+        self.windows.push(w);
+        self.state_dirty = true;
+        ctx.request_repaint();
+    }
+
+    /// Show `tab`'s row in window `number`, taking it from wherever it is.
+    fn move_to_window(&mut self, ctx: &egui::Context, tab: TabId, number: usize) {
+        if number == self.window_number() {
+            self.apply(ctx, Action::Select(tab));
+            return;
+        }
+        let slot = if number == 1 {
+            self.current_window
+        } else {
+            Some(number - 2)
+        };
+        let Some(slot) = slot.filter(|&k| k < self.windows.len()) else {
+            return;
+        };
+        // That window's focus in, choose there, settle, and back: the
+        // window being drawn gives the row up as any other would.
+        self.ws.swap_focus(&mut self.windows[slot].focus);
+        self.ws.set_active(self.ws.row_target(tab));
+        let mut parked: Vec<&mut giverny_core::tabs::Focus> =
+            self.windows.iter_mut().map(|w| &mut w.focus).collect();
+        windows::settle(&self.ws, &mut parked);
+        self.ws.swap_focus(&mut self.windows[slot].focus);
+        self.focus_terminal = true;
+        ctx.request_repaint();
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
@@ -4154,6 +4616,12 @@ impl App {
             }
             if i.consume_key(cs, Key::A) {
                 actions.push(Action::JumpAttention);
+            }
+            if i.consume_key(cs, Key::N) {
+                actions.push(Action::NewWindow);
+            }
+            if i.consume_key(cs, Key::B) {
+                actions.push(Action::ToggleRail);
             }
             if let Some(id) = self.ws.active {
                 use giverny_core::panes::{Axis, Direction};
@@ -4422,198 +4890,17 @@ impl eframe::App for App {
                 + Duration::from_millis(500),
         );
 
-        let mut actions = self.shortcuts(&ctx);
-
-        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-        if let Some(cursors) = &mut self.cursors {
-            cursors.keep();
-        }
-        if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
-            self.maximize.update(&ctx);
-            let maximized = self.maximize.is_on(&ctx);
-            titlebar::resize_edges(&ctx, maximized);
-            titlebar::outline(&ctx, &self.chrome, maximized);
-            let title = if self.attention > 0 {
-                format!("Giverny ({})", self.attention)
-            } else {
-                "Giverny".to_string()
-            };
-            egui::Panel::top("titlebar")
-                .exact_size(titlebar::HEIGHT)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(egui::Frame::NONE)
-                .show(ui, |ui| {
-                    titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
-                });
-        }
-
-        egui::Panel::left("rail")
-            .resizable(true)
-            .default_size(
-                self.layout
-                    .rail_width_in(RAIL_MIN..=RAIL_MAX)
-                    .unwrap_or(240.0),
-            )
-            .size_range(RAIL_MIN..=RAIL_MAX)
-            .show(ui, |ui| {
-                actions.extend(rail::show(self, ui));
-            });
-        self.track_layout(&ctx);
-
-        for action in actions.drain(..) {
-            self.apply(&ctx, action);
-        }
-
-        // A see-through window paints the area around the grid itself, so
-        // that no pixel has two translucent layers on it: the panel's fill
-        // under the grid's would show the desktop through both at once.
-        let opacity = self.shared.opacity;
-        let mut central = egui::CentralPanel::default();
-        if opacity < 1.0 {
-            central =
-                central.frame(egui::Frame::central_panel(ui.style()).fill(Color32::TRANSPARENT));
-        }
-        let mut backdrop = None;
-        let mut grid_rects: Vec<egui::Rect> = Vec::new();
-        let mut solid = false;
-        let panel = central.show(ui, |ui| {
-            if opacity < 1.0 {
-                backdrop = Some((ui.painter().add(egui::Shape::Noop), ui.painter().clone()));
-            }
-            // Settings take the terminal's place, so the rail stays visible
-            // and changes to it can be watched landing. The shell behind is
-            // untouched and keeps running.
-            if self.settings.is_some() {
-                // Solid: a screen of text and controls read against the
-                // wallpaper would be the hardest thing in the app to read.
-                solid = true;
-                let acts = settings_ui::settings_ui(self, ui);
-                actions.extend(acts);
-                return;
-            }
-            let Some(active) = self.ws.active else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("no tabs — Ctrl+Shift+T opens one");
-                });
-                return;
-            };
-
-            // Category accent strip above the pane: you always know where you
-            // are. A split's headers carry it instead, on the focused one.
-            let split = self.ws.group_of(active).is_some();
-            let accent = self
-                .ws
-                .tab(active)
-                .and_then(|t| self.ws.category(t.category))
-                .map(|c| self.chrome.category(c.color_index))
-                .unwrap_or(Color32::GRAY);
-            if !split {
-                let (strip, _) = ui.allocate_exact_size(
-                    egui::Vec2::new(ui.available_width(), 3.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter().rect_filled(strip, 0.0, accent);
-            }
-
-            // Files hovering over the window: say what a drop will do, so a
-            // drag is not a guess. On X11 winit counts the files but reports
-            // no position, so the destination is the active tab; on Wayland
-            // we track the drag ourselves and can name the tab under the
-            // pointer instead.
-            let hovering = ctx.input(|i| i.raw.hovered_files.len());
-            if hovering > 0 || self.drag_hover.is_some() {
-                let target = self
-                    .drag_hover
-                    .and_then(|p| self.tab_at(p).or_else(|| self.pane_at(p)))
-                    .unwrap_or(active);
-                let into = self
-                    .ws
-                    .tab(target)
-                    .map(|t| t.display_title(&self.cfg.titles))
-                    .unwrap_or_default();
-                let what = match hovering {
-                    0 => "drop into".to_string(),
-                    1 => "drop 1 path into".to_string(),
-                    n => format!("drop {n} paths into"),
-                };
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{what}  {into}"))
-                            .font(egui::FontId::monospace(11.0))
-                            .color(self.chrome.accent),
-                    );
-                });
-            }
-
-            let area = ui.available_rect_before_wrap();
-            let panes = panes::layout(self, area);
-            self.pane_rects = panes.iter().map(|p| (p.body, p.tab)).collect();
-            self.pane_areas = panes
-                .iter()
-                .map(|p| {
-                    let r = p.header.map_or(p.body, |h| h.union(p.body));
-                    (
-                        p.tab,
-                        giverny_core::panes::Area::new(r.min.x, r.min.y, r.width(), r.height()),
-                    )
-                })
-                .collect();
-            for pane in &panes {
-                let focused = pane.tab == active;
-                if let Some(h) = pane.header {
-                    panes::header(self, ui, h, pane.tab, focused, &mut actions);
-                }
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(pane.body)
-                        .id_salt(("pane", pane.tab.0))
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                if let Some(r) =
-                    self.show_terminal(&ctx, &mut child, pane.tab, focused, &mut actions)
-                {
-                    grid_rects.push(r);
-                }
-            }
-            panes::dividers(self, ui, area);
-            self.rail_drop_on_panes(ui, &panes, &mut actions);
-            ui.advance_cursor_after_rect(area);
-        });
-        if let Some((slot, painter)) = backdrop {
-            let outer = panel.response.rect;
-            let shape = if solid {
-                egui::Shape::rect_filled(outer, 0.0, self.chrome.panel)
-            } else {
-                let fill = giverny_term::render::opacity::see_through(self.chrome.panel, opacity);
-                egui::Shape::Vec(
-                    around(outer, &grid_rects)
-                        .into_iter()
-                        .map(|r| egui::Shape::rect_filled(r, 0.0, fill))
-                        .collect(),
-                )
-            };
-            painter.with_clip_rect(outer).set(slot, shape);
-        }
-
-        // A rail drag released anywhere neither the rail nor a terminal
-        // took it ends here.
-        if ctx.input(|i| i.pointer.any_released()) {
-            self.dragging = None;
-        }
-        actions.extend(overlays::palette_ui(self, &ctx));
-        actions.extend(overlays::sessions_ui(self, &ctx));
-        actions.extend(keymap::overlay_ui(self, &ctx));
-
-        for action in actions {
-            self.apply(&ctx, action);
+        self.walk_held = None;
+        self.window_ui(ui);
+        self.draw_extra_windows(&ctx);
+        if !self.windows.is_empty() {
+            giverny_term::pace::note_focus(self.walk_held.is_some());
         }
 
         // A keyboard walk ends the way Alt+Tab does: when Ctrl comes up, or
-        // when the window stops being the one receiving keys at all.
+        // when no window is receiving keys at all.
         if self.walking() {
-            let holding = ctx.input(|i| walk::still_held(i.modifiers.ctrl, i.focused));
-            if holding {
+            if self.walk_held == Some(true) {
                 // Modifier releases arrive as events on every platform we
                 // support, but a missed one would strand the walk open.
                 ctx.request_repaint_after(Duration::from_millis(250));

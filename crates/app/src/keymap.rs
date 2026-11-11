@@ -48,7 +48,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "Ctrl+Shift+W",
-        action: "close the active tab",
+        action: "close the active tab (in a split, the focused terminal)",
         scope: Scope::Global,
     },
     Binding {
@@ -69,6 +69,26 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         chord: "Ctrl+PageUp / PageDown",
         action: "previous / next tab",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+D / Ctrl+Shift+S",
+        action: "split the terminal: new one to the right / below",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+arrows",
+        action: "in a split: move to the terminal that way",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+Alt+arrows",
+        action: "in a split: move the nearest divider that way",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+Z",
+        action: "in a split: show only this terminal, or all again",
         scope: Scope::Global,
     },
     Binding {
@@ -123,7 +143,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "drag",
-        action: "reorder, or move between categories",
+        action: "reorder, or move between categories; onto a terminal to split with it",
         scope: Scope::Rail,
     },
     Binding {

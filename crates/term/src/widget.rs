@@ -160,6 +160,12 @@ pub struct TabView {
     /// text in the clipboard while the terminal had the keyboard: the app
     /// looks for files or an image there and pastes them.
     pub paste_image: bool,
+    /// Whether this terminal takes the keys meant for "the" terminal (search,
+    /// hints, Escape out of them). With several on screen only the focused
+    /// one does; set by the app before [`TabView::show`].
+    pub owns_keys: bool,
+    /// Whether the last frame was built with a hollow cursor.
+    last_hollow: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -240,6 +246,8 @@ impl Default for TabView {
             textures: std::collections::HashMap::new(),
             paste_chord: input::PasteChord::default(),
             paste_image: false,
+            owns_keys: true,
+            last_hollow: false,
         }
     }
 }
@@ -433,13 +441,16 @@ impl TabView {
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
         let dirty = session.take_dirty();
+        let hollow = !self.owns_keys;
         let needs_rebuild = dirty
             || self.last_blink != cursor_visible
+            || self.last_hollow != hollow
             || self
                 .cached
                 .as_ref()
                 .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
         self.last_blink = cursor_visible;
+        self.last_hollow = hollow;
         if needs_rebuild {
             let snapshot = {
                 let term = session.term.lock();
@@ -455,6 +466,7 @@ impl TabView {
                 origin_px,
                 pixels_per_point: ppp,
                 cursor_visible,
+                cursor_hollow: hollow,
             };
             let built = mesh::build(&snapshot, &mut params);
             let mut meshes = Vec::with_capacity(built.glyphs.len() + 2);
@@ -960,7 +972,8 @@ impl TabView {
         ppp: f32,
         m: CellMetrics,
     ) {
-        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::E));
+        let toggle = self.owns_keys
+            && ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::E));
         if toggle {
             self.hints = match self.hints.take() {
                 Some(_) => None,
@@ -976,6 +989,11 @@ impl TabView {
 
         // Read the choice before painting, so a hit closes in the same frame.
         let mut chosen: Option<(char, bool)> = None;
+        if !self.owns_keys {
+            // Focus moved to another terminal: its letters are its own to
+            // type, so the labels here go.
+            return;
+        }
         let mut close = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         ui.input_mut(|i| {
             i.events.retain(|ev| {
@@ -1149,7 +1167,8 @@ impl TabView {
         _m: CellMetrics,
     ) {
         // Open/close chords are consumed before the terminal sees them.
-        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F));
+        let toggle = self.owns_keys
+            && ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F));
         if toggle {
             self.search = match self.search.take() {
                 Some(s) => {
@@ -1169,6 +1188,9 @@ impl TabView {
         let mut close = false;
         let mut step: Option<Direction> = None;
         ui.input_mut(|i| {
+            if !self.owns_keys {
+                return;
+            }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 close = true;
             }

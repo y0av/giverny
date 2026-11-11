@@ -9,6 +9,7 @@ mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod panes;
 mod paste_image;
 mod prompt_bar;
 mod rail;
@@ -91,22 +92,42 @@ fn theme_for(name: &str) -> Theme {
     Theme::by_name(name)
 }
 
-/// `outer` less `hole`, as up to four rects that tile it without overlapping:
-/// full-width bands above and below, and the sides between them.
-fn around(outer: egui::Rect, hole: Option<egui::Rect>) -> Vec<egui::Rect> {
-    let Some(hole) = hole.map(|h| h.intersect(outer)).filter(|h| h.is_positive()) else {
-        return vec![outer];
-    };
-    let x = outer.x_range();
-    [
-        egui::Rect::from_x_y_ranges(x, outer.top()..=hole.top()),
-        egui::Rect::from_x_y_ranges(x, hole.bottom()..=outer.bottom()),
-        egui::Rect::from_x_y_ranges(outer.left()..=hole.left(), hole.y_range()),
-        egui::Rect::from_x_y_ranges(hole.right()..=outer.right(), hole.y_range()),
-    ]
-    .into_iter()
-    .filter(|r| r.is_positive())
-    .collect()
+/// `outer` less the `holes`, as rects that tile it without overlapping:
+/// the area cut into horizontal bands at every hole's top and bottom, and
+/// each band into the spans no hole covers. One hole gives the full-width
+/// bands above and below it and the two sides between; a split gives the
+/// gaps between its terminals too.
+fn around(outer: egui::Rect, holes: &[egui::Rect]) -> Vec<egui::Rect> {
+    let holes: Vec<egui::Rect> = holes
+        .iter()
+        .map(|h| h.intersect(outer))
+        .filter(|h| h.is_positive())
+        .collect();
+    let mut ys = vec![outer.top(), outer.bottom()];
+    for h in &holes {
+        ys.push(h.top());
+        ys.push(h.bottom());
+    }
+    ys.sort_by(f32::total_cmp);
+    ys.dedup();
+    let mut out = Vec::new();
+    for band in ys.windows(2) {
+        let (y0, y1) = (band[0], band[1]);
+        let mut spans: Vec<(f32, f32)> = holes
+            .iter()
+            .filter(|h| h.top() <= y0 && h.bottom() >= y1)
+            .map(|h| (h.left(), h.right()))
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut x = outer.left();
+        for (l, r) in spans.into_iter().chain([(outer.right(), outer.right())]) {
+            if l > x {
+                out.push(egui::Rect::from_x_y_ranges(x..=l, y0..=y1));
+            }
+            x = x.max(r);
+        }
+    }
+    out.into_iter().filter(|r| r.is_positive()).collect()
 }
 
 /// The opacity backgrounds are painted at: the configured one in a window
@@ -937,6 +958,29 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
+    /// Open a terminal beside `from`, in its row.
+    Split {
+        from: TabId,
+        axis: giverny_core::panes::Axis,
+        before: bool,
+    },
+    /// Close every terminal of `id`'s row.
+    CloseRow(TabId),
+    /// Focus the terminal next to the focused one.
+    FocusPane(giverny_core::panes::Direction),
+    /// Move the focused terminal's nearest divider that way.
+    ResizePane(giverny_core::panes::Direction),
+    /// Show only this terminal of its split, full size, or all of them again.
+    ToggleZoom(TabId),
+    /// Take a terminal out of its split onto a row of its own.
+    Detach(TabId),
+    /// Put `tab`'s row into `onto`'s split, beside it.
+    Join {
+        tab: TabId,
+        onto: TabId,
+        axis: giverny_core::panes::Axis,
+        before: bool,
+    },
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -994,6 +1038,10 @@ struct TabShape {
     /// Windows.
     in_wsl: bool,
 }
+
+/// How far a split's terminals without the keyboard sit back: black at this
+/// alpha over them.
+const UNFOCUSED_SHADE: u8 = 56;
 
 pub struct TabRuntime {
     pub session: Option<TermSession>,
@@ -1086,7 +1134,7 @@ pub struct App {
     focus_terminal: bool,
     last_info_refresh: Instant,
     paths: Paths,
-    state_dirty: bool,
+    pub state_dirty: bool,
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
     pub codex: codex_watch::CodexWatch,
@@ -1129,6 +1177,10 @@ pub struct App {
     paste_image: paste_image::ImagePaste,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
+    /// Each terminal's body on screen last frame, for drops aimed at one.
+    pub pane_rects: Vec<(egui::Rect, TabId)>,
+    /// The same, as the layout's own areas, for moving focus by direction.
+    pub pane_areas: Vec<(TabId, giverny_core::panes::Area)>,
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -1689,6 +1741,8 @@ impl App {
             drag_hover: None,
             paste_image: paste_image::ImagePaste::new(),
             row_rects: Vec::new(),
+            pane_rects: Vec::new(),
+            pane_areas: Vec::new(),
             attention: 0,
             #[cfg(unix)]
             coming_forward: None,
@@ -1856,6 +1910,76 @@ impl App {
                 let id = self.new_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
+                self.reveal_terminal();
+            }
+            Action::Split { from, axis, before } => {
+                self.end_switch();
+                let parent = self.ws.tab(from).cloned();
+                if let Some(id) = self.ws.split(from, axis, before) {
+                    history::remove(&self.paths, id);
+                    // The new terminal starts where the one it splits is,
+                    // in its distribution; the category gives it the account.
+                    let cwd = parent
+                        .as_ref()
+                        .and_then(|t| t.cwd.clone())
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(|| PathBuf::from("/"));
+                    if let Some(t) = self.ws.tab_mut(id) {
+                        t.cwd = Some(cwd);
+                        t.wsl_distro = parent.and_then(|p| p.wsl_distro);
+                    }
+                    self.spawn_session(ctx, id, None);
+                    self.reveal_terminal();
+                }
+            }
+            Action::CloseRow(id) => {
+                for tab in self.ws.row_tabs(id) {
+                    self.apply(ctx, Action::CloseTab(tab));
+                }
+            }
+            Action::FocusPane(dir) => {
+                if let Some(next) = panes::neighbour(self, dir) {
+                    self.apply(ctx, Action::Select(next));
+                }
+            }
+            Action::ResizePane(dir) => {
+                if let Some(active) = self.ws.active
+                    && let Some(g) = self.ws.group_of_mut(active)
+                {
+                    g.tree.nudge(active, dir, 0.05);
+                }
+            }
+            Action::ToggleZoom(id) => {
+                if self.ws.active != Some(id) {
+                    self.apply(ctx, Action::Select(id));
+                }
+                if let Some(g) = self.ws.group_of_mut(id) {
+                    g.zoomed = !g.zoomed;
+                }
+                self.focus_terminal = true;
+            }
+            Action::Detach(id) => {
+                self.ws.detach(id);
+                self.focus_terminal = true;
+            }
+            Action::Join {
+                tab,
+                onto,
+                axis,
+                before,
+            } => {
+                self.end_switch();
+                // A row dragged in brings all of its terminals, the one it
+                // was dragged by first.
+                let mut moving = vec![tab];
+                moving.extend(self.ws.row_tabs(tab).into_iter().filter(|&t| t != tab));
+                let mut anchor = onto;
+                for t in moving {
+                    self.ws.join(t, anchor, axis, before);
+                    anchor = t;
+                }
+                self.ws.set_active(tab);
+                self.mark_seen(tab);
                 self.reveal_terminal();
             }
             Action::NewCategory => {
@@ -3069,7 +3193,10 @@ impl App {
         }
         let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         let text = giverny_term::input::dropped_paths_text(&paths);
-        let Some(id) = at.and_then(|p| self.tab_at(p)).or(self.ws.active) else {
+        let Some(id) = at
+            .and_then(|p| self.tab_at(p).or_else(|| self.pane_at(p)))
+            .or(self.ws.active)
+        else {
             return;
         };
         // Dropping on an inactive tab means you want that tab: switch to it,
@@ -3106,6 +3233,46 @@ impl App {
             .iter()
             .find(|(rect, _)| rect.contains(pos))
             .map(|&(_, id)| id)
+    }
+
+    /// The terminal on screen under `pos`, in a split or alone.
+    pub fn pane_at(&self, pos: egui::Pos2) -> Option<TabId> {
+        self.pane_rects
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|&(_, id)| id)
+    }
+
+    /// A rail row dragged over a terminal: show the half it would take, and
+    /// on release build the split. Dropping a row onto its own row does
+    /// nothing; it is already there.
+    fn rail_drop_on_panes(
+        &mut self,
+        ui: &egui::Ui,
+        panes: &[panes::Pane],
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(dragged) = self.dragging else { return };
+        let Some(pointer) = ui.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+        let Some(pane) = panes.iter().find(|p| p.body.contains(pointer)) else {
+            return;
+        };
+        if self.ws.same_row(dragged, pane.tab) {
+            return;
+        }
+        let (axis, before, half) = panes::drop_zone(pane.body, pointer);
+        panes::paint_drop(ui, half, self.chrome.accent);
+        if ui.input(|i| i.pointer.any_released()) {
+            actions.push(Action::Join {
+                tab: dragged,
+                onto: pane.tab,
+                axis,
+                before,
+            });
+            self.dragging = None;
+        }
     }
 
     /// Wayland: drain the drag thread. Positions arrive in surface-local
@@ -3379,7 +3546,7 @@ impl App {
         if self.finish_input.insert(id, seq).unwrap_or(0) == seq {
             return;
         }
-        if self.ws.active != Some(id) {
+        if !self.ws.visible().contains(&id) {
             self.unseen_done.insert(id);
         }
     }
@@ -3387,9 +3554,16 @@ impl App {
     /// The user looked at tab `id`: its done-markers clear, Claude's tick and
     /// the unseen-finish badge alike.
     fn mark_seen(&mut self, id: TabId) {
-        self.claude.mark_viewed(id);
-        self.codex.attended(id);
-        self.unseen_done.remove(&id);
+        // Selecting a split row puts all of its terminals in front of you.
+        let ids = match self.ws.active {
+            Some(active) if self.ws.same_row(active, id) => self.ws.visible(),
+            _ => vec![id],
+        };
+        for id in ids {
+            self.claude.mark_viewed(id);
+            self.codex.attended(id);
+            self.unseen_done.remove(&id);
+        }
     }
 
     /// Note each Claude turn that ended unseen, so its tick outlives the
@@ -3817,6 +3991,146 @@ impl App {
         }
     }
 
+    /// One terminal and what sits on it: the exited bar, its lazy start, the
+    /// grid, the prompt bar. `focused` is the one the keyboard goes to; the
+    /// others in a split are drawn the same but take no keys. Returns the
+    /// grid's rect.
+    fn show_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        tab: TabId,
+        focused: bool,
+        actions: &mut Vec<Action>,
+    ) -> Option<egui::Rect> {
+        let mut grid_rect = None;
+        let exited = self.ws.tab(tab).is_some_and(|t| t.exited);
+        if exited {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("process exited")
+                        .color(Color32::from_rgb(0xd9, 0xb5, 0x5f)),
+                );
+                if ui.small_button("respawn").clicked() {
+                    actions.push(Action::Respawn(tab));
+                }
+            });
+        }
+
+        // Lazy restore: a tab from a previous run spawns its shell on
+        // first focus, pre-seeded with its saved scrollback. Not while a
+        // keyboard walk is held over it: the walk may only be passing
+        // through, and the tab it stops on starts when Ctrl comes up.
+        let walking = self.walking();
+        if walk::starts_now(
+            self.rt.contains_key(&tab),
+            self.ws.tab(tab).is_some_and(|t| t.exited),
+            walking,
+        ) {
+            let preseed = state::load_snapshot(&self.paths, tab)
+                .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
+            self.spawn_session(ctx, tab, preseed);
+            // The tab had a live Claude conversation — resume it; or a
+            // full-screen app worth starting again.
+            self.queue_resume(tab, ctx);
+            self.queue_app_restore(tab);
+        }
+
+        if let Some(rt) = self.rt.get_mut(&tab) {
+            if let Some(session) = &mut rt.session {
+                // The wheel over the closed prompt bar scrolls the
+                // terminal under it.
+                rt.view.wheel_through([prompt_bar::layer(tab)]);
+                rt.view.owns_keys = focused;
+                let response = rt.view.show(ui, &mut self.shared, session);
+                // A click into another terminal of the split moves the
+                // keyboard there. Until then it sits a shade back, so the
+                // one you type into is the brightest on screen.
+                if !focused {
+                    if response.clicked() || response.drag_started() {
+                        actions.push(Action::Select(tab));
+                    }
+                    ui.painter().rect_filled(
+                        response.rect,
+                        0.0,
+                        Color32::from_black_alpha(UNFOCUSED_SHADE),
+                    );
+                }
+                grid_rect = Some(response.rect);
+                if rt.view.paste_image {
+                    self.paste_image.request(ctx, tab);
+                }
+                // Typing goes to the terminal. egui drops a widget's
+                // focus on any press outside it — the rail, the
+                // taskbar, a header button — and the keys typed after
+                // that went nowhere until the terminal was clicked
+                // again. So it takes the keyboard back whenever nothing
+                // else is meant to hold it: a text field (the search
+                // bar, a settings input) or an overlay that reads keys
+                // of its own. Only when it has lost it, since each
+                // request interrupts IME input.
+                let overlay = self.palette.is_some()
+                    || self.session_picker.is_some()
+                    || self.keys_overlay.is_some()
+                    || self.rename.is_some();
+                if focused && (self.focus_terminal || terminal_lost_keys(ctx, response.id, overlay))
+                {
+                    response.request_focus();
+                    self.focus_terminal = false;
+                }
+                // The prompt whose turn is in view, once its own row
+                // has scrolled out of sight.
+                let pinned = self.claude.prompts_of(tab).and_then(|history| {
+                    rt.prompt_bar
+                        .get(session.content_seq(), history, || {
+                            let rows = session.viewport_rows();
+                            prompt_bar::owner(history, &rows, |matches| {
+                                session.find_above(
+                                    prompt_bar::SEARCH_ABOVE,
+                                    &prompt_bar::PROMPT_MARKS,
+                                    |row, shaded| matches(row, shaded),
+                                )
+                            })
+                        })
+                        .map(|i| history[i].as_str())
+                });
+                match pinned {
+                    Some(prompt) => {
+                        let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                        if prompt_bar::show(
+                            ctx,
+                            &self.chrome,
+                            response.rect,
+                            row,
+                            self.shared.font_size,
+                            tab,
+                            prompt,
+                        ) {
+                            self.focus_terminal = true;
+                        }
+                    }
+                    None => prompt_bar::hide(ctx, tab),
+                }
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("no session");
+                });
+            }
+        } else if walking && focused {
+            // A walk passing over a tab that has not started: its saved
+            // scrollback, read-only, until Ctrl comes up.
+            if self.walk_preview.as_ref().is_none_or(|p| p.tab != tab) {
+                let dump = state::load_snapshot(&self.paths, tab);
+                self.walk_preview = Some(walk::Preview::new(tab, dump.as_deref()));
+            }
+            if let Some(preview) = &self.walk_preview {
+                let rect = ui.available_rect_before_wrap();
+                preview.show(ui, rect, &self.chrome, self.shared.font_size);
+            }
+        }
+        grid_rect
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
@@ -3840,6 +4154,44 @@ impl App {
             }
             if i.consume_key(cs, Key::A) {
                 actions.push(Action::JumpAttention);
+            }
+            if let Some(id) = self.ws.active {
+                use giverny_core::panes::{Axis, Direction};
+                if i.consume_key(cs, Key::D) {
+                    actions.push(Action::Split {
+                        from: id,
+                        axis: Axis::Row,
+                        before: false,
+                    });
+                }
+                if i.consume_key(cs, Key::S) {
+                    actions.push(Action::Split {
+                        from: id,
+                        axis: Axis::Column,
+                        before: false,
+                    });
+                }
+                // The rest only mean something in a split; elsewhere the
+                // keys belong to the terminal.
+                let split = self.ws.group_of(id).is_some();
+                if split && i.consume_key(cs, Key::Z) {
+                    actions.push(Action::ToggleZoom(id));
+                }
+                // With Alt the divider moves; without, the focus. Alt first:
+                // a chord without it matches one with it too.
+                for (key, dir) in [
+                    (Key::ArrowLeft, Direction::Left),
+                    (Key::ArrowRight, Direction::Right),
+                    (Key::ArrowUp, Direction::Up),
+                    (Key::ArrowDown, Direction::Down),
+                ] {
+                    if split && i.consume_key(cs | Modifiers::ALT, key) {
+                        actions.push(Action::ResizePane(dir));
+                    }
+                    if split && i.consume_key(cs, key) {
+                        actions.push(Action::FocusPane(dir));
+                    }
+                }
             }
             if i.consume_key(cs, Key::P) {
                 actions.push(Action::TogglePalette);
@@ -3983,7 +4335,8 @@ impl eframe::App for App {
             }
         }
 
-        let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        let shown = self.ws.visible();
+        let effects = self.claude.tick(&shell_pids, shown.clone(), &titles);
         for msg in effects.codex {
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(&msg) else {
                 continue;
@@ -3991,9 +4344,7 @@ impl eframe::App for App {
             let Some(tab) = self.ws.tab(id) else { continue };
             let distro = msg.wsl_distro.clone().or_else(|| tab.wsl_distro.clone());
             let before = self.codex.state_of(id);
-            if let Some(captured) = self
-                .codex
-                .handle(&msg, id, distro, self.ws.active == Some(id))
+            if let Some(captured) = self.codex.handle(&msg, id, distro, shown.contains(&id))
                 && let Some(tab) = self.ws.tab_mut(id)
             {
                 tab.agent_session = captured;
@@ -4003,7 +4354,7 @@ impl eframe::App for App {
             }
             let after = self.codex.state_of(id);
             if self.cfg.behavior.notifications
-                && self.ws.active != Some(id)
+                && !shown.contains(&id)
                 && after != before
                 && matches!(
                     after,
@@ -4019,10 +4370,10 @@ impl eframe::App for App {
                 desktop_notify(summary.into(), titles.get(&id).cloned().unwrap_or_default());
             }
         }
-        if let Some(active) = self.ws.active
-            && self.codex.state_of(active) == giverny_core::agent::AgentState::DoneUnseen
-        {
-            self.codex.attended(active);
+        for &id in &shown {
+            if self.codex.state_of(id) == giverny_core::agent::AgentState::DoneUnseen {
+                self.codex.attended(id);
+            }
         }
         self.show_attention(&ctx, frame);
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -4124,7 +4475,7 @@ impl eframe::App for App {
                 central.frame(egui::Frame::central_panel(ui.style()).fill(Color32::TRANSPARENT));
         }
         let mut backdrop = None;
-        let mut grid_rect = None;
+        let mut grid_rects: Vec<egui::Rect> = Vec::new();
         let mut solid = false;
         let panel = central.show(ui, |ui| {
             if opacity < 1.0 {
@@ -4148,18 +4499,22 @@ impl eframe::App for App {
                 return;
             };
 
-            // Category accent strip above the pane: you always know where you are.
+            // Category accent strip above the pane: you always know where you
+            // are. A split's headers carry it instead, on the focused one.
+            let split = self.ws.group_of(active).is_some();
             let accent = self
                 .ws
                 .tab(active)
                 .and_then(|t| self.ws.category(t.category))
                 .map(|c| self.chrome.category(c.color_index))
                 .unwrap_or(Color32::GRAY);
-            let (strip, _) = ui.allocate_exact_size(
-                egui::Vec2::new(ui.available_width(), 3.0),
-                egui::Sense::hover(),
-            );
-            ui.painter().rect_filled(strip, 0.0, accent);
+            if !split {
+                let (strip, _) = ui.allocate_exact_size(
+                    egui::Vec2::new(ui.available_width(), 3.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(strip, 0.0, accent);
+            }
 
             // Files hovering over the window: say what a drop will do, so a
             // drag is not a guess. On X11 winit counts the files but reports
@@ -4170,7 +4525,7 @@ impl eframe::App for App {
             if hovering > 0 || self.drag_hover.is_some() {
                 let target = self
                     .drag_hover
-                    .and_then(|p| self.tab_at(p))
+                    .and_then(|p| self.tab_at(p).or_else(|| self.pane_at(p)))
                     .unwrap_or(active);
                 let into = self
                     .ws
@@ -4191,115 +4546,39 @@ impl eframe::App for App {
                 });
             }
 
-            let exited = self.ws.tab(active).is_some_and(|t| t.exited);
-            if exited {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("process exited")
-                            .color(Color32::from_rgb(0xd9, 0xb5, 0x5f)),
-                    );
-                    if ui.small_button("respawn").clicked() {
-                        actions.push(Action::Respawn(active));
-                    }
-                });
-            }
-
-            // Lazy restore: a tab from a previous run spawns its shell on
-            // first focus, pre-seeded with its saved scrollback. Not while a
-            // keyboard walk is held over it: the walk may only be passing
-            // through, and the tab it stops on starts when Ctrl comes up.
-            let walking = self.walking();
-            if walk::starts_now(
-                self.rt.contains_key(&active),
-                self.ws.tab(active).is_some_and(|t| t.exited),
-                walking,
-            ) {
-                let preseed = state::load_snapshot(&self.paths, active)
-                    .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
-                self.spawn_session(&ctx, active, preseed);
-                // The tab had a live Claude conversation — resume it; or a
-                // full-screen app worth starting again.
-                self.queue_resume(active, &ctx);
-                self.queue_app_restore(active);
-            }
-
-            if let Some(rt) = self.rt.get_mut(&active) {
-                if let Some(session) = &mut rt.session {
-                    // The wheel over the closed prompt bar scrolls the
-                    // terminal under it.
-                    rt.view.wheel_through([prompt_bar::layer(active)]);
-                    let response = rt.view.show(ui, &mut self.shared, session);
-                    grid_rect = Some(response.rect);
-                    if rt.view.paste_image {
-                        self.paste_image.request(&ctx, active);
-                    }
-                    // Typing goes to the terminal. egui drops a widget's
-                    // focus on any press outside it — the rail, the
-                    // taskbar, a header button — and the keys typed after
-                    // that went nowhere until the terminal was clicked
-                    // again. So it takes the keyboard back whenever nothing
-                    // else is meant to hold it: a text field (the search
-                    // bar, a settings input) or an overlay that reads keys
-                    // of its own. Only when it has lost it, since each
-                    // request interrupts IME input.
-                    let overlay = self.palette.is_some()
-                        || self.session_picker.is_some()
-                        || self.keys_overlay.is_some()
-                        || self.rename.is_some();
-                    if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
-                        response.request_focus();
-                        self.focus_terminal = false;
-                    }
-                    // The prompt whose turn is in view, once its own row
-                    // has scrolled out of sight.
-                    let pinned = self.claude.prompts_of(active).and_then(|history| {
-                        rt.prompt_bar
-                            .get(session.content_seq(), history, || {
-                                let rows = session.viewport_rows();
-                                prompt_bar::owner(history, &rows, |matches| {
-                                    session.find_above(
-                                        prompt_bar::SEARCH_ABOVE,
-                                        &prompt_bar::PROMPT_MARKS,
-                                        |row, shaded| matches(row, shaded),
-                                    )
-                                })
-                            })
-                            .map(|i| history[i].as_str())
-                    });
-                    match pinned {
-                        Some(prompt) => {
-                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
-                            if prompt_bar::show(
-                                &ctx,
-                                &self.chrome,
-                                response.rect,
-                                row,
-                                self.shared.font_size,
-                                active,
-                                prompt,
-                            ) {
-                                self.focus_terminal = true;
-                            }
-                        }
-                        None => prompt_bar::hide(&ctx, active),
-                    }
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("no session");
-                    });
+            let area = ui.available_rect_before_wrap();
+            let panes = panes::layout(self, area);
+            self.pane_rects = panes.iter().map(|p| (p.body, p.tab)).collect();
+            self.pane_areas = panes
+                .iter()
+                .map(|p| {
+                    let r = p.header.map_or(p.body, |h| h.union(p.body));
+                    (
+                        p.tab,
+                        giverny_core::panes::Area::new(r.min.x, r.min.y, r.width(), r.height()),
+                    )
+                })
+                .collect();
+            for pane in &panes {
+                let focused = pane.tab == active;
+                if let Some(h) = pane.header {
+                    panes::header(self, ui, h, pane.tab, focused, &mut actions);
                 }
-            } else if walking {
-                // A walk passing over a tab that has not started: its saved
-                // scrollback, read-only, until Ctrl comes up.
-                if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
-                    let dump = state::load_snapshot(&self.paths, active);
-                    self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
-                }
-                if let Some(preview) = &self.walk_preview {
-                    let rect = ui.available_rect_before_wrap();
-                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(pane.body)
+                        .id_salt(("pane", pane.tab.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                if let Some(r) =
+                    self.show_terminal(&ctx, &mut child, pane.tab, focused, &mut actions)
+                {
+                    grid_rects.push(r);
                 }
             }
+            panes::dividers(self, ui, area);
+            self.rail_drop_on_panes(ui, &panes, &mut actions);
+            ui.advance_cursor_after_rect(area);
         });
         if let Some((slot, painter)) = backdrop {
             let outer = panel.response.rect;
@@ -4308,7 +4587,7 @@ impl eframe::App for App {
             } else {
                 let fill = giverny_term::render::opacity::see_through(self.chrome.panel, opacity);
                 egui::Shape::Vec(
-                    around(outer, grid_rect)
+                    around(outer, &grid_rects)
                         .into_iter()
                         .map(|r| egui::Shape::rect_filled(r, 0.0, fill))
                         .collect(),
@@ -4317,6 +4596,11 @@ impl eframe::App for App {
             painter.with_clip_rect(outer).set(slot, shape);
         }
 
+        // A rail drag released anywhere neither the rail nor a terminal
+        // took it ends here.
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.dragging = None;
+        }
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
@@ -5090,7 +5374,7 @@ mod tests {
     fn the_backdrop_tiles_around_the_grid_exactly() {
         let outer = egui::Rect::from_min_max(egui::pos2(240.0, 0.0), egui::pos2(1280.0, 820.0));
         let grid = egui::Rect::from_min_max(egui::pos2(248.0, 14.0), egui::pos2(1272.0, 812.0));
-        let parts = around(outer, Some(grid));
+        let parts = around(outer, &[grid]);
         assert_eq!(parts.len(), 4);
         let area: f32 = parts.iter().map(|r| r.area()).sum();
         assert_eq!(area, outer.area() - grid.area(), "gaps or overlaps");
@@ -5100,7 +5384,14 @@ mod tests {
                 assert!(!a.shrink(0.01).intersects(b.shrink(0.01)), "parts overlap");
             }
         }
-        assert_eq!(around(outer, None), vec![outer]);
+        assert_eq!(around(outer, &[]), vec![outer]);
+
+        // Two terminals side by side: the gap between them is filled too.
+        let left = egui::Rect::from_min_max(egui::pos2(248.0, 14.0), egui::pos2(700.0, 812.0));
+        let right = egui::Rect::from_min_max(egui::pos2(704.0, 14.0), egui::pos2(1272.0, 812.0));
+        let parts = around(outer, &[left, right]);
+        let area: f32 = parts.iter().map(|r| r.area()).sum();
+        assert_eq!(area, outer.area() - left.area() - right.area());
     }
 
     #[test]

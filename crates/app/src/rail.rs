@@ -370,6 +370,7 @@ fn braille(turns: f64) -> String {
 // Chrome colours come from the active theme (see `chrome`), reached through
 // `app.chrome`. Only geometry is constant here.
 
+#[derive(Clone)]
 struct RowData {
     id: TabId,
     title: String,
@@ -397,6 +398,8 @@ struct RowData {
     /// not looked since: a Claude turn, or a shell's command.
     /// Outlives Claude's `DoneUnseen`, which a new turn replaces.
     unseen: bool,
+    /// Terminals in the row: more than one for a split.
+    panes: usize,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -512,7 +515,69 @@ fn row_data(
         running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
         unseen: app.unseen_done.contains(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
+        panes: 1,
     }
+}
+
+/// The row for `t`'s rail entry: its own, or for a split the row of all its
+/// terminals at once. A split wears the most pressing state among them, a
+/// flag over a spinner over a tick, so a terminal that wants you is never
+/// hidden behind a quiet neighbour; selecting it lands on the terminal you
+/// last typed in.
+fn row_for(
+    app: &App,
+    t: &giverny_core::tabs::Tab,
+    color: Color32,
+    under: Option<&Path>,
+) -> RowData {
+    let Some(group) = app.ws.group_of(t.id) else {
+        return row_data(app, t, color, under);
+    };
+    let members: Vec<RowData> = group
+        .tree
+        .leaves()
+        .into_iter()
+        .filter_map(|id| app.ws.tab(id))
+        .map(|m| row_data(app, m, color, under))
+        .collect();
+    merge_rows(members, group.focus).unwrap_or_else(|| row_data(app, t, color, under))
+}
+
+/// One row standing for several: see [`row_for`].
+fn merge_rows(members: Vec<RowData>, focus: TabId) -> Option<RowData> {
+    let first = members.first()?.clone();
+    let lead = members
+        .iter()
+        .find(|r| r.id == focus)
+        .cloned()
+        .unwrap_or(first);
+    let any = |f: fn(&RowData) -> bool| members.iter().any(f);
+    let claude = [
+        ClaudeState::NeedsYou,
+        ClaudeState::Busy,
+        ClaudeState::DoneUnseen,
+        ClaudeState::Idle,
+    ]
+    .into_iter()
+    .find(|s| members.iter().any(|r| r.started && r.claude == *s))
+    .unwrap_or(ClaudeState::None);
+    Some(RowData {
+        title: members
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect::<Vec<_>>()
+            .join(" · "),
+        active: any(|r| r.active),
+        exited: members.iter().all(|r| r.exited),
+        started: any(|r| r.started),
+        resumes_claude: any(|r| r.resumes_claude),
+        claude,
+        background: any(|r| r.background),
+        running: any(|r| r.running),
+        unseen: any(|r| r.unseen),
+        panes: members.len(),
+        ..lead
+    })
 }
 
 /// Counts a header carries: how many, how many working, how many want you.
@@ -574,7 +639,8 @@ fn groups(app: &App) -> Vec<GroupData> {
                 let rows: Vec<RowData> = app
                     .ws
                     .tabs_in(c.id)
-                    .map(|t| row_data(app, t, color, None))
+                    .filter(|t| app.ws.is_row_head(t.id))
+                    .map(|t| row_for(app, t, color, None))
                     .collect();
                 let (count, busy, needs) = tallies(&rows);
                 GroupData {
@@ -618,8 +684,8 @@ fn groups(app: &App) -> Vec<GroupData> {
                         .ws
                         .tabs
                         .iter()
-                        .filter(|t| t.git_repo == key)
-                        .map(|t| row_data(app, t, color, key.as_deref()))
+                        .filter(|t| t.git_repo == key && app.ws.is_row_head(t.id))
+                        .map(|t| row_for(app, t, color, key.as_deref()))
                         .collect();
                     let (count, busy, needs) = tallies(&rows);
                     let category = rows
@@ -787,8 +853,15 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         if ui.input(|i| i.pointer.any_released()) {
             if let Some((cat, index, _)) = drop_target {
                 actions.push(Action::ReorderTab(dragged, cat, index));
+                app.dragging = None;
+            } else if ui
+                .input(|i| i.pointer.latest_pos())
+                .is_some_and(|p| ui.max_rect().contains(p))
+            {
+                app.dragging = None;
             }
-            app.dragging = None;
+            // Released over the terminals: a drop onto a split, which the
+            // central panel sees after the rail (`rail_drop_on_panes`).
         }
     }
 
@@ -1560,6 +1633,87 @@ impl Mark {
     }
 }
 
+/// A row's status mark (see [`Mark`]) at `dot`. `rect` is what an animated
+/// mark keeps repainting.
+fn draw_mark(
+    app: &App,
+    ui: &Ui,
+    p: &egui::Painter,
+    rect: Rect,
+    dot: Pos2,
+    row: &RowData,
+    dim: Color32,
+) {
+    let time = anim_time();
+    let mark = Mark::of(row);
+    let color = mark.color(row.color, dim);
+    match mark {
+        // Off, a working tab's spinner is not drawn, the only state left
+        // blank (a calm ring holds still, full size). The title stays
+        // where it is.
+        Mark::Busy => busy(ui, p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
+        Mark::Flag => {
+            // One breath every two seconds, sampled at the animation step.
+            // Off, no pulse: the flag held at full colour.
+            let pulse = if animating(ui) {
+                keep_animating(ui, rect);
+                breath(time)
+            } else {
+                1.0
+            };
+            flag(p, dot, color.gamma_multiply(pulse));
+        }
+        // Still: finished, nothing owed. The flag above is the one that
+        // wants something; the two differ in shape and movement.
+        Mark::Tick => tick(p, dot, color),
+        // A background shell or its subagents keep running while Claude
+        // waits at its prompt. Worth showing — it is why a directory is
+        // still churning — but it is not the agent working: it can take a
+        // message. So no spinner and no flag: a slow colour drifting
+        // through three small dots, the hum of something left running.
+        // Off, they hold still and faded.
+        Mark::Wave => shell_dots(ui, p, rect, dot, color),
+        Mark::Idle => {
+            p.circle_filled(dot, DOT_R, color);
+        }
+        // A plain shell, which most tabs are most of the time: a small
+        // filled square at its prompt, breathing out to the hollow square
+        // and back while a command runs, and the small square hollow and in
+        // gray once the shell has exited. Squares read larger than circles
+        // of the same width, so each is a touch narrower than its round twin.
+        Mark::Running => breathing_square(ui, p, rect, dot, color),
+        Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
+            if let Some((side, filled)) = mark.still_square() {
+                square(p, dot, side, filled, color);
+            }
+        }
+        // A restored tab whose process has not started yet: small and
+        // gray, since any colour would claim something running.
+        Mark::NotStarted { claude: true } => {
+            p.circle_filled(dot, DOT_R, color);
+        }
+    }
+    // The unseen finish beside what runs after it: the tick,
+    // smaller, in the gutter left of the mark, so the mark keeps its place
+    // and the title never moves as the badge comes and goes.
+    if mark.badged(row) {
+        badge_tick(p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
+    }
+}
+
+/// The status mark of one terminal, for the header over it in a split:
+/// the rail's mark for that terminal alone.
+pub fn pane_mark(app: &App, ui: &Ui, p: &egui::Painter, rect: Rect, dot: Pos2, tab: TabId) {
+    let Some(t) = app.ws.tab(tab) else { return };
+    let color = app
+        .ws
+        .category(t.category)
+        .map(|c| app.chrome.category(c.color_index))
+        .unwrap_or(app.chrome.dim);
+    let row = row_data(app, t, color, None);
+    draw_mark(app, ui, p, rect, dot, &row, app.chrome.dim);
+}
+
 fn tab_row(
     app: &mut App,
     ui: &mut Ui,
@@ -1624,61 +1778,7 @@ fn tab_row(
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
-    let time = anim_time();
-    let mark = Mark::of(row);
-    let color = mark.color(row.color, dim);
-    match mark {
-        // Off, a working tab's spinner is not drawn, the only state left
-        // blank (a calm ring holds still, full size). The title stays
-        // where it is.
-        Mark::Busy => busy(ui, &p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
-        Mark::Flag => {
-            // One breath every two seconds, sampled at the animation step.
-            // Off, no pulse: the flag held at full colour.
-            let pulse = if animating(ui) {
-                keep_animating(ui, rect);
-                breath(time)
-            } else {
-                1.0
-            };
-            flag(&p, dot, color.gamma_multiply(pulse));
-        }
-        // Still: finished, nothing owed. The flag above is the one that
-        // wants something; the two differ in shape and movement.
-        Mark::Tick => tick(&p, dot, color),
-        // A background shell or its subagents keep running while Claude
-        // waits at its prompt. Worth showing — it is why a directory is
-        // still churning — but it is not the agent working: it can take a
-        // message. So no spinner and no flag: a slow colour drifting
-        // through three small dots, the hum of something left running.
-        // Off, they hold still and faded.
-        Mark::Wave => shell_dots(ui, &p, rect, dot, color),
-        Mark::Idle => {
-            p.circle_filled(dot, DOT_R, color);
-        }
-        // A plain shell, which most tabs are most of the time: a small
-        // filled square at its prompt, breathing out to the hollow square
-        // and back while a command runs, and the small square hollow and in
-        // gray once the shell has exited. Squares read larger than circles
-        // of the same width, so each is a touch narrower than its round twin.
-        Mark::Running => breathing_square(ui, &p, rect, dot, color),
-        Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
-            if let Some((side, filled)) = mark.still_square() {
-                square(&p, dot, side, filled, color);
-            }
-        }
-        // A restored tab whose process has not started yet: small and
-        // gray, since any colour would claim something running.
-        Mark::NotStarted { claude: true } => {
-            p.circle_filled(dot, DOT_R, color);
-        }
-    }
-    // The unseen finish beside what runs after it: the tick,
-    // smaller, in the gutter left of the mark, so the mark keeps its place
-    // and the title never moves as the badge comes and goes.
-    if mark.badged(row) {
-        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
-    }
+    draw_mark(app, ui, &p, rect, dot, row, dim);
 
     // Inline rename?
     if let Some((RenameTarget::Tab(id), buf)) = &mut app.rename
@@ -1707,8 +1807,22 @@ fn tab_row(
         return rect;
     }
 
+    // A split says so at the row's end, where the close button would be
+    // when hovered: how its terminals are laid out matters less than that
+    // there are several behind one row.
+    let glyph_w = if row.panes > 1 && !hovered {
+        split_glyph(
+            &p,
+            Pos2::new(rect.max.x - 22.0, rect.min.y + 13.0),
+            row.panes,
+            dim,
+        );
+        14.0
+    } else {
+        0.0
+    };
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
+    let char_budget = ((width - 68.0 - glyph_w) / 7.2).max(4.0) as usize;
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
@@ -1753,7 +1867,7 @@ fn tab_row(
             },
         );
         if close.clicked() {
-            actions.push(Action::CloseTab(row.id));
+            actions.push(close_row(row));
             return rect;
         }
     }
@@ -1783,8 +1897,13 @@ fn tab_row(
             }
         });
         ui.separator();
-        if ui.button("close").clicked() {
-            actions.push(Action::CloseTab(row.id));
+        let label = if row.panes > 1 {
+            format!("close all {} terminals", row.panes)
+        } else {
+            "close".to_string()
+        };
+        if ui.button(label).clicked() {
+            actions.push(close_row(row));
             ui.close();
         }
     });
@@ -1797,7 +1916,7 @@ fn tab_row(
     } else if resp.clicked() {
         actions.push(Action::Select(row.id));
     } else if resp.middle_clicked() {
-        actions.push(Action::CloseTab(row.id));
+        actions.push(close_row(row));
     }
     if hovered {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
@@ -1811,6 +1930,29 @@ fn tab_row(
         );
     }
     rect
+}
+
+/// The rail's close for `row`: the terminal, or a split's every terminal.
+fn close_row(row: &RowData) -> Action {
+    if row.panes > 1 {
+        Action::CloseRow(row.id)
+    } else {
+        Action::CloseTab(row.id)
+    }
+}
+
+/// A small window cut into panes, centred on `at`: two side by side, or
+/// for three and more the right one split again.
+fn split_glyph(p: &egui::Painter, at: Pos2, panes: usize, color: Color32) {
+    let r = Rect::from_center_size(at, Vec2::new(12.0, 9.0));
+    let stroke = Stroke::new(1.0, color);
+    p.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Inside);
+    let mid = r.center().x.round() + 0.5;
+    p.line_segment([Pos2::new(mid, r.min.y), Pos2::new(mid, r.max.y)], stroke);
+    if panes > 2 {
+        let y = r.center().y.round() + 0.5;
+        p.line_segment([Pos2::new(mid, y), Pos2::new(r.max.x, y)], stroke);
+    }
 }
 
 /// WSLg lost its shared memory with Windows: say why the window lags and
@@ -2497,6 +2639,12 @@ fn usage_bar(
     );
 }
 
+/// `s` cut to `max` characters and put in display order, for a label drawn
+/// outside the rail.
+pub fn fit(s: &str, max: usize) -> String {
+    egui_line(&truncate_chars(s, max), None).into_owned()
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -2944,7 +3092,39 @@ mod tests {
             background: false,
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
+            panes: 1,
         }
+    }
+
+    /// A split's row wears the most pressing of its terminals' states.
+    #[test]
+    fn a_split_row_shows_what_wants_you_first() {
+        let with = |id, claude| RowData {
+            id: TabId(id),
+            title: format!("t{id}"),
+            ..row(claude)
+        };
+        let merged = merge_rows(
+            vec![
+                with(1, ClaudeState::Busy),
+                with(2, ClaudeState::NeedsYou),
+                with(3, ClaudeState::Idle),
+            ],
+            TabId(3),
+        )
+        .unwrap();
+        assert_eq!(merged.claude, ClaudeState::NeedsYou);
+        assert_eq!(merged.id, TabId(3), "selecting it lands on the last focus");
+        assert_eq!(merged.title, "t1 · t2 · t3");
+        assert_eq!(merged.panes, 3);
+
+        let merged = merge_rows(
+            vec![with(1, ClaudeState::Idle), with(2, ClaudeState::DoneUnseen)],
+            TabId(1),
+        )
+        .unwrap();
+        assert_eq!(merged.claude, ClaudeState::DoneUnseen);
+        assert!(merged.unseen);
     }
 
     /// Every state gets its own mark, and a plain shell's are squares no

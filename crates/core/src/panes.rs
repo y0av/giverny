@@ -121,6 +121,11 @@ impl Node {
         }
     }
 
+    /// Never: a tree holds at least one terminal.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Node::Leaf(_) => 1,
@@ -241,9 +246,7 @@ impl Node {
             None => Some(self),
             Some((&step, rest)) => match self {
                 Node::Leaf(_) => None,
-                Node::Split { a, b, .. } => {
-                    if step { b } else { a }.at_path(rest)
-                }
+                Node::Split { a, b, .. } => if step { b } else { a }.at_path(rest),
             },
         }
     }
@@ -312,10 +315,22 @@ pub fn neighbour(areas: &[(TabId, Area)], from: TabId, dir: Direction) -> Option
         .filter(|(id, _)| *id != from)
         .filter_map(|(id, r)| {
             let (beyond, overlap) = match dir {
-                Direction::Right => (r.x >= here.x + here.w - eps, overlaps(r.y, r.h, here.y, here.h)),
-                Direction::Left => (r.x + r.w <= here.x + eps, overlaps(r.y, r.h, here.y, here.h)),
-                Direction::Down => (r.y >= here.y + here.h - eps, overlaps(r.x, r.w, here.x, here.w)),
-                Direction::Up => (r.y + r.h <= here.y + eps, overlaps(r.x, r.w, here.x, here.w)),
+                Direction::Right => (
+                    r.x >= here.x + here.w - eps,
+                    overlaps(r.y, r.h, here.y, here.h),
+                ),
+                Direction::Left => (
+                    r.x + r.w <= here.x + eps,
+                    overlaps(r.y, r.h, here.y, here.h),
+                ),
+                Direction::Down => (
+                    r.y >= here.y + here.h - eps,
+                    overlaps(r.x, r.w, here.x, here.w),
+                ),
+                Direction::Up => (
+                    r.y + r.h <= here.y + eps,
+                    overlaps(r.x, r.w, here.x, here.w),
+                ),
             };
             if !beyond || overlap <= 0.0 {
                 return None;
@@ -376,7 +391,9 @@ mod tests {
     fn removing_a_leaf_lets_its_sibling_take_the_space() {
         let n = three().remove(B).unwrap();
         assert_eq!(n.leaves(), vec![A, C]);
-        let Node::Split { axis, b, .. } = &n else { panic!() };
+        let Node::Split { axis, b, .. } = &n else {
+            panic!()
+        };
         assert_eq!(*axis, Axis::Row);
         assert_eq!(**b, Node::Leaf(C), "c moved up into b's split's place");
 
@@ -390,7 +407,11 @@ mod tests {
         let n = three();
         assert_eq!(n.heir(B), Some(C));
         assert_eq!(n.heir(C), Some(B));
-        assert_eq!(n.heir(A), Some(B), "a's sibling is the stack; its first leaf");
+        assert_eq!(
+            n.heir(A),
+            Some(B),
+            "a's sibling is the stack; its first leaf"
+        );
         assert_eq!(Node::Leaf(A).heir(A), None);
     }
 
@@ -413,7 +434,9 @@ mod tests {
 
         n.set_ratio(&divs[1].path, 0.95);
         let Node::Split { b, .. } = &n else { panic!() };
-        let Node::Split { ratio, .. } = **b else { panic!() };
+        let Node::Split { ratio, .. } = **b else {
+            panic!()
+        };
         assert_eq!(ratio, 1.0 - MIN_RATIO, "kept off the edge");
         n.equalize();
         assert_eq!(n, three());
@@ -423,13 +446,25 @@ mod tests {
     fn nudge_moves_the_nearest_split_on_that_axis() {
         let mut n = three();
         assert!(n.nudge(C, Direction::Up, 0.1), "the stack's divider");
-        let Node::Split { ratio: outer, b, .. } = &n else { panic!() };
-        let Node::Split { ratio: inner, .. } = **b else { panic!() };
+        let Node::Split {
+            ratio: outer, b, ..
+        } = &n
+        else {
+            panic!()
+        };
+        let Node::Split { ratio: inner, .. } = **b else {
+            panic!()
+        };
         assert_eq!(*outer, 0.5);
         assert!((inner - 0.4).abs() < 1e-6);
 
-        assert!(n.nudge(C, Direction::Left, 0.1), "no row split in the stack: the outer one");
-        let Node::Split { ratio: outer, .. } = &n else { panic!() };
+        assert!(
+            n.nudge(C, Direction::Left, 0.1),
+            "no row split in the stack: the outer one"
+        );
+        let Node::Split { ratio: outer, .. } = &n else {
+            panic!()
+        };
         assert!((outer - 0.4).abs() < 1e-6);
         assert!(!Node::Leaf(A).clone().nudge(A, Direction::Left, 0.1));
     }
@@ -437,7 +472,11 @@ mod tests {
     #[test]
     fn neighbours_follow_the_layout() {
         let areas = three().layout(Area::new(0.0, 0.0, 201.0, 101.0), 1.0);
-        assert_eq!(neighbour(&areas, A, Direction::Right), Some(B), "level with a's top half wins the tie");
+        assert_eq!(
+            neighbour(&areas, A, Direction::Right),
+            Some(B),
+            "level with a's top half wins the tie"
+        );
         assert_eq!(neighbour(&areas, B, Direction::Down), Some(C));
         assert_eq!(neighbour(&areas, C, Direction::Up), Some(B));
         assert_eq!(neighbour(&areas, C, Direction::Left), Some(A));

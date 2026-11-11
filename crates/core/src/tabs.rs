@@ -450,7 +450,9 @@ impl Workspace {
 
     /// The split row `tab` is in, if it is in one.
     pub fn group_of(&self, tab: TabId) -> Option<&Group> {
-        self.tab(tab).and_then(|t| t.group).and_then(|g| self.group(g))
+        self.tab(tab)
+            .and_then(|t| t.group)
+            .and_then(|g| self.group(g))
     }
 
     pub fn group_of_mut(&mut self, tab: TabId) -> Option<&mut Group> {
@@ -677,9 +679,7 @@ impl Workspace {
         groups.retain_mut(|g| {
             let mut tree = Some(g.tree.clone());
             for leaf in g.tree.leaves() {
-                let member = self
-                    .tab(leaf)
-                    .is_some_and(|t| t.group == Some(g.id));
+                let member = self.tab(leaf).is_some_and(|t| t.group == Some(g.id));
                 if !live.contains(&leaf) || !member {
                     tree = tree.and_then(|n| n.remove(leaf));
                 }
@@ -1067,9 +1067,17 @@ mod tests {
         let b = ws.split(a, Axis::Row, false).unwrap();
         ws.set_active(a);
         ws.set_active(b);
-        assert_eq!(ws.recent_order(), vec![b, x], "the row once, then the row before it");
+        assert_eq!(
+            ws.recent_order(),
+            vec![b, x],
+            "the row once, then the row before it"
+        );
         ws.set_active(x);
-        assert_eq!(ws.recent_order(), vec![x, b], "the row comes back at its last focus");
+        assert_eq!(
+            ws.recent_order(),
+            vec![x, b],
+            "the row comes back at its last focus"
+        );
         assert_eq!(ws.row_target(a), b);
     }
 
@@ -1096,7 +1104,11 @@ mod tests {
         let b = ws.split(a, Axis::Row, false).unwrap();
         let c = ws.split(b, Axis::Column, false).unwrap();
         ws.close_tab(c);
-        assert_eq!(ws.active, Some(b), "the terminal beside it, not the previous row");
+        assert_eq!(
+            ws.active,
+            Some(b),
+            "the terminal beside it, not the previous row"
+        );
         assert_eq!(ws.row_tabs(a), vec![a, b]);
         ws.close_tab(b);
         assert_eq!(ws.active, Some(a));
@@ -1119,9 +1131,17 @@ mod tests {
         ws.reorder_tab(c, main, 0);
         assert_eq!(ids(&ws, main), vec![c, a, b]);
         ws.reorder_tab(b, main, 0);
-        assert_eq!(ids(&ws, main), vec![a, b, c], "dragging any member drags the row");
+        assert_eq!(
+            ids(&ws, main),
+            vec![a, b, c],
+            "dragging any member drags the row"
+        );
         ws.reorder_tab(c, main, 1);
-        assert_eq!(ids(&ws, main), vec![a, b, c], "index 1 is after the row, not inside it");
+        assert_eq!(
+            ids(&ws, main),
+            vec![a, b, c],
+            "index 1 is after the row, not inside it"
+        );
         ws.move_tab_to_category(a, work);
         assert_eq!(ids(&ws, work), vec![a, b]);
         assert_eq!(ids(&ws, main), vec![c]);

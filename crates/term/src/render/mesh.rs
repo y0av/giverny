@@ -249,6 +249,9 @@ pub struct BuildParams<'a> {
     pub pixels_per_point: f32,
     /// Blink phase: `false` hides the cursor for this frame.
     pub cursor_visible: bool,
+    /// Another terminal has the keyboard: a block cursor is drawn as its
+    /// outline, so the one you type into is the only solid one on screen.
+    pub cursor_hollow: bool,
 }
 
 pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
@@ -274,7 +277,13 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
 
     // Cursor block backdrop paints first so glyphs draw over it.
     let shown_cursor = if p.cursor_visible {
-        snapshot.cursor
+        snapshot.cursor.map(|(line, col, shape)| {
+            if p.cursor_hollow && shape == CursorShape::Block {
+                (line, col, CursorShape::HollowBlock)
+            } else {
+                (line, col, shape)
+            }
+        })
     } else {
         None
     };
@@ -520,6 +529,7 @@ mod tests {
             origin_px: Vec2::ZERO,
             pixels_per_point: 1.0,
             cursor_visible: true,
+            cursor_hollow: false,
         };
         let meshes = build(&snap, &mut params);
 

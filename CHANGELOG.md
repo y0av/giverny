@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Lower CPU use with many terminals.** Foreground commands are found with
+  one process-table scan per refresh. Unchanged scrollback skips serialization
+  as well as disk writes, including in background tabs. Hidden and scrolled-away
+  cursors no longer schedule blink repaints.
 - **Splits.** `Ctrl+Shift+D` and `Ctrl+Shift+S` split the terminal right or
   down, inside the same rail row. The row wears the most pressing state among
   its terminals, and each terminal has a header with its own. Move between

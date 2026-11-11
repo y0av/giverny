@@ -187,6 +187,134 @@ fn drain_until_done(session: &TermSession) {
     assert!(ok, "session did not finish");
 }
 
+#[test]
+fn persistence_tracks_hidden_output_resize_and_sync_flush() {
+    let mut session = headless_session(
+        Some((
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                r"
+stty -echo
+printf 'READY\r\n'
+while IFS= read -r action; do
+    case $action in
+        output) printf 'SECOND\r\n';;
+        hide) printf '\033[?25l';;
+        show) printf '\033[?25h';;
+        alt) printf '\033[?1049hALT';;
+        main) printf '\033[?1049l';;
+        sync) printf '\033[?2026hSYNC';;
+        fill) i=0; while [ $i -lt 80 ]; do printf 'row\r\n'; i=$((i+1)); done; printf 'FILLED';;
+    esac
+done
+"
+                .into(),
+            ],
+        )),
+        std::env::temp_dir(),
+        None,
+    );
+    assert!(wait_for(
+        || session.screen_text().contains("READY"),
+        Duration::from_secs(5)
+    ));
+    let initial = session.snapshot_revision();
+    assert!(session.snapshot_ansi(1000).unwrap().contains("READY"));
+    assert_eq!(
+        session.snapshot_revision(),
+        initial,
+        "capturing is read-only"
+    );
+    session.write(b"output\n".as_slice());
+    assert!(wait_for(
+        || session.screen_text().contains("SECOND"),
+        Duration::from_secs(5)
+    ));
+    assert!(session.snapshot_revision() > initial);
+    assert_eq!(session.content_seq(), 0, "the hidden tab was never drawn");
+    assert!(session.snapshot_ansi(1000).unwrap().contains("SECOND"));
+
+    let before = session.snapshot_revision();
+    let size = session.size();
+    session.resize(size);
+    assert_eq!(session.snapshot_revision(), before, "same size is a no-op");
+    session.resize(GridSize {
+        cols: size.cols - 10,
+        ..size
+    });
+    assert!(session.snapshot_revision() > before);
+    let before = session.snapshot_revision();
+    session.scroll_lines(1);
+    session.mark_dirty();
+    session.take_dirty();
+    assert_eq!(
+        session.snapshot_revision(),
+        before,
+        "view changes don't change the dump"
+    );
+
+    assert!(session.cursor_on_screen());
+    session.write(b"hide\n".as_slice());
+    assert!(wait_for(
+        || !session.cursor_on_screen(),
+        Duration::from_secs(5)
+    ));
+    session.write(b"show\n".as_slice());
+    assert!(wait_for(
+        || session.cursor_on_screen(),
+        Duration::from_secs(5)
+    ));
+    session.write(b"alt\n".as_slice());
+    assert!(wait_for(
+        || session
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+        Duration::from_secs(5)
+    ));
+    assert!(session.snapshot_ansi(1000).is_none());
+    let alternate = session.snapshot_revision();
+    session.write(b"main\n".as_slice());
+    assert!(wait_for(
+        || !session
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+        Duration::from_secs(5)
+    ));
+    assert!(session.snapshot_revision() > alternate);
+    assert!(session.snapshot_ansi(1000).unwrap().contains("SECOND"));
+
+    let before_sync = session.snapshot_revision();
+    session.write(b"sync\n".as_slice());
+    // No end-sync escape: the I/O loop's timeout must apply the buffered
+    // output and advance persistence's revision even without more PTY bytes.
+    assert!(wait_for(
+        || session.screen_text().contains("SYNC"),
+        Duration::from_secs(5)
+    ));
+    assert!(
+        session.snapshot_revision() >= before_sync + 2,
+        "both buffering and timeout flush invalidate persistence"
+    );
+    assert!(session.snapshot_ansi(1000).unwrap().contains("SYNC"));
+    session.write(b"fill\n".as_slice());
+    assert!(wait_for(
+        || session.screen_text().contains("FILLED"),
+        Duration::from_secs(5)
+    ));
+    let before_scroll = session.snapshot_revision();
+    assert!(session.cursor_on_screen());
+    session.scroll_lines(50);
+    assert!(
+        !session.cursor_on_screen(),
+        "cursor is below the scrolled viewport"
+    );
+    session.scroll_to_bottom();
+    assert!(session.cursor_on_screen());
+    assert_eq!(session.snapshot_revision(), before_scroll);
+    session.shutdown();
+}
+
 /// The M3 restore contract: scrollback from one session, serialized to an
 /// ANSI dump, pre-seeds a fresh session — text, colors, and ordering intact,
 /// with the restored divider between old content and the new shell.

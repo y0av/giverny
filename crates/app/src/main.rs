@@ -1099,6 +1099,7 @@ const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 struct Snapshot {
     at: Instant,
     hash: u64,
+    revision: u64,
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -1880,11 +1881,19 @@ impl App {
     /// changed since the last one — an idle tab would otherwise cost an fsync
     /// a minute for a file already holding exactly those bytes.
     fn snapshot_tab(&mut self, id: TabId) {
-        let dump = self
-            .rt
-            .get(&id)
-            .and_then(|rt| rt.session.as_ref())
-            .and_then(|session| session.snapshot_ansi(SNAPSHOT_ROWS));
+        let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref()) else {
+            return;
+        };
+        // Read before capturing; output racing the capture can only cause
+        // another capture, never an unsaved change being skipped.
+        let revision = session.snapshot_revision();
+        if let Some(saved) = self.snapshots.get_mut(&id)
+            && saved.revision == revision
+        {
+            saved.at = Instant::now();
+            return;
+        }
+        let dump = session.snapshot_ansi(SNAPSHOT_ROWS);
         // `None` means the alt screen is up: vim or a full-screen Claude owns
         // the terminal, and what it draws is not what the tab should come back
         // as. Keep whatever was saved before it took over.
@@ -1892,12 +1901,12 @@ impl App {
         let hash = hash_of(&dump);
         let at = Instant::now();
         if self.snapshots.get(&id).is_some_and(|s| s.hash == hash) {
-            self.snapshots.insert(id, Snapshot { at, hash });
+            self.snapshots.insert(id, Snapshot { at, hash, revision });
             return;
         }
         match state::save_snapshot(&self.paths, id, &dump) {
             Ok(()) => {
-                self.snapshots.insert(id, Snapshot { at, hash });
+                self.snapshots.insert(id, Snapshot { at, hash, revision });
             }
             Err(err) => tracing::error!("snapshot save failed for {id:?}: {err:#}"),
         }
@@ -2586,6 +2595,8 @@ impl App {
             preseed.as_deref(),
         ) {
             Ok(session) => {
+                // Revisions start over for a replacement shell in this tab.
+                self.snapshots.remove(&id);
                 self.ws.tab_mut(id).unwrap().exited = false;
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
@@ -3645,15 +3656,15 @@ impl App {
 
     /// Remember what each tab is running, so a restart can bring it back.
     fn track_foreground(&mut self) {
-        let seen: Vec<(TabId, Option<String>)> = self
+        let shells: Vec<(TabId, u32)> = self
             .rt
             .iter()
-            .filter_map(|(&id, rt)| {
-                let pid = rt.session.as_ref()?.child_pid?;
-                Some((id, giverny_core::procs::foreground_command(pid)))
-            })
+            .filter_map(|(&id, rt)| Some((id, rt.session.as_ref()?.child_pid?)))
             .collect();
-        for (id, cmd) in seen {
+        let pids: Vec<u32> = shells.iter().map(|&(_, pid)| pid).collect();
+        let mut commands = giverny_core::procs::foreground_commands(&pids);
+        for (id, pid) in shells {
+            let cmd = commands.remove(&pid);
             if self.cfg.codex.enabled && self.ws.tab(id).is_some_and(|t| t.wsl_distro.is_none()) {
                 let running = cmd.as_deref().is_some_and(giverny_codex::is_codex_command);
                 if running {

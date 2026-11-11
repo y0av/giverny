@@ -3,7 +3,7 @@
 
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use crossbeam_channel::Sender;
@@ -31,10 +31,19 @@ pub enum TabEvent {
 
 /// State shared between the UI thread and the proxy for inline replies.
 pub struct SharedTermState {
+    /// Changes that can affect a persisted dump, independent of rendering.
+    /// Writers increment this while holding the terminal lock.
+    pub(crate) snapshot_revision: AtomicU64,
     pub theme: RwLock<Theme>,
     pub size: RwLock<GridSize>,
     /// Images transmitted by the kitty graphics protocol.
     pub graphics: parking_lot::Mutex<crate::graphics::Graphics>,
+}
+
+impl SharedTermState {
+    pub(crate) fn note_snapshot_change(&self) {
+        self.snapshot_revision.fetch_add(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]

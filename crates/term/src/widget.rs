@@ -205,6 +205,24 @@ fn cursor_blink(since: f64) -> (bool, Option<f64>) {
     (visible, Some(wait))
 }
 
+/// Hidden, scrolled-away and unfocused cursors have no animation clock.
+/// Becoming visible again starts solid, just like receiving focus.
+fn update_cursor_blink(
+    from: &mut Option<f64>,
+    now: f64,
+    active: bool,
+    typing: bool,
+) -> (bool, Option<f64>) {
+    if !active {
+        *from = None;
+        return (true, None);
+    }
+    if from.is_none() || typing {
+        *from = Some(now);
+    }
+    cursor_blink(now - from.unwrap())
+}
+
 /// Input that restarts the blink: what a person typing produces.
 fn is_typing(event: &egui::Event) -> bool {
     matches!(
@@ -420,15 +438,14 @@ impl TabView {
             crate::pace::note_input();
         }
         crate::pace::note_frame(window_focused, predicted_dt);
-        if !focused {
-            self.blink_from = None;
-        } else if self.blink_from.is_none() || ui.input(|i| i.events.iter().any(is_typing)) {
-            self.blink_from = Some(now);
-        }
-        let (cursor_visible, next_edge) = match self.blink_from {
-            Some(from) => cursor_blink(now - from),
-            None => (true, None),
-        };
+        let blink_active =
+            focused && window_focused && self.owns_keys && session.cursor_on_screen();
+        let (cursor_visible, next_edge) = update_cursor_blink(
+            &mut self.blink_from,
+            now,
+            blink_active,
+            ui.input(|i| i.events.iter().any(is_typing)),
+        );
         if let Some(wait) = next_edge {
             // Plus egui's predicted frame time, which it takes off every
             // delayed repaint: without it the frame lands just before the
@@ -1378,7 +1395,26 @@ fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) 
 
 #[cfg(test)]
 mod blink_tests {
-    use super::cursor_blink;
+    use super::{cursor_blink, update_cursor_blink};
+
+    #[test]
+    fn invisible_cursor_stops_waking_and_reappears_solid() {
+        let mut from = None;
+        assert!(update_cursor_blink(&mut from, 0.0, true, false).1.is_some());
+        assert!(!update_cursor_blink(&mut from, 0.5, true, false).0);
+        assert_eq!(
+            update_cursor_blink(&mut from, 0.6, false, false),
+            (true, None)
+        );
+        assert_eq!(
+            update_cursor_blink(&mut from, 5.0, false, true),
+            (true, None)
+        );
+        let (shown, wait) = update_cursor_blink(&mut from, 5.5, true, false);
+        assert!(shown && wait.is_some());
+        assert!(!update_cursor_blink(&mut from, 6.0, true, false).0);
+        assert!(update_cursor_blink(&mut from, 6.0, true, true).0);
+    }
 
     #[test]
     fn the_blink_wakes_only_at_its_edges_and_then_stops() {

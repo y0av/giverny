@@ -981,13 +981,19 @@ pub enum Action {
     MoveToWindow(TabId, Option<usize>),
     /// Fold the rail away in this window, or bring it back.
     ToggleRail,
-    /// Put `tab`'s row into `onto`'s split, beside it.
+    /// Put `tab` into `onto`'s split, beside it: its whole row, or only it.
     Join {
         tab: TabId,
         onto: TabId,
         axis: giverny_core::panes::Axis,
         before: bool,
+        whole_row: bool,
     },
+    /// Trade the places of two terminals of a split.
+    SwapPanes(TabId, TabId),
+    /// Take a terminal out of its split onto a row of its own, at a place
+    /// in the rail.
+    DetachTo(TabId, CategoryId, usize),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -1158,6 +1164,11 @@ pub struct App {
     input_seen: HashMap<TabId, u64>,
     /// Tab currently being dragged in the rail.
     pub dragging: Option<TabId>,
+    /// The drag carries one terminal (a split's header, or its line under
+    /// an unfolded split row) rather than the whole row `dragging` is in.
+    pub dragging_one: bool,
+    /// Split rows unfolded in the rail to show their terminals.
+    pub unfolded: std::collections::HashSet<giverny_core::tabs::GroupId>,
     /// Category currently being dragged in the rail. Never both at once: a
     /// drag starts on one thing.
     pub dragging_category: Option<CategoryId>,
@@ -1758,6 +1769,8 @@ impl App {
             session_picker: None,
             input_seen: HashMap::new(),
             dragging: None,
+            dragging_one: false,
+            unfolded: std::collections::HashSet::new(),
             dragging_category: None,
             switcher: None,
             cycling: false,
@@ -2013,17 +2026,32 @@ impl App {
                 onto,
                 axis,
                 before,
+                whole_row,
             } => {
                 self.end_switch();
                 // A row dragged in brings all of its terminals, the one it
                 // was dragged by first.
                 let mut moving = vec![tab];
-                moving.extend(self.ws.row_tabs(tab).into_iter().filter(|&t| t != tab));
+                if whole_row {
+                    moving.extend(self.ws.row_tabs(tab).into_iter().filter(|&t| t != tab));
+                }
                 let mut anchor = onto;
                 for t in moving {
                     self.ws.join(t, anchor, axis, before);
                     anchor = t;
                 }
+                self.ws.set_active(tab);
+                self.mark_seen(tab);
+                self.reveal_terminal();
+            }
+            Action::SwapPanes(a, b) => {
+                self.ws.swap_in_group(a, b);
+                self.ws.set_active(a);
+                self.focus_terminal = true;
+            }
+            Action::DetachTo(tab, category, index) => {
+                self.end_switch();
+                self.ws.detach_to(tab, category, index);
                 self.ws.set_active(tab);
                 self.mark_seen(tab);
                 self.reveal_terminal();
@@ -3294,9 +3322,11 @@ impl App {
             .map(|&(_, id)| id)
     }
 
-    /// A rail row dragged over a terminal: show the half it would take, and
-    /// on release build the split. Dropping a row onto its own row does
-    /// nothing; it is already there.
+    /// Something dragged over a terminal: a rail row, an unfolded split's
+    /// terminal, or a split's own header. Show where it would go, and on
+    /// release put it there: beside the terminal on the edge it is nearest,
+    /// or, for a terminal of the same split dropped in the middle, in its
+    /// place, the two trading.
     fn rail_drop_on_panes(
         &mut self,
         ui: &egui::Ui,
@@ -3307,23 +3337,89 @@ impl App {
         let Some(pointer) = ui.input(|i| i.pointer.latest_pos()) else {
             return;
         };
-        let Some(pane) = panes.iter().find(|p| p.body.contains(pointer)) else {
+        let Some(pane) = panes.iter().find(|p| {
+            p.header
+                .map_or(p.body, |h| h.union(p.body))
+                .contains(pointer)
+        }) else {
             return;
         };
-        if self.ws.same_row(dragged, pane.tab) {
+        if pane.tab == dragged {
             return;
         }
-        let (axis, before, half) = panes::drop_zone(pane.body, pointer);
-        panes::paint_drop(ui, half, self.chrome.accent);
-        if ui.input(|i| i.pointer.any_released()) {
-            actions.push(Action::Join {
-                tab: dragged,
-                onto: pane.tab,
-                axis,
-                before,
-            });
-            self.dragging = None;
+        let same_row = self.ws.same_row(dragged, pane.tab);
+        // A whole row dropped on its own split goes nowhere.
+        if same_row && !self.dragging_one {
+            return;
         }
+        let zone = panes::drop_zone(pane.body, pointer, same_row);
+        let released = ui.input(|i| i.pointer.any_released());
+        match zone {
+            panes::Zone::Center(r) => {
+                panes::paint_drop(ui, r, self.chrome.accent);
+                if released {
+                    actions.push(Action::SwapPanes(dragged, pane.tab));
+                }
+            }
+            panes::Zone::Edge { axis, before, half } => {
+                panes::paint_drop(ui, half, self.chrome.accent);
+                if released {
+                    actions.push(Action::Join {
+                        tab: dragged,
+                        onto: pane.tab,
+                        axis,
+                        before,
+                        whole_row: !self.dragging_one,
+                    });
+                }
+            }
+        }
+        if released {
+            self.dragging = None;
+            self.dragging_one = false;
+        }
+    }
+
+    /// What is being dragged, by name, beside the pointer: a drag that
+    /// leaves its row behind should still say what it carries.
+    fn paint_drag_chip(&self, ctx: &egui::Context) {
+        let Some(dragged) = self.dragging else { return };
+        let Some(p) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+        let name = if self.dragging_one {
+            self.ws
+                .tab(dragged)
+                .map(|t| t.display_title(&self.cfg.titles))
+        } else {
+            let names: Vec<String> = self
+                .ws
+                .row_tabs(dragged)
+                .iter()
+                .filter_map(|&t| self.ws.tab(t))
+                .map(|t| t.display_title(&self.cfg.titles))
+                .collect();
+            Some(names.join(" · "))
+        };
+        let Some(name) = name else { return };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("drag-chip"),
+        ));
+        let text = rail::fit(&name, 32);
+        let galley = painter.layout_no_wrap(text, egui::FontId::monospace(11.5), self.chrome.fg);
+        let rect = egui::Rect::from_min_size(
+            p + egui::vec2(14.0, 10.0),
+            galley.size() + egui::vec2(14.0, 8.0),
+        );
+        painter.rect_filled(rect, 4.0, self.chrome.panel);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, self.chrome.accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.min + egui::vec2(7.0, 4.0), galley, self.chrome.fg);
     }
 
     /// Wayland: drain the drag thread. Positions arrive in surface-local
@@ -4363,6 +4459,10 @@ impl App {
                     grid_rects.push(r);
                 }
             }
+            if let Some(tab) = panes::take_drag(ui.ctx()) {
+                self.dragging = Some(tab);
+                self.dragging_one = true;
+            }
             panes::dividers(self, ui, area);
             self.rail_drop_on_panes(ui, &panes, &mut actions);
             ui.advance_cursor_after_rect(area);
@@ -4385,8 +4485,10 @@ impl App {
 
         // A rail drag released anywhere neither the rail nor a terminal
         // took it ends here.
+        self.paint_drag_chip(&ctx);
         if ctx.input(|i| i.pointer.any_released()) {
             self.dragging = None;
+            self.dragging_one = false;
         }
         if self.overlay_here() {
             actions.extend(overlays::palette_ui(self, &ctx));

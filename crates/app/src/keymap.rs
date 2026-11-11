@@ -153,8 +153,18 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "drag",
-        action: "reorder, or move between categories; onto a terminal to split with it",
+        action: "between rows to reorder; onto a row's middle or a terminal to split with it",
         scope: Scope::Rail,
+    },
+    Binding {
+        chord: "▸ on a split",
+        action: "unfold its terminals; drag one out between rows to unsplit it",
+        scope: Scope::Rail,
+    },
+    Binding {
+        chord: "drag a terminal's header",
+        action: "onto another's edge to move it there, its middle to swap, the rail to unsplit",
+        scope: Scope::Terminal,
     },
     Binding {
         chord: "right-click",

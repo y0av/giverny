@@ -13,6 +13,8 @@ use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
 use crate::{Action, App, RenameTarget};
 
 const ROW_H: f32 = 40.0;
+/// A split's terminal, unfolded under its row: one line, no path.
+const MEMBER_H: f32 = 24.0;
 const HEADER_H: f32 = 26.0;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -764,6 +766,8 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .input(|i| i.pointer.interact_pos())
         .filter(|_| arrangeable);
     let mut drop_target: Option<(CategoryId, usize, f32)> = None;
+    // A drop on a row's middle rather than between rows: merge into it.
+    let mut merge_target: Option<(TabId, Rect)> = None;
     // Where a dragged *category* would land: an index in rail order, and the
     // line to draw for it.
     let mut category_drop: Option<(usize, f32)> = None;
@@ -796,17 +800,45 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                 if !cat.collapsed {
                     for (index, row) in cat.rows.iter().enumerate() {
                         let rect = tab_row(app, ui, row, fg, dim, &mut actions);
-                        // Above a row's midpoint drops before it, below after.
+                        // The middle of a row merges into it; above that
+                        // drops before it, below after.
                         if let Some(p) = pointer
-                            && app.dragging.is_some()
+                            && let Some(dragged) = app.dragging
                             && p.x >= rect.min.x
                             && p.x <= rect.max.x
                             && p.y >= rect.min.y - 2.0
                             && p.y <= rect.max.y + 2.0
                         {
-                            let after = p.y > rect.center().y;
-                            let y = if after { rect.max.y } else { rect.min.y };
-                            drop_target = Some((cat.category, index + usize::from(after), y));
+                            let rel = (p.y - rect.min.y) / rect.height();
+                            if (0.3..0.7).contains(&rel) && !app.ws.same_row(dragged, row.id) {
+                                merge_target = Some((row.id, rect));
+                                drop_target = None;
+                            } else {
+                                let after = p.y > rect.center().y;
+                                let y = if after { rect.max.y } else { rect.min.y };
+                                drop_target = Some((cat.category, index + usize::from(after), y));
+                                merge_target = None;
+                            }
+                        }
+                        // An unfolded split lists its terminals under it,
+                        // each one a handle to drag out or onto.
+                        let unfolded = app
+                            .ws
+                            .group_of(row.id)
+                            .is_some_and(|g| app.unfolded.contains(&g.id));
+                        if row.panes > 1 && unfolded {
+                            for member in app.ws.row_tabs(row.id) {
+                                let r = member_row(app, ui, member, row.color, fg, &mut actions);
+                                if let Some(p) = pointer
+                                    && let Some(dragged) = app.dragging
+                                    && r.contains(p)
+                                {
+                                    drop_target = None;
+                                    merge_target = (dragged != member
+                                        && !app.ws.same_row(dragged, member))
+                                    .then_some((member, r));
+                                }
+                            }
                         }
                     }
                 }
@@ -852,16 +884,53 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             ui.painter()
                 .hline(x0..=x1, y, egui::Stroke::new(2.0, app.chrome.accent));
         }
+        if let Some((_, rect)) = merge_target {
+            let r = rect.shrink2(Vec2::new(4.0, 1.0));
+            ui.painter()
+                .rect_filled(r, 4.0, app.chrome.accent.gamma_multiply(0.16));
+            ui.painter().rect_stroke(
+                r,
+                4.0,
+                Stroke::new(1.5, app.chrome.accent),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                Pos2::new(r.max.x - 8.0, r.center().y),
+                Align2::RIGHT_CENTER,
+                "split with",
+                FontId::monospace(10.0),
+                app.chrome.accent,
+            );
+        }
         ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
         if ui.input(|i| i.pointer.any_released()) {
-            if let Some((cat, index, _)) = drop_target {
-                actions.push(Action::ReorderTab(dragged, cat, index));
+            let one = app.dragging_one;
+            if let Some((onto, _)) = merge_target {
+                actions.push(Action::Join {
+                    tab: dragged,
+                    onto,
+                    axis: giverny_core::panes::Axis::Row,
+                    before: false,
+                    whole_row: !one,
+                });
                 app.dragging = None;
+                app.dragging_one = false;
+            } else if let Some((cat, index, _)) = drop_target {
+                // One terminal dropped between rows leaves its split for a
+                // row of its own there; a whole row just moves.
+                actions.push(if one && app.ws.group_of(dragged).is_some() {
+                    Action::DetachTo(dragged, cat, index)
+                } else {
+                    Action::ReorderTab(dragged, cat, index)
+                });
+                app.dragging = None;
+                app.dragging_one = false;
             } else if ui
                 .input(|i| i.pointer.latest_pos())
                 .is_some_and(|p| ui.max_rect().contains(p))
             {
                 app.dragging = None;
+                app.dragging_one = false;
             }
             // Released over the terminals: a drop onto a split, which the
             // central panel sees after the rail (`rail_drop_on_panes`).
@@ -1784,6 +1853,38 @@ fn tab_row(
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     draw_mark(app, ui, &p, rect, dot, row, dim);
+    // A split folds out to its terminals, left of its mark.
+    if row.panes > 1
+        && let Some(gid) = app.ws.group_of(row.id).map(|g| g.id)
+    {
+        let open = app.unfolded.contains(&gid);
+        let at = Pos2::new(rect.min.x + 19.0, rect.min.y + 13.0);
+        let hit = Rect::from_center_size(at, Vec2::splat(14.0));
+        let caret = ui.interact(hit, ui.id().with(("split-caret", gid.0)), Sense::click());
+        let color = if caret.hovered() { fg } else { dim };
+        let pts = if open {
+            vec![
+                at + Vec2::new(-3.5, -1.5),
+                at + Vec2::new(3.5, -1.5),
+                at + Vec2::new(0.0, 2.5),
+            ]
+        } else {
+            vec![
+                at + Vec2::new(-1.5, -3.5),
+                at + Vec2::new(2.5, 0.0),
+                at + Vec2::new(-1.5, 3.5),
+            ]
+        };
+        p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+        if caret.clicked() {
+            if open {
+                app.unfolded.remove(&gid);
+            } else {
+                app.unfolded.insert(gid);
+            }
+            return rect;
+        }
+    }
 
     // Inline rename?
     let here = app.overlay_here();
@@ -1941,6 +2042,7 @@ fn tab_row(
 
     if resp.drag_started() {
         app.dragging = Some(row.id);
+        app.dragging_one = false;
     }
     if resp.double_clicked() {
         actions.push(Action::StartRename(RenameTarget::Tab(row.id)));
@@ -1953,7 +2055,75 @@ fn tab_row(
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
     // The dragged row dims in place; the drop indicator shows where it lands.
-    if app.dragging == Some(row.id) {
+    if app.dragging == Some(row.id) && !app.dragging_one {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+        );
+    }
+    rect
+}
+
+/// One terminal of an unfolded split, under its row: its mark and title,
+/// a click to focus it, and a handle to drag it out of the split or onto
+/// another row.
+fn member_row(
+    app: &mut App,
+    ui: &mut Ui,
+    tab: TabId,
+    color: Color32,
+    fg: Color32,
+    actions: &mut Vec<Action>,
+) -> Rect {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, MEMBER_H), Sense::click_and_drag());
+    app.row_rects.push((rect, tab));
+    let p = ui.painter_at(rect);
+    let active = app.ws.active == Some(tab);
+    let hovered = ui.rect_contains_pointer(rect);
+    if active {
+        p.rect_filled(
+            Rect::from_min_size(
+                rect.min + Vec2::new(40.0, 3.0),
+                Vec2::new(2.0, MEMBER_H - 6.0),
+            ),
+            1.0,
+            color,
+        );
+    }
+    if hovered {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+        );
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+    }
+    let dot = Pos2::new(rect.min.x + 50.0, rect.center().y);
+    pane_mark(app, ui, &p, rect, dot, tab);
+    let title = app
+        .ws
+        .tab(tab)
+        .map(|t| t.display_title(&app.cfg.titles))
+        .unwrap_or_default();
+    let budget = ((width - 80.0) / 6.8).max(4.0) as usize;
+    p.text(
+        Pos2::new(rect.min.x + 60.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        egui_line(&truncate_chars(&title, budget), None),
+        FontId::monospace(11.5),
+        if active { fg } else { fg.gamma_multiply(0.7) },
+    );
+    if resp.drag_started() {
+        app.dragging = Some(tab);
+        app.dragging_one = true;
+    } else if resp.clicked() {
+        actions.push(Action::Select(tab));
+    } else if resp.middle_clicked() {
+        actions.push(Action::CloseTab(tab));
+    }
+    if app.dragging == Some(tab) {
         p.rect_filled(
             rect.shrink2(Vec2::new(4.0, 1.0)),
             4.0,

@@ -158,6 +158,19 @@ impl Node {
         }
     }
 
+    /// Trade the places of two terminals.
+    pub fn swap_leaves(&mut self, x: TabId, y: TabId) {
+        match self {
+            Node::Leaf(id) if *id == x => *id = y,
+            Node::Leaf(id) if *id == y => *id = x,
+            Node::Leaf(_) => {}
+            Node::Split { a, b, .. } => {
+                a.swap_leaves(x, y);
+                b.swap_leaves(x, y);
+            }
+        }
+    }
+
     /// Take `target` out; its sibling takes the space. `None` when the tree
     /// was that one leaf and nothing is left.
     pub fn remove(self, target: TabId) -> Option<Node> {
@@ -482,6 +495,13 @@ mod tests {
         assert_eq!(neighbour(&areas, C, Direction::Left), Some(A));
         assert_eq!(neighbour(&areas, A, Direction::Left), None);
         assert_eq!(neighbour(&areas, B, Direction::Up), None);
+    }
+
+    #[test]
+    fn swapping_trades_places_and_keeps_the_shape() {
+        let mut n = three();
+        n.swap_leaves(A, C);
+        assert_eq!(n.leaves(), vec![C, B, A]);
     }
 
     #[test]

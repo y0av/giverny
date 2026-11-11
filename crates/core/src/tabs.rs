@@ -651,6 +651,24 @@ impl Workspace {
         }
     }
 
+    /// Trade the places of two terminals of one split.
+    pub fn swap_in_group(&mut self, a: TabId, b: TabId) {
+        if a == b || !self.same_row(a, b) {
+            return;
+        }
+        if let Some(g) = self.group_of_mut(a) {
+            g.tree.swap_leaves(a, b);
+            g.zoomed = false;
+        }
+    }
+
+    /// Take `id` out of its split onto a row of its own at `index` among
+    /// `category`'s rows: a terminal dragged out of a split in the rail.
+    pub fn detach_to(&mut self, id: TabId, category: CategoryId, index: usize) {
+        self.detach(id);
+        self.reorder_tab(id, category, index);
+    }
+
     /// Put `id` (with its row, if it had one, broken up) into `onto`'s
     /// row, beside `onto`. The rail drop that builds a split.
     pub fn join(&mut self, id: TabId, onto: TabId, axis: Axis, before: bool) {
@@ -1191,6 +1209,26 @@ mod tests {
         ws.join(b, c, Axis::Row, false);
         assert_eq!(ws.row_tabs(c), vec![c, b]);
         assert_eq!(ws.row_tabs(a), vec![x, a]);
+    }
+
+    #[test]
+    fn a_terminal_dragged_out_lands_where_it_was_dropped() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let x = ws.add_tab(cat);
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        // Rows: x, [a b]. Drop b above x.
+        ws.detach_to(b, cat, 0);
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![b, x, a]);
+        assert!(ws.groups.is_empty());
+
+        let c = ws.split(a, Axis::Row, false).unwrap();
+        ws.swap_in_group(a, c);
+        assert_eq!(ws.row_tabs(a), vec![c, a]);
+        ws.swap_in_group(a, x);
+        assert_eq!(ws.row_tabs(a), vec![c, a], "not in one split: nothing");
     }
 
     #[test]

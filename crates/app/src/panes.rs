@@ -138,7 +138,11 @@ pub fn header(
     let zoomed = app.ws.group_of(tab).is_some_and(|g| g.zoomed);
     let count = app.ws.row_tabs(tab).len();
 
-    let resp = ui.interact(rect, ui.id().with(("pane-header", tab.0)), Sense::click());
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("pane-header", tab.0)),
+        Sense::click_and_drag(),
+    );
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, c.panel);
     let line = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 2.0), rect.max);
@@ -198,10 +202,32 @@ pub fn header(
     if resp.clicked() && !focused {
         actions.push(Action::Select(tab));
     }
+    // Grab a header to move its terminal: onto another one's edge to sit
+    // there, onto its middle to trade places, onto the rail to stand alone.
+    if resp.drag_started() {
+        app_drag(ui, tab);
+    }
+    if resp.hovered() && !resp.dragged() {
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+    }
     if resp.double_clicked() {
         actions.push(Action::ToggleZoom(tab));
     }
     resp.context_menu(|ui| menu(ui, tab, zoomed, actions));
+}
+
+/// Start dragging one terminal; picked up by the app after the frame
+/// ([`take_drag`]), since a header only borrows the app.
+fn app_drag(ui: &egui::Ui, tab: TabId) {
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new("pane-drag-start"), Some(tab.0)));
+}
+
+/// A header drag that started this frame, if one did.
+pub fn take_drag(ctx: &egui::Context) -> Option<TabId> {
+    ctx.data_mut(|d| d.remove_temp::<Option<u64>>(egui::Id::new("pane-drag-start")))
+        .flatten()
+        .map(TabId)
 }
 
 /// What a terminal in a split can do, from its header's right-click menu.
@@ -246,10 +272,25 @@ fn menu(ui: &mut egui::Ui, tab: TabId, zoomed: bool, actions: &mut Vec<Action>) 
     item(ui, "close", "Ctrl+Shift+W", Action::CloseTab(tab));
 }
 
-/// Where a row dragged from the rail would join the split: the half of
-/// the terminal under the pointer it is nearest to.
-pub fn drop_zone(body: Rect, pointer: Pos2) -> (Axis, bool, Rect) {
+/// Where a drop on a terminal lands.
+pub enum Zone {
+    /// Beside it, in the half nearest the pointer.
+    Edge {
+        axis: Axis,
+        before: bool,
+        half: Rect,
+    },
+    /// In its place, the two trading: only for a terminal of the same split.
+    Center(Rect),
+}
+
+/// Where a drop at `pointer` on terminal `body` would land. With `swap`,
+/// the middle third trades places instead of splitting.
+pub fn drop_zone(body: Rect, pointer: Pos2, swap: bool) -> Zone {
     let rel = (pointer - body.min) / body.size();
+    if swap && (1.0 / 3.0..2.0 / 3.0).contains(&rel.x) && (1.0 / 3.0..2.0 / 3.0).contains(&rel.y) {
+        return Zone::Center(body.shrink2(body.size() / 6.0));
+    }
     // Distance to each edge, as a share of the terminal: the nearest wins.
     let edges = [
         (rel.x, Axis::Row, true),
@@ -267,7 +308,7 @@ pub fn drop_zone(body: Rect, pointer: Pos2) -> (Axis, bool, Rect) {
         (Axis::Column, true) => body.split_top_bottom_at_fraction(0.5).0,
         (Axis::Column, false) => body.split_top_bottom_at_fraction(0.5).1,
     };
-    (axis, before, half)
+    Zone::Edge { axis, before, half }
 }
 
 /// Paint the half a drop would land in.
@@ -297,10 +338,26 @@ mod tests {
     #[test]
     fn a_drop_lands_in_the_half_nearest_the_pointer() {
         let body = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 100.0));
-        let (axis, before, half) = drop_zone(body, Pos2::new(190.0, 50.0));
+        let Zone::Edge { axis, before, half } = drop_zone(body, Pos2::new(190.0, 50.0), true)
+        else {
+            panic!()
+        };
         assert_eq!((axis, before), (Axis::Row, false));
         assert_eq!(half.min.x, 100.0);
-        let (axis, before, _) = drop_zone(body, Pos2::new(100.0, 5.0));
+        let Zone::Edge { axis, before, .. } = drop_zone(body, Pos2::new(100.0, 5.0), true) else {
+            panic!()
+        };
         assert_eq!((axis, before), (Axis::Column, true));
+        assert!(matches!(
+            drop_zone(body, Pos2::new(100.0, 50.0), true),
+            Zone::Center(_)
+        ));
+        assert!(
+            matches!(
+                drop_zone(body, Pos2::new(100.0, 50.0), false),
+                Zone::Edge { .. }
+            ),
+            "a row from the rail only ever splits"
+        );
     }
 }

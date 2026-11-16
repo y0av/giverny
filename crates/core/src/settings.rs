@@ -331,6 +331,30 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: true },
     },
     SettingDef {
+        key: "rail.tab_figures",
+        label: "tab CPU/mem figures",
+        section: Section::Titles,
+        doc: "Each tab's CPU and memory in the rail, and a collapsed group's sum.",
+        note: &[
+            "Off, no row or group header draws figures, and the title,",
+            "sub-line and group name take the room they held.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.total_line",
+        label: "total CPU/mem line",
+        section: Section::Appearance,
+        doc: "The summed CPU and memory line under the account bars.",
+        note: &[
+            "What Giverny runs now, summed: `23% CPU  2.0G RAM`. Off, the",
+            "bars end the rail's bottom panel.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "behavior.scrollback_lines",
         label: "scrollback lines",
         section: Section::Terminal,
@@ -895,7 +919,10 @@ mod tests {
     }
 
     /// The rail's two motion options sit with the title glyph toggle in tabs
-    /// & titles, right after it, though their keys stay in `[rail]`.
+    /// & titles, right after it, though their keys stay in `[rail]`; the
+    /// tab CPU/mem figures, drawn on the tab rows too, follow them. The
+    /// total line is under the account bars, not on a tab, and is in
+    /// appearance.
     #[test]
     fn rail_motion_options_follow_the_title_glyph() {
         let titles: Vec<&str> = in_section(Section::Titles).map(|d| d.key).collect();
@@ -904,8 +931,12 @@ mod tests {
             .position(|k| *k == "titles.strip_claude_glyph")
             .expect("glyph toggle is in tabs & titles");
         assert_eq!(
-            titles[glyph + 1..glyph + 3],
-            ["rail.animate", "rail.calm_busy"]
+            titles[glyph + 1..glyph + 4],
+            ["rail.animate", "rail.calm_busy", "rail.tab_figures"]
+        );
+        assert_eq!(
+            by_key("rail.total_line").unwrap().section,
+            Section::Appearance
         );
     }
 

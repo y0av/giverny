@@ -195,6 +195,24 @@ pub struct TabView {
     /// text in the clipboard while the terminal had the keyboard: the app
     /// looks for files or an image there and pastes them.
     pub paste_image: bool,
+    /// Reads the screen's text (row per line) into rows the app wants
+    /// painted over with the background, whenever the grid is redrawn.
+    /// Rows of the live screen; nothing is painted while the view is
+    /// scrolled back. `None`: none.
+    pub hide_for: Option<fn(&str) -> Vec<u16>>,
+    hidden: Vec<u16>,
+    /// Reads the screen's text (row per line, the rows past the picture
+    /// included) into how many rows at its bottom are to be kept out of
+    /// sight: the program is given them past the bottom of the tab
+    /// ([`crate::tail`]). Only on the alternate screen; `None`: none.
+    pub tail_for: Option<fn(&str) -> u16>,
+    tail: crate::tail::Tail,
+    /// The picture's size in cells last frame, to tell the tail when the
+    /// tab itself was resized.
+    tail_cells: Option<(u16, u16)>,
+    /// The frame on screen was held for the tail: the next one is drawn
+    /// afresh.
+    was_held: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -275,6 +293,12 @@ impl Default for TabView {
             textures: std::collections::HashMap::new(),
             paste_chord: input::PasteChord::default(),
             paste_image: false,
+            hide_for: None,
+            hidden: Vec::new(),
+            tail_for: None,
+            tail: crate::tail::Tail::default(),
+            tail_cells: None,
+            was_held: false,
         }
     }
 }
@@ -371,15 +395,17 @@ impl TabView {
         }
         response.clone().on_hover_cursor(CursorIcon::Text);
 
-        // Resize the grid to fit.
+        // Resize the grid to fit, and the rows past the picture the app
+        // keeps out of sight (`tail_for`).
         let cols = ((rect.width() * ppp / metrics.cell_w as f32).floor() as u16).max(2);
         let rows = ((rect.height() * ppp / metrics.cell_h as f32).floor() as u16).max(2);
-        session.resize(GridSize {
+        let grid_size = |tail: u16| GridSize {
             cols,
-            rows,
+            rows: rows.saturating_add(tail.min(rows)),
             cell_width: metrics.cell_w as u16,
             cell_height: metrics.cell_h as u16,
-        });
+        };
+        session.resize(grid_size(self.tail.rows()));
 
         let mode = session.mode();
         let shift_held = ui.input(|i| i.modifiers.shift);
@@ -467,15 +493,64 @@ impl TabView {
 
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
-        let dirty = session.take_dirty();
-        let needs_rebuild = dirty
-            || self.last_blink != cursor_visible
-            || self
+        // The rows past the picture: asked for anew whenever the screen
+        // changed, and the last frame held while the program redraws at the
+        // new height.
+        let output = session
+            .shared
+            .output_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        if self.tail_cells.replace((cols, rows)) != Some((cols, rows)) {
+            self.tail.resized(std::time::Instant::now(), output);
+        }
+        let tail_for = self
+            .tail_for
+            .filter(|_| mode.contains(TermMode::ALT_SCREEN));
+        let read = self.tail.pending()
+            || session.is_dirty()
+            || (tail_for.is_none() && self.tail.rows() > 0);
+        let want = read.then(|| match tail_for {
+            Some(tail_for) => tail_for(&session.screen_text()).min(rows),
+            None => 0,
+        });
+        let tail_hold = match self.tail.step(std::time::Instant::now(), want, output) {
+            crate::tail::Step::Draw => false,
+            crate::tail::Step::Hold => true,
+            crate::tail::Step::Resize(tail) => {
+                session.resize(grid_size(tail));
+                true
+            }
+        };
+        if self.tail.pending() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(10));
+        }
+        // Held: the last frame stays as long as it still fits where it is
+        // drawn. The program's output stays dirty, so the first frame after
+        // is drawn from it.
+        let held = tail_hold
+            && self
                 .cached
                 .as_ref()
-                .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
-        self.last_blink = cursor_visible;
+                .is_some_and(|c| c.origin_px == origin_px && c.generation == shared.generation);
+        let released = std::mem::replace(&mut self.was_held, held) && !held;
+        let needs_rebuild = !held
+            && (session.take_dirty()
+                || released
+                || self.last_blink != cursor_visible
+                || self
+                    .cached
+                    .as_ref()
+                    .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation));
+        if !held {
+            self.last_blink = cursor_visible;
+        }
         if needs_rebuild {
+            let live = session.term.lock().grid().display_offset() == 0;
+            self.hidden = match (self.hide_for, live) {
+                (Some(hide_for), true) => hide_for(&session.screen_text()),
+                _ => Vec::new(),
+            };
             let snapshot = {
                 let term = session.term.lock();
                 Snapshot::capture(&term, &shared.theme)
@@ -534,10 +609,34 @@ impl TabView {
             }
         }
         if let Some(cached) = &self.cached {
+            // The grid goes on past the picture's last whole row while the
+            // program has rows out of sight (`tail_for`): the part of the
+            // next row that fits under it is not drawn.
+            let grid = if self.tail.rows() > 0 {
+                let mut clip = rect;
+                clip.max.y = clip.max.y.min(rect.min.y + f32::from(rows) * ch_pt);
+                painter.with_clip_rect(clip)
+            } else {
+                painter.clone()
+            };
             for mesh in &cached.meshes {
                 if !mesh.vertices.is_empty() {
-                    painter.add(Shape::Mesh(mesh.clone()));
+                    grid.add(Shape::Mesh(mesh.clone()));
                 }
+            }
+        }
+        // The rows the app blanks (`hide_for`), over the grid: painted
+        // opaque, as a see-through one would let the text show.
+        if self.hide_for.is_none() {
+            self.hidden.clear();
+        }
+        for &row in &self.hidden {
+            if i32::from(row) < rows_now(rect, ppp, metrics) {
+                let band = Rect::from_min_size(
+                    Pos2::new(rect.min.x, rect.min.y + f32::from(row) * ch_pt),
+                    Vec2::new(rect.width(), ch_pt),
+                );
+                painter.rect_filled(band, 0.0, shared.theme.bg);
             }
         }
 
@@ -1450,7 +1549,11 @@ pub(crate) fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, 
     let x_px = ((pos.x - rect.min.x) * ppp).max(0.0);
     let y_px = ((pos.y - rect.min.y) * ppp).max(0.0);
     let col = (x_px / m.cell_w as f32).floor() as u16;
-    let line = (y_px / m.cell_h as f32).floor() as u16;
+    // Never past the picture's last row: the grid may go on below it
+    // (`TabView::tail_for`), and a drag or release under the tab must not
+    // reach rows nobody can see.
+    let last = u16::try_from(rows_now(rect, ppp, m) - 1).unwrap_or(0);
+    let line = ((y_px / m.cell_h as f32).floor() as u16).min(last);
     let within = x_px - col as f32 * m.cell_w as f32;
     let side = if within < m.cell_w as f32 / 2.0 {
         Side::Left

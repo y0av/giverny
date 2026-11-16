@@ -467,9 +467,9 @@ impl FeedCache {
 
 /// What the pane needs from a live row (Claude Code's own view of a
 /// subagent) to merge it with the feed. The live-row model implements this;
-/// the join key is [`agent_id`], the subagent's id as Claude Code reports it
-/// (`tasks[].id` on the `subagentStatusLine` payload, the `<id>` of
-/// `subagents/agent-<id>.jsonl`).
+/// the join key is [`agent_id`], the subagent's id as Claude Code writes it
+/// (the `<id>` of `subagents/agent-<id>.jsonl`, the `agent_id` on its hook
+/// payloads).
 ///
 /// [`agent_id`]: LiveAgent::agent_id
 pub trait LiveAgent {

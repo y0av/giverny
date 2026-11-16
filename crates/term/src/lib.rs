@@ -15,5 +15,6 @@ pub mod pty;
 pub mod render;
 pub mod search;
 pub mod session;
+pub mod tail;
 pub mod tee;
 pub mod widget;

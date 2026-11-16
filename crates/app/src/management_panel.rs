@@ -8,20 +8,21 @@
 //! ([`giverny_claude::managers`]), so its Next up shows before its first
 //! spawn. A feed never opens it alone ([`feed::opens`]).
 //!
-//! The rows are a [`Tracker`] (Claude Code's own data: live list,
-//! transcripts, notifications) merged with the optional feed file a manager
-//! writes ([`feed::merge`], `docs/management-panel.md`), and **every row
-//! drawn is a real agent** ([`Drawn`]): a feed row with no subagent behind
-//! it is not drawn, save a manager's own Next up. This module owns only the
-//! look: the columns STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one
-//! but TASK a fixed width, no column headings, the whole row tinted by its
-//! stage, a stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done
-//! row's `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's
-//! row above it: a compact status table pinned under Claude Code. The
-//! session's token total is not here: it is on the status line.
+//! The rows are a [`Tracker`] (Claude Code's own data: the workers'
+//! transcripts and metas, the parent's notifications) merged with the
+//! optional feed file a manager writes ([`feed::merge`],
+//! `docs/management-panel.md`), and **every row drawn is a real agent**
+//! ([`Drawn`]): a feed row with no subagent behind it is not drawn, save a
+//! manager's own Next up. This module owns only the look: the columns
+//! STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one but TASK a fixed
+//! width, no column headings, the whole row tinted by its stage, a stopwatch
+//! ELAPSED ticking every second, `~1h3m` ETAs, a Done row's
+//! `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's row
+//! above it: a compact status table pinned under Claude Code. The session's
+//! token total is not here: it is on the status line.
 //!
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker
-//! (`ClaudeWatch::agents`, `management_live.rs`), fed by the relay,
+//! (`ClaudeWatch::agents`, `management_live.rs`), read off the disk,
 //! persisted, emptied on `/clear` and refreshed once a second, and keeps only
 //! what the pane itself needs per tab: the feed it last read.
 //!
@@ -134,7 +135,9 @@ impl View {
     /// Re-read the feed for `session`, at most once a [`POLL`] (or at once
     /// when the session changed). A session Claude Code re-id'd is looked
     /// up by its earlier ids too, newest first, until its feed names the
-    /// new one.
+    /// new one. Those are its own conversation's alone: the tab's table
+    /// drops an id whose transcript has another root, as a `/clear` or a
+    /// resume into another conversation gives ([`Tracker::continues`]).
     ///
     /// The manager mark is looked up with it ([`View::manager`]): a `stat`
     /// of the session's mark and its earlier ids', and of its
@@ -2467,7 +2470,6 @@ fn draw_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giverny_claude::subagents::LiveSnapshot;
 
     const T0: u64 = 1_790_000_000_000; // an epoch-ms "now"
 
@@ -2475,10 +2477,25 @@ mod tests {
         feed::parse(json.as_bytes()).expect("test feed parses")
     }
 
-    fn live(json: &str) -> Vec<SubagentRow> {
-        let mut t = Tracker::new(None);
-        t.apply_live(&LiveSnapshot::parse(json), T0);
-        t.rows().to_vec()
+    /// A row as the tracker keeps it: `id`, Running or Done (`done` ended at
+    /// [`T0`]), its description, start and tokens.
+    fn row(
+        id: &str,
+        done: bool,
+        description: Option<&str>,
+        started: u64,
+        tokens: u64,
+    ) -> SubagentRow {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "stage": if done { "done" } else { "running" },
+            "outcome": done.then_some("completed"),
+            "ended_ms": done.then_some(T0),
+            "description": description,
+            "started_ms": started,
+            "tokens": tokens,
+        }))
+        .expect("a row")
     }
 
     #[test]
@@ -2499,28 +2516,22 @@ mod tests {
         assert_eq!(fmt_tokens(2_000), "2k");
     }
 
-    /// Live rows from `(id, status, start offset s, parent)`: each named
+    /// Rows from `(id, status, start offset s, parent)`: each named
     /// `Work <id>`, its parent as its meta would give it.
     fn family(rows: &[(&str, &str, u64, Option<&str>)]) -> Vec<SubagentRow> {
-        let tasks: Vec<String> = rows
-            .iter()
-            .map(|(id, status, at, _)| {
-                format!(
-                    r#"{{"id":"{id}","status":"{status}","description":"Work {id}",
-                       "startTime":{},"tokenCount":1000}}"#,
-                    T0 - 600_000 + at * 1000
-                )
+        rows.iter()
+            .map(|(id, status, at, parent)| {
+                let mut r = row(
+                    id,
+                    *status != "running",
+                    Some(&format!("Work {id}")),
+                    T0 - 600_000 + at * 1000,
+                    1000,
+                );
+                r.parent_id = parent.map(str::to_string);
+                r
             })
-            .collect();
-        let mut out = live(&format!(
-            r#"{{"session_id":"s","tasks":[{}]}}"#,
-            tasks.join(",")
-        ));
-        for r in &mut out {
-            let (.., parent) = rows.iter().find(|(id, ..)| *id == r.id).unwrap();
-            r.parent_id = parent.map(str::to_string);
-        }
-        out
+            .collect()
     }
 
     fn titles(t: &Table) -> Vec<(String, usize, Stage)> {
@@ -2588,19 +2599,16 @@ mod tests {
     /// the worker on it now.
     #[test]
     fn a_replaced_worker_is_a_done_row_of_its_own() {
-        let snap = |first: &str| {
-            format!(
-                r#"{{"session_id":"s","tasks":[
-                  {{"id":"a1","status":"{first}","description":"Work acme#5",
-                    "startTime":1789998800000,"tokenCount":40000}},
-                  {{"id":"a2","status":"running","description":"Work acme#5 again",
-                    "startTime":1789999400000,"tokenCount":7000}}]}}"#
-            )
-        };
-        let mut t = Tracker::new(None);
-        t.apply_live(&LiveSnapshot::parse(&snap("running")), T0 - 700_000);
-        t.apply_live(&LiveSnapshot::parse(&snap("completed")), T0 - 600_000);
-        let rows = t.rows().to_vec();
+        let mut first = row("a1", true, Some("Work acme#5"), 1_789_998_800_000, 40_000);
+        first.ended_ms = Some(T0 - 600_000);
+        let fresh = row(
+            "a2",
+            false,
+            Some("Work acme#5 again"),
+            1_789_999_400_000,
+            7_000,
+        );
+        let rows = vec![fresh, first];
         // The row moved to the fresh worker.
         let f = feed(
             r#"{"version":1,"session":"s","rows":[
@@ -2645,11 +2653,13 @@ mod tests {
     /// row of its own beside it.
     #[test]
     fn a_running_worker_naming_a_task_is_not_drawn_twice() {
-        let rows = live(
-            r#"{"session_id":"s","tasks":[
-              {"id":"a1","status":"running","description":"Work acme#5",
-               "startTime":1789999400000,"tokenCount":1000}]}"#,
-        );
+        let rows = vec![row(
+            "a1",
+            false,
+            Some("Work acme#5"),
+            1_789_999_400_000,
+            1000,
+        )];
         let f = feed(
             r#"{"version":1,"session":"s","rows":[
               {"key":"acme#5","stage":"running","title":"FEATURE: five",
@@ -2663,10 +2673,7 @@ mod tests {
 
     #[test]
     fn the_feed_gives_ids_titles_etas_and_landings() {
-        let rows = live(
-            r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
-                "startTime":1789999400000,"tokenCount":1000}]}"#,
-        );
+        let rows = vec![row("a1", false, None, 1_789_999_400_000, 1000)];
         let f = feed(
             r#"{"version":1,"session":"s","rows":[
               {"key":"acme#1","stage":"running","title":"FEATURE: one","agent_id":"a1",

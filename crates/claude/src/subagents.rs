@@ -7,20 +7,19 @@
 //! is the model behind that list, and it needs no setup from the user: every
 //! row comes from data Claude Code already writes.
 //!
-//! Three sources, each carrying what the others cannot:
+//! Two sources, each carrying what the other cannot:
 //!
-//! * **The live list.** Claude Code hands its `subagentStatusLine` command a
-//!   JSON object on stdin at least every five seconds while workers run:
-//!   `session_id`, and `tasks[]` with `id`, `type`, `status`, `description`,
-//!   `label`, `startTime`, `model`, `tokenCount`, `cwd`, and `name` only when
-//!   the agent was given one. [`LiveSnapshot::parse`] reads it. It is the
-//!   authority on what is running *now*.
 //! * **The worker's own transcript.**
 //!   `projects/<munged cwd>/<parent session>/subagents/agent-<id>.jsonl`, with
 //!   `agent-<id>.meta.json` beside it (`description`, `agentType`, `model`,
-//!   and for an agent another agent spawned `parentAgentId` and
-//!   `spawnDepth`: what nests it under its parent's row).
-//!   The last `tool_use` in it is what the worker is doing ([`read_activity`]).
+//!   `name` when the agent was given one, and for an agent another agent
+//!   spawned `parentAgentId` and `spawnDepth`: what nests it under its
+//!   parent's row; `finished: true` once its run has ended, gone again with
+//!   a `revivedAt` when it is messaged). The last `tool_use` in it is what
+//!   the worker is doing ([`read_activity`]). A worker with a transcript and
+//!   no landing since its last turn is running, if it has written since the
+//!   claude now running its session started: one killed with an earlier
+//!   claude of the conversation lands nowhere ([`Tracker::refresh`]).
 //! * **The parent's transcript.** When a worker stops, Claude Code queues a
 //!   `<task-notification>` naming its `<task-id>` and a `<status>` —
 //!   `completed`, `failed`, `killed` or `stopped` on every transcript on the
@@ -31,7 +30,7 @@
 //!   notification is newer than the worker's latest line", never "a
 //!   notification exists".
 //!
-//! [`Tracker`] folds the three into [`SubagentRow`]s for one tab. It is
+//! [`Tracker`] folds the two into [`SubagentRow`]s for one tab. It is
 //! serde-serialisable so the tab can persist it and a Giverny restart keeps
 //! the Done rows.
 //!
@@ -91,8 +90,7 @@ pub enum Stage {
     Done,
 }
 
-/// How a Done row ended, from the `<status>` of its notification or the
-/// `status` of its live-list entry.
+/// How a Done row ended, from the `<status>` of its notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
@@ -101,9 +99,9 @@ pub enum Outcome {
     /// Killed by the user or the parent (`TaskStop`).
     Killed,
     Stopped,
-    /// It left the live list and no notification has said how. The usual
-    /// case for the few seconds between the two, and the permanent one when
-    /// the parent transcript cannot be found.
+    /// Its meta says it finished and no notification has said how. The
+    /// usual case for the few seconds between the two, and the permanent one
+    /// when the parent transcript cannot be found.
     Unknown,
 }
 
@@ -123,81 +121,6 @@ impl Outcome {
     /// Anything but a clean completion — worth a warning colour.
     pub fn is_bad(self) -> bool {
         matches!(self, Outcome::Failed | Outcome::Killed)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The live list (subagentStatusLine stdin)
-// ---------------------------------------------------------------------------
-
-/// One `tasks[]` entry of the `subagentStatusLine` input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveTask {
-    /// The agent id — `agent-<id>.jsonl`, and the merge key.
-    pub id: String,
-    /// `local_agent` for a subagent; carried through as-is.
-    pub kind: Option<String>,
-    /// Raw status word (`running`, `completed`, …).
-    pub status: String,
-    /// The Agent tool's `description`.
-    pub description: Option<String>,
-    /// Claude Code's own one-line "what it's doing" (often empty).
-    pub label: Option<String>,
-    /// Present only for an agent that was given a name.
-    pub name: Option<String>,
-    pub start_ms: Option<u64>,
-    pub model: Option<String>,
-    pub tokens: Option<u64>,
-    pub cwd: Option<PathBuf>,
-}
-
-impl LiveTask {
-    fn from_value(v: &Value) -> Option<LiveTask> {
-        Some(LiveTask {
-            id: as_str(v, "id")?,
-            kind: as_str(v, "type"),
-            status: as_str(v, "status").unwrap_or_default(),
-            description: as_str(v, "description"),
-            label: as_str(v, "label"),
-            name: as_str(v, "name"),
-            start_ms: as_millis(v, "startTime"),
-            model: as_str(v, "model"),
-            tokens: as_u64(v, "tokenCount"),
-            cwd: as_str(v, "cwd").map(PathBuf::from),
-        })
-    }
-
-    /// Still going, by its own status word.
-    pub fn is_running(&self) -> bool {
-        Outcome::parse(&self.status).is_none()
-    }
-}
-
-/// One `subagentStatusLine` input: whose session, and its visible workers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LiveSnapshot {
-    pub session_id: Option<String>,
-    pub tasks: Vec<LiveTask>,
-}
-
-impl LiveSnapshot {
-    /// Parse the stdin JSON. Never fails: garbage is an empty snapshot, an
-    /// entry with no `id` is skipped.
-    pub fn parse(json: &str) -> LiveSnapshot {
-        serde_json::from_str::<Value>(json)
-            .map(|v| LiveSnapshot::from_value(&v))
-            .unwrap_or_default()
-    }
-
-    pub fn from_value(v: &Value) -> LiveSnapshot {
-        LiveSnapshot {
-            session_id: as_str(v, "session_id"),
-            tasks: v
-                .get("tasks")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(LiveTask::from_value).collect())
-                .unwrap_or_default(),
-        }
     }
 }
 
@@ -234,14 +157,18 @@ pub fn session_transcript(config_dir: &Path, session: &str) -> Option<PathBuf> {
 /// Lines of a transcript's head the conversation's root can hide in.
 const ROOT_SCAN: usize = 500;
 
-/// The conversation a transcript holds: the `uuid` of its first parentless
-/// user or assistant turn. Claude Code copies a conversation's records
+/// The conversation a transcript holds: the `uuid` of the record its chain
+/// starts from, the first one with no parent. That is a turn, or a record
+/// Claude Code writes before one: a conversation `/clear` (or a hooked
+/// startup) began opens with its `SessionStart` hook's record, and its first
+/// turn hangs off that, so a root read from turns alone would leave every
+/// such conversation without one. Claude Code copies a conversation's records
 /// forward when it re-ids a session, so this is the same before and after
 /// where the session id is not; `/clear` starts a new root, and a different
-/// conversation has its own.
-/// `None` for a transcript with no turn of its own yet — a session
-/// just switched to in the agents view holds only headers until its next
-/// turn.
+/// conversation has its own. A compaction's boundary starts no
+/// conversation. `None` for a transcript with no record of its own yet — a
+/// session just switched to in the agents view holds only headers until its
+/// next turn.
 pub fn conversation_root(transcript: &Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(transcript).ok()?;
@@ -258,8 +185,9 @@ pub fn conversation_root(transcript: &Path) -> Option<String> {
         }
         if !matches!(
             v.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
+            Some("user" | "assistant" | "attachment" | "system")
+        ) || v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
             continue;
         }
         let parent = v.get("parentUuid").and_then(Value::as_str);
@@ -308,6 +236,13 @@ pub struct AgentMeta {
     /// How deep it was spawned (`spawnDepth`): 1 for the session's own
     /// workers, 2 for an agent one of them spawned, and so on.
     pub depth: Option<u32>,
+    /// `name`, only when the agent was given one.
+    pub name: Option<String>,
+    /// `finished: true`: Claude Code writes it into the meta when the
+    /// worker's run ends, and drops it when the worker is messaged again.
+    pub finished: bool,
+    /// `revivedAt` (epoch ms): when the worker was last messaged again.
+    pub revived_ms: Option<u64>,
 }
 
 pub fn read_meta(subagents_dir: &Path, id: &str) -> AgentMeta {
@@ -324,6 +259,9 @@ pub fn read_meta(subagents_dir: &Path, id: &str) -> AgentMeta {
         model: as_str(&v, "model"),
         parent_id: as_str(&v, "parentAgentId"),
         depth: as_u64(&v, "spawnDepth").map(|d| d.min(u64::from(u32::MAX)) as u32),
+        name: as_str(&v, "name"),
+        finished: v.get("finished").and_then(Value::as_bool) == Some(true),
+        revived_ms: as_millis(&v, "revivedAt"),
     }
 }
 
@@ -356,8 +294,7 @@ pub struct Activity {
 pub struct Stop {
     /// The error line's timestamp.
     pub from_ms: u64,
-    /// Its next real turn (or its revival in the live list); `None` while
-    /// it is still stopped.
+    /// Its next real turn; `None` while it is still stopped.
     #[serde(default)]
     pub to_ms: Option<u64>,
     /// `no network`, `usage limit`, `login expired`, `timed out`,
@@ -847,18 +784,17 @@ pub fn is_finished(completion: &Completion, last_turn_ms: Option<u64>) -> bool {
 // Rows
 // ---------------------------------------------------------------------------
 
-/// One subagent, as the pane shows it. The stable type the pane and the
-/// relay consume; fields are only ever added.
+/// One subagent, as the pane shows it. The stable type the pane consumes;
+/// fields are only ever added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentRow {
-    /// Agent id: `agent-<id>.jsonl`, `tasks[].id`, `<task-id>`. Never
-    /// rewritten.
+    /// Agent id: `agent-<id>.jsonl`, `<task-id>`. Never rewritten.
     pub id: String,
     pub stage: Stage,
     /// Set once Done.
     #[serde(default)]
     pub outcome: Option<Outcome>,
-    /// A name, when the agent was given one.
+    /// A name, when the agent was given one (its meta's `name`).
     #[serde(default)]
     pub name: Option<String>,
     /// The Agent tool's `description` — what the pane shows as its title.
@@ -868,16 +804,20 @@ pub struct SubagentRow {
     pub agent_type: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// Epoch ms; ELAPSED is drawn from this every second.
+    /// Epoch ms: its transcript's first line, or the message that woke it
+    /// again (its meta's `revivedAt`). ELAPSED is drawn from this every
+    /// second.
     #[serde(default)]
     pub started_ms: Option<u64>,
-    /// Epoch ms it landed (notification time, else when it left the list).
+    /// Epoch ms it landed (its notification, else its meta's `finished`),
+    /// or its last write when it stopped with the claude that ran it.
     #[serde(default)]
     pub ended_ms: Option<u64>,
+    /// The context it carries now, from its transcript ([`Activity::tokens`]).
     #[serde(default)]
     pub tokens: Option<u64>,
-    /// What it is doing now: the live `label` when Claude Code gave one,
-    /// else the last tool call in its transcript. Cleared on Done.
+    /// What it is doing now: the last tool call in its transcript. Cleared
+    /// on Done.
     #[serde(default)]
     pub activity: Option<String>,
     /// Its `agent-<id>.jsonl`, once known — what a click opens.
@@ -889,19 +829,6 @@ pub struct SubagentRow {
     /// Summary line of its last notification.
     #[serde(default)]
     pub summary: Option<String>,
-    /// `tokens` came from its transcript, not the live list. Once it has,
-    /// the live list's `tokenCount` never replaces it: that count is the
-    /// context *plus* output so far, and an API error zeroes the context
-    /// part, so a failed worker lists at its output alone — the `764`
-    /// of the real transcript in the tests.
-    #[serde(default)]
-    pub tokens_from_transcript: bool,
-    /// Claude Code's own count, the live list's `tokenCount`: the context of
-    /// its last turn *plus* every output token of the run so far (and an
-    /// estimate of a reply still streaming) — the number its agents view
-    /// shows. [`SubagentRow::shown_tokens`] is the one the pane draws.
-    #[serde(default)]
-    pub live_tokens: Option<u64>,
     /// Spans it stood stopped on an API error ([`Stop`]), oldest first.
     #[serde(default)]
     pub stops: Vec<Stop>,
@@ -932,8 +859,6 @@ impl SubagentRow {
             transcript: None,
             last_turn_ms: None,
             summary: None,
-            tokens_from_transcript: false,
-            live_tokens: None,
             stops: Vec::new(),
             parent_id: None,
             depth: None,
@@ -973,8 +898,8 @@ impl SubagentRow {
     }
 
     /// Fold in the spans a transcript read found: a known span (same
-    /// start) that is still open takes the read's end — one the live list
-    /// already closed at the continue keeps that — and a new one is added.
+    /// start) that is still open takes the read's end, and a new one is
+    /// added.
     fn merge_stops(&mut self, found: &[Stop]) {
         for f in found {
             match self.stops.iter_mut().find(|s| s.from_ms == f.from_ms) {
@@ -998,18 +923,6 @@ impl SubagentRow {
         self.stops.drain(..over);
     }
 
-    /// The live list lists it running again from `start_ms`: an open stop
-    /// ends there. True when one did — a resume, not a new run.
-    fn resume_at(&mut self, start_ms: Option<u64>) -> bool {
-        match (self.stops.last_mut(), start_ms) {
-            (Some(s), Some(at)) if s.to_ms.is_none() && at > s.from_ms => {
-                s.to_ms = Some(at);
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// The agent id (same as [`SubagentRow::id`]).
     pub fn agent_id(&self) -> &str {
         &self.id
@@ -1026,20 +939,6 @@ impl SubagentRow {
             .as_deref()
             .or(self.description.as_deref())
             .unwrap_or(&self.id)
-    }
-
-    /// The count the pane draws: Claude Code's own (`tokenCount`, what its
-    /// agents view shows), unless the transcript's context is
-    /// larger. By construction Claude Code's is the context plus output, so
-    /// it is only ever smaller when it is wrong: after an API error it is
-    /// the output alone, and just after a continue it is a
-    /// count the next turn replaces. Then the transcript's stands in, as it
-    /// does while no live list has named one.
-    pub fn shown_tokens(&self) -> Option<u64> {
-        match (self.live_tokens, self.tokens) {
-            (Some(live), Some(ctx)) => Some(live.max(ctx)),
-            (live, ctx) => live.or(ctx),
-        }
     }
 
     /// Wall time so far (Running) or taken (Done), in ms.
@@ -1072,6 +971,9 @@ impl SubagentRow {
     }
 
     fn fill_meta(&mut self, meta: AgentMeta) {
+        if meta.name.is_some() {
+            self.name = meta.name;
+        }
         if self.description.is_none() {
             self.description = meta.description;
         }
@@ -1102,7 +1004,7 @@ impl crate::feed::LiveAgent for SubagentRow {
         self.started_ms
     }
     fn tokens(&self) -> Option<u64> {
-        self.shown_tokens()
+        self.tokens
     }
     fn description(&self) -> Option<&str> {
         self.description.as_deref()
@@ -1117,9 +1019,8 @@ impl crate::feed::LiveAgent for SubagentRow {
 
 /// The subagents of one tab's Claude session, Running and Done.
 ///
-/// Feed it [`LiveSnapshot`]s as the relay delivers them
-/// ([`Tracker::apply_live`]) and call [`Tracker::refresh`] about once a
-/// second; read [`Tracker::rows`]. Nothing ages out — Done rows stay until
+/// Call [`Tracker::refresh`] about once a second and read
+/// [`Tracker::rows`]. Nothing ages out — Done rows stay until
 /// [`Tracker::clear`] (the tab's `/clear`, or `SessionStart` with
 /// `source=clear`).
 ///
@@ -1149,18 +1050,19 @@ pub struct Tracker {
     /// A follower per Running worker's transcript, by agent id.
     #[serde(skip)]
     followers: HashMap<String, TranscriptTail>,
-    /// Finished workers whose transcript this process has read once: a row
-    /// restored with the live list's count (or none) is set right from its
-    /// transcript after a restart, and then left alone.
+    /// Each worker's `agent-<id>.meta.json` as last read, with its length
+    /// and mtime: read again only when they change, since `finished` and
+    /// `revivedAt` come and go in it as the worker ends and is messaged
+    /// again.
     #[serde(skip)]
-    checked: std::collections::HashSet<String>,
-    /// Workers whose `agent-<id>.meta.json` this process has read: once
-    /// each, as a worker the live list announced first (or one restored from
-    /// before its parent was kept) has its parent only there.
+    metas: HashMap<String, ((u64, Option<u64>), AgentMeta)>,
+    /// Each worker's transcript length at the last refresh: a finished
+    /// worker whose transcript grows is looked at again, its new lines
+    /// alone (messaged again, it is Running).
     #[serde(skip)]
-    meta_read: std::collections::HashSet<String>,
+    lens: HashMap<String, u64>,
     /// Workers whose Done rows were cleared by hand ([`Tracker::clear_done`]):
-    /// not brought back by the disk or the live list unless they run again.
+    /// not brought back by the disk unless they run again.
     #[serde(default)]
     dismissed: Vec<String>,
     /// When the Done rows were last cleared by hand: the pane hides the
@@ -1245,6 +1147,52 @@ impl Tracker {
         any.then_some(false)
     }
 
+    /// Forget the earlier ids that hold another conversation than the bound
+    /// session (a root of their own, not its root), and the rows found
+    /// under them: a table that took one for a re-id while the roots could
+    /// not be read keeps showing that conversation's workers. An id whose
+    /// root cannot be read stays. Reads transcript heads, so call it when a
+    /// session starts, not every tick. Returns whether anything went.
+    pub fn forget_other_conversations(&mut self) -> bool {
+        if self.aliases.is_empty() {
+            return false;
+        }
+        let (Some(config), Some(session)) =
+            (self.config_dir.as_deref(), self.session_id.as_deref())
+        else {
+            return false;
+        };
+        let root = |sid: &str| session_transcript(config, sid).and_then(|p| conversation_root(&p));
+        let Some(own) = root(session) else {
+            return false;
+        };
+        let others: Vec<String> = self
+            .aliases
+            .iter()
+            .filter(|a| root(a).is_some_and(|r| r != own))
+            .cloned()
+            .collect();
+        if others.is_empty() {
+            return false;
+        }
+        self.aliases.retain(|a| !others.contains(a));
+        // A worker's transcript is `<session>/subagents/agent-<id>.jsonl`.
+        let under = |r: &SubagentRow| {
+            r.transcript
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|s| others.iter().any(|o| s == o.as_str()))
+        };
+        self.rows.retain(|r| !under(r));
+        // The readers are rebuilt for the ids left on the next refresh.
+        self.dirs.clear();
+        self.tails.clear();
+        self.resolved.clear();
+        true
+    }
+
     /// Bind to a session. A different id keeps the rows and records the old
     /// one as an alias — a resumed or re-id'd conversation is still the same
     /// session; call [`Tracker::clear`] as well if it is not.
@@ -1270,88 +1218,27 @@ impl Tracker {
         }
     }
 
-    /// Fold in one live list. Every listed task becomes (or stays) a row;
-    /// a Running row absent from the list is Done as of `now_ms`, with its
-    /// outcome to be filled by a notification.
-    pub fn apply_live(&mut self, snap: &LiveSnapshot, now_ms: u64) {
-        if let Some(sid) = &snap.session_id {
-            self.set_session(sid);
-        }
-        for t in &snap.tasks {
-            if let Some(i) = self.dismissed.iter().position(|d| *d == t.id) {
-                // Cleared by hand: still listed finished for a while, which
-                // must not bring it back; running again, it is a row again.
-                if Outcome::parse(&t.status).is_some() {
-                    continue;
-                }
-                self.dismissed.remove(i);
-            }
-            let row = self.row_mut(&t.id, Stage::Running);
-            if t.name.is_some() {
-                row.name = t.name.clone();
-            }
-            if t.description.is_some() {
-                row.description = t.description.clone();
-            }
-            if t.model.is_some() {
-                row.model = t.model.clone();
-            }
-            // A worker continued after an API error is listed afresh, its
-            // start moved to the continue: the stop ends there and the
-            // clock carries on from where it stood.
-            let resumed = Outcome::parse(&t.status).is_none() && row.resume_at(t.start_ms);
-            if t.start_ms.is_some() && !(resumed && row.started_ms.is_some()) {
-                row.started_ms = t.start_ms;
-            }
-            // The transcript's count is the one the pane keeps once there
-            // is one (it moves every second); the live list's stands in
-            // until then. It is
-            // never taken back: after an API error the live count is the
-            // output alone.
-            if t.tokens.is_some() && !row.tokens_from_transcript {
-                row.tokens = t.tokens;
-            }
-            // Claude Code writes 0 for a worker with no progress yet.
-            if let Some(n) = t.tokens.filter(|&n| n > 0) {
-                row.live_tokens = Some(n);
-            }
-            match Outcome::parse(&t.status) {
-                None => {
-                    if row.stage == Stage::Done {
-                        row.revive();
-                    }
-                    // The transcript's last tool call is kept once there
-                    // is one: it is re-read every second, where the label
-                    // comes every few and often just repeats the
-                    // description. The label stands in until then.
-                    if t.label.is_some() && (row.transcript.is_none() || row.activity.is_none()) {
-                        row.activity = t.label.clone();
-                    }
-                }
-                // Claude Code lists a finished task for a while after: it
-                // ended when first listed so (or when its notification
-                // says), not on every list since.
-                Some(o) if row.stage == Stage::Done && row.outcome == Some(o) => {}
-                Some(o) => row.mark_done(o, now_ms),
-            }
-        }
-        for row in &mut self.rows {
-            if row.stage == Stage::Running && !snap.tasks.iter().any(|t| t.id == row.id) {
-                row.mark_done(Outcome::Unknown, now_ms);
-            }
-        }
-        self.sort();
-    }
-
     /// Read the disk: find the session's `subagents/` dir and transcript,
     /// pick up new notifications, refresh each row's activity, meta and
-    /// transcript path, and add Done rows for workers that finished while
-    /// nothing was watching (Giverny closed, or the pane just switched on).
+    /// transcript path, and add the workers it finds: Running ones, and Done
+    /// ones that finished while nothing was watching (Giverny closed, or the
+    /// pane just switched on).
     ///
-    /// Cheap enough for once a second: one `read_dir`, and an appended-bytes
-    /// read of the parent transcript and of each Running worker's
-    /// ([`TranscriptTail`]) — a `stat` each while nothing was written.
-    pub fn refresh(&mut self) {
+    /// A worker runs when it has an `agent-<id>.jsonl`, no landing since its
+    /// last turn (no notification, no `finished` in its meta), and has
+    /// written since the claude now running the session started
+    /// (`host_started_ms`, its registry `startedAt`). That last test is what
+    /// tells it from a worker killed with an earlier claude of the same
+    /// conversation, which lands nowhere: such a worker is never a new row,
+    /// and a Running row of one ends, stopped, at its last write. With no
+    /// claude known for the session (`None`) the disk adds no Running row
+    /// and ends none.
+    ///
+    /// Cheap enough for once a second: one `read_dir`, a `stat` per worker,
+    /// and an appended-bytes read of the parent transcript and of each
+    /// Running worker's ([`TranscriptTail`]). A finished worker is read
+    /// again only when its transcript grows.
+    pub fn refresh(&mut self, host_started_ms: Option<u64>, now_ms: u64) {
         let Some(config) = self.config_dir.clone() else {
             return;
         };
@@ -1385,112 +1272,14 @@ impl Tracker {
                 }
             }
         }
+        let host = Host {
+            started_ms: host_started_ms,
+            now_ms,
+        };
         let dirs = self.dirs.clone();
         for dir in &dirs {
             for id in list_agent_ids(dir) {
-                let known = self.rows.iter().any(|r| r.id == id);
-                if !known && self.dismissed.contains(&id) {
-                    // Cleared by hand; the live list says if it runs again.
-                    continue;
-                }
-                let completion = completions.get(&id);
-                if !known && completion.is_none() {
-                    // Not in the live list and never notified: a worker the
-                    // live list will announce, or one killed with its parent.
-                    // Either way not ours to invent.
-                    continue;
-                }
-                let unchecked = !self.checked.contains(&id);
-                let want_meta = !self.meta_read.contains(&id);
-                let needs_read = !known
-                    || self.rows.iter().any(|r| {
-                        r.id == id
-                            && (r.stage == Stage::Running
-                                || r.transcript.is_none()
-                                || (unchecked && !r.tokens_from_transcript))
-                    });
-                if !needs_read && completion.is_none() && !want_meta {
-                    continue;
-                }
-                let path = agent_transcript(dir, &id);
-                let row_is_running = self
-                    .rows
-                    .iter()
-                    .any(|r| r.id == id && r.stage == Stage::Running);
-                // A Running worker is followed: only what it appended since
-                // the last second is read. Anything else is read once.
-                let act = if row_is_running {
-                    let f = self
-                        .followers
-                        .entry(id.clone())
-                        .or_insert_with(|| TranscriptTail::new(&path));
-                    f.poll();
-                    Some(f.activity().clone())
-                } else if needs_read {
-                    self.checked.insert(id.clone());
-                    Some(read_activity(&path))
-                } else {
-                    None
-                };
-                let meta = want_meta.then(|| read_meta(dir, &id));
-                // Written at the spawn, but a worker's transcript can show
-                // up first: one with no meta yet is looked at again.
-                if meta.as_ref().is_some_and(|m| *m != AgentMeta::default()) {
-                    self.meta_read.insert(id.clone());
-                }
-                // A worker new to us is Done unless it has written since its
-                // notification: messaged again and still going, with no live
-                // entry yet — Running until the list or the next
-                // notification says otherwise.
-                let initial = match (completion, &act) {
-                    (Some(c), Some(a)) if !is_finished(c, a.last_turn_ms) => Stage::Running,
-                    _ => Stage::Done,
-                };
-                let row = self.row_mut(&id, initial);
-                row.transcript = Some(path);
-                if let Some(meta) = meta {
-                    row.fill_meta(meta);
-                }
-                if let Some(act) = act {
-                    if act.last_turn_ms.is_some() {
-                        row.last_turn_ms = act.last_turn_ms;
-                    }
-                    if row.model.is_none() {
-                        row.model = act.model;
-                    }
-                    // The transcript's count wins at every stage: a Done row
-                    // holding the live list's (the output alone, after an API
-                    // error) is set right the first time it is read.
-                    if act.tokens.is_some() {
-                        row.tokens = act.tokens;
-                        row.tokens_from_transcript = true;
-                    }
-                    row.merge_stops(&act.stops);
-                    // The transcript's last tool call; the live label
-                    // stands until the worker has made one.
-                    if row.stage == Stage::Running && act.doing.is_some() {
-                        row.activity = act.doing;
-                    }
-                }
-                if !known && row.started_ms.is_none() {
-                    row.started_ms = first_line_ms(&agent_transcript(dir, &id));
-                }
-                // A worker woken by a message is listed afresh with its
-                // start moved to the message, minutes before its first
-                // turn after it: that listing is newer than the notice
-                // too. Its last turn alone would land it
-                // here and revive it at the next live list, every few
-                // seconds, until it next wrote.
-                let alive = match (row.last_turn_ms, row.started_ms) {
-                    (Some(t), Some(s)) => Some(t.max(s)),
-                    (t, s) => t.or(s),
-                };
-                if let Some(c) = completion
-                    && is_finished(c, alive)
-                {
-                    row.mark_done(c.outcome, c.at_ms);
-                    row.summary = c.summary.clone();
-                }
+                self.refresh_agent(dir, &id, completions.get(&id), host);
             }
         }
         let rows = &self.rows;
@@ -1499,6 +1288,188 @@ impl Tracker {
                 .any(|r| &r.id == id && r.stage == Stage::Running)
         });
         self.sort();
+    }
+
+    /// The meta of worker `id`, read again only when its file changed, and
+    /// that file's mtime.
+    fn meta_of(&mut self, dir: &Path, id: &str) -> (AgentMeta, Option<u64>) {
+        let stat = file_stat(&dir.join(format!("agent-{id}.meta.json")));
+        match self.metas.get(id) {
+            Some((seen, meta)) if *seen == stat && stat.1.is_some() => (meta.clone(), stat.1),
+            _ => {
+                let meta = read_meta(dir, id);
+                self.metas.insert(id.to_string(), (stat, meta.clone()));
+                (meta, stat.1)
+            }
+        }
+    }
+
+    /// One worker of [`Tracker::refresh`].
+    fn refresh_agent(&mut self, dir: &Path, id: &str, notified: Option<&Completion>, host: Host) {
+        let path = agent_transcript(dir, id);
+        let (len, written) = file_stat(&path);
+        let before = self.lens.insert(id.to_string(), len);
+        let grew = before.filter(|&b| len > b);
+        let row = self.rows.iter().find(|r| r.id == id);
+        let known = row.is_some();
+        let dismissed = !known && self.dismissed.iter().any(|d| d == id);
+        let meta_seen = self
+            .metas
+            .get(id)
+            .is_some_and(|(_, m)| *m != AgentMeta::default());
+        // Written since the claude running the session now started: it may
+        // be alive. `None`: no such claude known.
+        let alive = host.alive(written);
+        match row {
+            // A finished worker is looked at again only when something may
+            // have changed: its transcript grew (messaged again?), a
+            // notification to apply, its meta not read yet in this process.
+            Some(r) if r.stage == Stage::Done => {
+                let news = notified
+                    .is_some_and(|c| r.outcome != Some(c.outcome) || r.ended_ms != Some(c.at_ms));
+                if grew.is_none() && !news && meta_seen {
+                    return;
+                }
+            }
+            Some(_) => {}
+            // Cleared by hand: back only if it runs again.
+            None if dismissed && (grew.is_none() || alive != Some(true)) => return,
+            // Never notified: Running if alive, else not ours to invent (a
+            // worker killed with its parent's earlier claude, or one whose
+            // session is not known to run).
+            None if !dismissed && notified.is_none() && alive != Some(true) => return,
+            None => {}
+        }
+        let (meta, meta_mtime) = self.meta_of(dir, id);
+        let running = self
+            .rows
+            .iter()
+            .any(|r| r.id == id && r.stage == Stage::Running);
+        // A Running worker is followed: only what it appended since the
+        // last second is read. One new to us is read once; a finished one
+        // that grew has its new lines read.
+        let act = if running {
+            let f = self
+                .followers
+                .entry(id.to_string())
+                .or_insert_with(|| TranscriptTail::new(&path));
+            f.poll();
+            Some(f.activity().clone())
+        } else if !known {
+            Some(read_activity(&path))
+        } else if let Some(from) = before.filter(|_| grew.is_some()) {
+            let mut tail = TranscriptTail::new(&path);
+            tail.offset = Some(from);
+            tail.poll();
+            Some(tail.act)
+        } else {
+            None
+        };
+        let last_turn = act
+            .as_ref()
+            .and_then(|a| a.last_turn_ms)
+            .or_else(|| self.rows.iter().find(|r| r.id == id)?.last_turn_ms);
+        let started = self
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.started_ms);
+        // A worker woken by a message has its start moved to the message,
+        // minutes before its first turn after it: that start is newer than
+        // the notice too. Its last turn alone would land it here and
+        // revive it on the next refresh, every second, until it next wrote.
+        let alive_ms = match (last_turn, started) {
+            (Some(t), Some(s)) => Some(t.max(s)),
+            (t, s) => t.or(s),
+        };
+        // Landed: its notification is at least as new as its last turn, or,
+        // with none that is, its meta says `finished` (rewritten as the run
+        // ends, so its mtime is when) — the few seconds before the
+        // notification, or for good where none comes.
+        let finished = meta
+            .finished
+            .then_some(meta_mtime)
+            .flatten()
+            .map(|at_ms| Completion {
+                outcome: Outcome::Unknown,
+                at_ms,
+                summary: None,
+            });
+        let landing = notified
+            .filter(|c| is_finished(c, alive_ms))
+            .cloned()
+            .or_else(|| finished.filter(|f| is_finished(f, alive_ms)));
+        let landed = landing.is_some();
+        // A worker new to us is Done when landed; else it has run since its
+        // landing (messaged again) or has none yet: Running, until the test
+        // below finds its claude gone.
+        let initial = if landed { Stage::Done } else { Stage::Running };
+        if dismissed {
+            if landed {
+                return;
+            }
+            self.dismissed.retain(|d| d != id);
+        }
+        let row = self.row_mut(id, initial);
+        row.transcript = Some(path.clone());
+        if meta != AgentMeta::default() {
+            row.fill_meta(meta.clone());
+        }
+        if let Some(act) = act {
+            if act.last_turn_ms.is_some() {
+                row.last_turn_ms = act.last_turn_ms;
+            }
+            if row.model.is_none() {
+                row.model = act.model;
+            }
+            if act.tokens.is_some() {
+                row.tokens = act.tokens;
+            }
+            row.merge_stops(&act.stops);
+            if row.stage == Stage::Running && act.doing.is_some() {
+                row.activity = act.doing;
+            }
+        }
+        if !known && row.started_ms.is_none() {
+            // Running again after a landing, its clock starts at the
+            // message that woke it.
+            row.started_ms = meta
+                .revived_ms
+                .filter(|_| !landed)
+                .or_else(|| first_line_ms(&path));
+        }
+        if let Some(l) = landing {
+            row.mark_done(l.outcome, l.at_ms);
+            if l.summary.is_some() {
+                row.summary = l.summary;
+            }
+            return;
+        }
+        match row.stage {
+            // Killed with an earlier claude of its conversation: it lands
+            // nowhere, and stopped writing when that claude went.
+            Stage::Running if alive == Some(false) => {
+                let at = written.unwrap_or(host.now_ms);
+                row.mark_done(Outcome::Stopped, at);
+            }
+            // Messaged again: a turn after it ended, from the claude that
+            // runs the session now. Its clock starts over at the message.
+            Stage::Done
+                if alive != Some(false)
+                    && last_turn
+                        .zip(row.ended_ms)
+                        .is_some_and(|(t, end)| t > end + LANDING_SLACK_MS) =>
+            {
+                row.revive();
+                if let Some(at) = meta
+                    .revived_ms
+                    .filter(|&at| row.started_ms.is_none_or(|s| at > s))
+                {
+                    row.started_ms = Some(at);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn sort(&mut self) {
@@ -1515,8 +1486,46 @@ impl Tracker {
     }
 }
 
-/// Timestamp of the first line of a transcript — its start, when no live
-/// list ever said.
+/// How much later than a row's end a turn must be to be the worker
+/// messaged again: past the few milliseconds by which the files of one
+/// ending land out of order.
+const LANDING_SLACK_MS: u64 = 2_000;
+
+/// How far a worker's last write may fall before its claude's start and
+/// still be taken as that claude's: clocks that disagree by a little.
+const HOST_SLACK_MS: u64 = 5_000;
+
+/// The claude running a tracker's session, as [`Tracker::refresh`] is told.
+#[derive(Debug, Clone, Copy)]
+struct Host {
+    /// Its registry `startedAt`; `None` when no claude is known to run it.
+    started_ms: Option<u64>,
+    now_ms: u64,
+}
+
+impl Host {
+    /// Was a file last written at `written` written by this claude?
+    /// `None` when there is no claude to ask about.
+    fn alive(&self, written: Option<u64>) -> Option<bool> {
+        let started = self.started_ms?;
+        Some(written.is_some_and(|w| w + HOST_SLACK_MS >= started))
+    }
+}
+
+/// A file's length and mtime (epoch ms); `(0, None)` when it is not there.
+fn file_stat(path: &Path) -> (u64, Option<u64>) {
+    let Ok(m) = std::fs::metadata(path) else {
+        return (0, None);
+    };
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    (m.len(), mtime)
+}
+
+/// Timestamp of the first line of a transcript: when the worker started.
 fn first_line_ms(path: &Path) -> Option<u64> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
@@ -1586,30 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_live_snapshot_tolerantly() {
-        let snap = LiveSnapshot::parse(
-            r#"{"session_id":"s1","columns":179,"tasks":[
-                {"id":"a1","type":"local_agent","status":"running","description":"Work acme#74",
-                 "label":"Grepping","startTime":1790089835667,"model":"m","tokenCount":124832,"cwd":"/w"},
-                {"id":"a2","status":"completed","startTime":"2026-09-23T08:00:00Z","tokenCount":"oops"},
-                {"status":"running"}
-            ]}"#,
-        );
-        assert_eq!(snap.session_id.as_deref(), Some("s1"));
-        assert_eq!(snap.tasks.len(), 2, "entry with no id skipped");
-        assert_eq!(snap.tasks[0].label.as_deref(), Some("Grepping"));
-        assert_eq!(snap.tasks[0].tokens, Some(124832));
-        assert!(snap.tasks[0].is_running());
-        assert!(!snap.tasks[1].is_running());
-        assert!(snap.tasks[1].start_ms.is_some(), "RFC 3339 start accepted");
-        assert_eq!(
-            snap.tasks[1].tokens, None,
-            "wrong type costs the field only"
-        );
-        assert_eq!(LiveSnapshot::parse("not json"), LiveSnapshot::default());
-    }
-
-    #[test]
     fn notifications_keep_the_latest_per_id() {
         let (_c, _s, parent) = layout("notif", "s1");
         append(&parent, &notification_lines("a1", "completed", T0));
@@ -1625,6 +1610,273 @@ mod tests {
         );
         assert_eq!(got["a2"].outcome, Outcome::Failed);
         assert_eq!(got["a2"].summary.as_deref(), Some("Agent \"x\" finished"));
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// One assistant turn calling Bash with `cmd`, at `ms`.
+    fn turn(ms: u64, cmd: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "timestamp": iso(ms),
+            "message": {"model": "claude-x",
+                "usage": {"input_tokens": 100, "cache_read_input_tokens": 900},
+                "content": [{"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]},
+        })
+        .to_string()
+            + "\n"
+    }
+
+    /// A worker as Claude Code 2.1.325 writes it: its meta, and a
+    /// transcript opening with its prompt and one turn, the files written
+    /// now whatever their timestamps say.
+    fn spawn(subs: &Path, id: &str, at: u64) {
+        std::fs::write(
+            subs.join(format!("agent-{id}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"pics: more pictures","spawnDepth":1,"requestShape":"background"}"#,
+        )
+        .unwrap();
+        let prompt = serde_json::json!({"type": "user", "timestamp": iso(at), "message": {"role": "user", "content": "go"}});
+        append(&agent_transcript(subs, id), &(prompt.to_string() + "\n"));
+        append(&agent_transcript(subs, id), &turn(at + 1000, "cargo test"));
+    }
+
+    /// Rewrite the meta with `finished` set (or not) and `extra` fields.
+    fn meta(subs: &Path, id: &str, finished: bool, extra: &str) {
+        let fin = if finished { r#","finished":true"# } else { "" };
+        std::fs::write(
+            subs.join(format!("agent-{id}.meta.json")),
+            format!(r#"{{"agentType":"general-purpose","description":"pics: more pictures","spawnDepth":1{fin}{extra}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_worker_runs_from_the_disk_alone() {
+        // The meta and the transcript are all there is.
+        let (config, subs, parent) = layout("disk-runs", "s1");
+        let t0 = now() - 60_000;
+        spawn(&subs, "a1", t0);
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        let host = Some(t0 - 600_000);
+        t.refresh(host, now());
+        let r = t.get("a1").expect("a running worker is a row");
+        assert!(r.running());
+        assert_eq!(r.description.as_deref(), Some("pics: more pictures"));
+        assert_eq!(r.activity.as_deref(), Some("Bash: cargo test"));
+        assert_eq!(r.tokens, Some(1000));
+        assert_eq!(r.started_ms, Some(t0), "its transcript's first line");
+
+        // It works on: the follower keeps the activity current.
+        append(
+            &agent_transcript(&subs, "a1"),
+            &turn(t0 + 5000, "cargo clippy"),
+        );
+        t.refresh(host, now());
+        assert_eq!(
+            t.get("a1").unwrap().activity.as_deref(),
+            Some("Bash: cargo clippy")
+        );
+
+        // It ends: the notification lands it.
+        meta(&subs, "a1", true, "");
+        append(&parent, &notification_lines("a1", "completed", t0 + 6000));
+        t.refresh(host, now());
+        let r = t.get("a1").unwrap();
+        assert!(!r.running());
+        assert_eq!(r.outcome, Some(Outcome::Completed));
+        assert_eq!(r.ended_ms, Some(t0 + 6030));
+    }
+
+    #[test]
+    fn a_named_agent_takes_its_name_from_its_meta() {
+        let (config, subs, _parent) = layout("disk-named", "s1");
+        let t0 = now() - 60_000;
+        spawn(&subs, "a1", t0);
+        meta(&subs, "a1", false, r#","name":"pics""#);
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        t.refresh(Some(t0 - 600_000), now());
+        assert_eq!(t.get("a1").unwrap().display_name(), "pics");
+    }
+
+    #[test]
+    fn a_finished_meta_lands_it_before_its_notification() {
+        let (config, subs, parent) = layout("disk-finished", "s1");
+        let t0 = now() - 60_000;
+        spawn(&subs, "a1", t0);
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        let host = Some(t0 - 600_000);
+        t.refresh(host, now());
+        assert!(t.get("a1").unwrap().running());
+        meta(&subs, "a1", true, "");
+        t.refresh(host, now());
+        let r = t.get("a1").unwrap();
+        assert!(!r.running(), "`finished` in its meta is a landing");
+        assert_eq!(r.outcome, Some(Outcome::Unknown));
+        append(&parent, &notification_lines("a1", "failed", t0 + 2000));
+        t.refresh(host, now());
+        assert_eq!(t.get("a1").unwrap().outcome, Some(Outcome::Failed));
+    }
+
+    #[test]
+    fn a_worker_killed_with_an_earlier_claude_does_not_run() {
+        let (config, subs, _parent) = layout("disk-dead", "s1");
+        let t0 = now() - 60_000;
+        spawn(&subs, "a1", t0);
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        // a1 is a row from when its claude ran; a2 spawns after that look.
+        t.refresh(Some(t0 - 600_000), now());
+        assert!(t.get("a1").unwrap().running());
+        spawn(&subs, "a2", t0);
+        // The conversation is resumed in a claude started after both last
+        // wrote: neither lands, ever.
+        let later = now() + 60_000;
+        let mut fresh = Tracker::new(t.config_dir.clone());
+        fresh.set_session("s1");
+        fresh.refresh(Some(later), now());
+        assert!(fresh.get("a1").is_none(), "not ours to invent");
+        t.refresh(Some(later), now());
+        let r = t.get("a1").unwrap();
+        assert!(!r.running(), "a Running row of a dead claude ends");
+        assert_eq!(r.outcome, Some(Outcome::Stopped));
+        assert!(t.get("a2").is_none());
+        // No claude known for the session: the disk says nothing.
+        let mut blind = Tracker::new(t.config_dir.clone());
+        blind.set_session("s1");
+        blind.refresh(None, now());
+        assert!(blind.is_empty());
+    }
+
+    #[test]
+    fn a_worker_messaged_again_runs_again() {
+        let (config, subs, parent) = layout("disk-revive", "s1");
+        let t0 = now() - 600_000;
+        spawn(&subs, "a1", t0);
+        meta(&subs, "a1", true, "");
+        append(&parent, &notification_lines("a1", "completed", t0 + 2000));
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        let host = Some(t0 - 600_000);
+        t.refresh(host, now());
+        assert!(!t.get("a1").unwrap().running());
+        t.refresh(host, now());
+        assert!(!t.get("a1").unwrap().running(), "settled");
+        // SendMessage: the meta loses `finished`, gains `revivedAt`, and a
+        // new turn lands minutes after the notification.
+        let woke = t0 + 300_000;
+        meta(&subs, "a1", false, &format!(r#","revivedAt":{woke}"#));
+        append(
+            &agent_transcript(&subs, "a1"),
+            &turn(woke + 3000, "git status"),
+        );
+        t.refresh(host, now());
+        let r = t.get("a1").unwrap();
+        assert!(r.running(), "revived from the disk");
+        assert_eq!(r.started_ms, Some(woke), "its clock starts at the message");
+        assert_eq!(r.outcome, None);
+        // And it lands again.
+        meta(&subs, "a1", true, &format!(r#","revivedAt":{woke}"#));
+        append(&parent, &notification_lines("a1", "completed", woke + 9000));
+        t.refresh(host, now());
+        let r = t.get("a1").unwrap();
+        assert!(!r.running());
+        assert_eq!(r.ended_ms, Some(woke + 9030));
+    }
+
+    #[test]
+    fn a_cleared_done_row_stays_gone_until_it_runs_again() {
+        let (config, subs, parent) = layout("disk-cleared", "s1");
+        let t0 = now() - 600_000;
+        spawn(&subs, "a1", t0);
+        meta(&subs, "a1", true, "");
+        append(&parent, &notification_lines("a1", "completed", t0 + 2000));
+        let mut t = Tracker::new(Some(config));
+        t.set_session("s1");
+        let host = Some(t0 - 600_000);
+        t.refresh(host, now());
+        assert_eq!(t.clear_done(now()), 1);
+        t.refresh(host, now());
+        assert!(t.get("a1").is_none(), "the disk does not bring it back");
+        // Messaged again: it runs, and is a row again.
+        let woke = t0 + 300_000;
+        meta(&subs, "a1", false, &format!(r#","revivedAt":{woke}"#));
+        append(
+            &agent_transcript(&subs, "a1"),
+            &turn(woke + 3000, "git status"),
+        );
+        t.refresh(host, now());
+        assert!(t.get("a1").is_some_and(SubagentRow::running));
+    }
+
+    /// A transcript as Claude Code 2.1.325 writes a conversation `/clear`
+    /// began: a header, the `SessionStart:clear` hook's record with no
+    /// parent, and the first turn hanging off it.
+    fn cleared(path: &Path, root: &str) {
+        let lines = [
+            serde_json::json!({"type": "permission-mode", "permissionMode": "default"}),
+            serde_json::json!({"parentUuid": null, "isSidechain": false, "type": "attachment",
+                "uuid": root, "attachment": {"type": "hook_success", "hookName": "SessionStart:clear"}}),
+            serde_json::json!({"parentUuid": root, "isSidechain": false, "type": "user",
+                "uuid": format!("{root}-1"), "message": {"role": "user", "content": "hi"}}),
+        ];
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_table_lets_go_of_another_conversations_id() {
+        // Conversation A (`a`, a Done worker) and B (`b1`, re-id'd as `b2`:
+        // its records copied forward), both begun by a `/clear`.
+        let (config, subs, a) = layout("other-conversation", "a");
+        let proj = subs.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let t0 = now() - 600_000;
+        cleared(&a, "root-a");
+        spawn(&subs, "w1", t0);
+        meta(&subs, "w1", true, "");
+        append(&a, &notification_lines("w1", "completed", t0 + 2000));
+        cleared(&proj.join("b1.jsonl"), "root-b");
+        std::fs::copy(proj.join("b1.jsonl"), proj.join("b2.jsonl")).unwrap();
+        assert_eq!(conversation_root(&a).as_deref(), Some("root-a"));
+
+        // The cut: B is not A's conversation; A's own re-id is.
+        let mut t = Tracker::new(Some(config.clone()));
+        t.set_session("a");
+        t.refresh(Some(t0 - 600_000), now());
+        assert!(t.get("w1").is_some());
+        assert_eq!(t.continues("b2"), Some(false));
+        std::fs::copy(&a, proj.join("a2.jsonl")).unwrap();
+        assert_eq!(t.continues("a2"), Some(true));
+
+        // A table that took B for a re-id of A (before roots were read
+        // past a `/clear`'s opening record): A's id and its worker go,
+        // B's own earlier id stays.
+        t.set_session("b1");
+        t.set_session("b2");
+        assert!(t.forget_other_conversations());
+        assert_eq!(t.aliases, vec!["b1".to_string()]);
+        assert!(t.get("w1").is_none(), "A's worker went with its id");
+        t.refresh(Some(t0 - 600_000), now());
+        assert!(t.get("w1").is_none(), "and stays gone");
+        assert!(!t.forget_other_conversations());
+
+        // A compaction's boundary is not a conversation's start.
+        let compacted = proj.join("c.jsonl");
+        let lines = [
+            serde_json::json!({"parentUuid": null, "type": "system", "subtype": "compact_boundary", "uuid": "cb"}),
+            serde_json::json!({"parentUuid": "cb", "type": "user", "uuid": "u1"}),
+        ];
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(&compacted, text).unwrap();
+        assert_eq!(conversation_root(&compacted), None);
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[test]

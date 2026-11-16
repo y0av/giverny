@@ -7,6 +7,7 @@ mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
+mod list_hide;
 mod management_live;
 mod management_panel;
 mod oom;
@@ -4262,11 +4263,19 @@ impl eframe::App for App {
                 );
             }
 
+            // With the management panel on, it stands in for Claude Code's
+            // own agent list: the list is kept out of the picture, in the
+            // tab's own Claude Code alone (the one in front of its shell; a
+            // claude in a multiplexer or a nested shell keeps its list).
+            let hide_list = self.cfg.claude.management_panel
+                && list_hide::own_claude(self.ws.tab(active).and_then(|t| t.foreground.as_deref()));
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
                     // The wheel over the closed prompt bar scrolls the
                     // terminal under it.
                     rt.view.wheel_through([prompt_bar::layer(active)]);
+                    rt.view.hide_for = hide_list.then_some(list_hide::hidden_rows as fn(&str) -> _);
+                    rt.view.tail_for = hide_list.then_some(list_hide::tail_rows as fn(&str) -> _);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     if rt.view.paste_image {

@@ -231,6 +231,100 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
     out
 }
 
+/// Ending a background job, as Claude Code's own CLI does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// `claude stop <id>`: the worker goes, the conversation stays —
+    /// `claude attach <id>` or `--resume` brings it back.
+    Stop,
+    /// `claude rm <id>`: the job and its worktree go for good.
+    Delete,
+}
+
+impl End {
+    fn subcommand(self) -> &'static str {
+        match self {
+            End::Stop => "stop",
+            End::Delete => "rm",
+        }
+    }
+
+    /// The word for it in the rail.
+    pub fn verb(self) -> &'static str {
+        match self {
+            End::Stop => "stop",
+            End::Delete => "delete",
+        }
+    }
+}
+
+/// Is `id` a job id, safe to hand to a command line? Claude Code's are
+/// short hex; anything else came from a file that surprised us.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// End background job `id` of the account at `config_dir`.
+///
+/// Blocking — Claude Code talks to its daemon, which takes a moment — so
+/// call it off the UI thread. Bounded: a CLI that never answers is killed,
+/// not waited on. The error carries what the CLI said, for the row to show.
+pub fn end(config_dir: &Path, id: &str, how: End) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    if !valid_id(id) {
+        anyhow::bail!("not a job id: {id:?}");
+    }
+    let mut child = crate::usage::claude_command(config_dir)?
+        .arg(how.subcommand())
+        .arg(id)
+        // Not a tab's claude: its hooks must not land on one.
+        .env_remove("GIVERNY_TAB_ID")
+        .env_remove("GIVERNY_NONCE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("cannot run claude: {e}"))?;
+    // Read both pipes as the CLI writes, so a chatty answer cannot fill
+    // one and stall the process the deadline is waiting on.
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(o) = out.as_mut() {
+            let _ = o.read_to_string(&mut text);
+        }
+        if let Some(e) = err.as_mut() {
+            let _ = e.read_to_string(&mut text);
+        }
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("claude {} {id} did not answer in 30 s", how.subcommand());
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let said = reader.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    let said = said.trim();
+    if said.is_empty() {
+        anyhow::bail!("claude {} {id} exited with {status}", how.subcommand());
+    }
+    anyhow::bail!("{said}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +339,21 @@ mod tests {
         let dir = config.join("jobs").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("state.json"), body).unwrap();
+    }
+
+    /// An id goes onto a command line: only what Claude Code's ids are
+    /// made of gets there, and nothing runs for anything else.
+    #[test]
+    fn only_a_job_id_is_ended() {
+        assert!(valid_id("1b3d5606"));
+        assert!(valid_id("6e7e56e0-7c66"));
+        for bad in ["", "a b", "x;rm -rf ~", "../jobs", "id\n"] {
+            assert!(!valid_id(bad), "{bad:?}");
+            let err = end(Path::new("/nonexistent"), bad, End::Stop).unwrap_err();
+            assert!(err.to_string().starts_with("not a job id"), "{err}");
+        }
+        assert_eq!(End::Stop.subcommand(), "stop");
+        assert_eq!(End::Delete.subcommand(), "rm");
     }
 
     #[test]

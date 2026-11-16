@@ -17,6 +17,8 @@ use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
+use crate::management_live::ManagementLive;
+
 pub use giverny_core::agent::AgentState as ClaudeState;
 
 #[derive(Debug, Clone, Default)]
@@ -366,6 +368,12 @@ pub struct ClaudeWatch {
     /// Background agents across every account — the Claudes with no tab.
     pub jobs: Vec<Job>,
     pub accounts: Vec<AccountPanel>,
+    /// Each tab's subagents, read off the disk — what the management panel
+    /// draws. See [`ManagementLive::tracker`].
+    pub agents: ManagementLive,
+    /// The management panel is on ([`ClaudeWatch::set_management_panel`]):
+    /// only then does a hook naming a worker give its tab a table.
+    panel: bool,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
     /// The live Giverny that has the relay socket, when this one could not
@@ -718,6 +726,14 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
+            // Beside the spool: Giverny's own state dir.
+            agents: ManagementLive::load(
+                spool
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("agents.json"),
+            ),
+            panel: false,
             leave_accounts,
             #[cfg(unix)]
             last_link_check: Instant::now(),
@@ -870,6 +886,15 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // A worker's tool call, or the session's own launch of one: the
+        // tab's management-panel table, made if it has none, reads the disk
+        // now.
+        if self.panel
+            && let Some(worker) = msg.names_worker()
+        {
+            self.agents
+                .worker_seen(tab_id, msg.session_id(), config_dir.clone(), worker);
+        }
 
         match msg.hook_event() {
             // A compaction is the same session carrying on: the turn it
@@ -885,6 +910,12 @@ impl ClaudeWatch {
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
                 );
+                self.agents.session_started(
+                    tab_id,
+                    Some("compact"),
+                    msg.session_id(),
+                    config_dir.clone(),
+                );
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
@@ -896,6 +927,12 @@ impl ClaudeWatch {
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
+                );
+                self.agents.session_started(
+                    tab_id,
+                    msg.event.get("source").and_then(|v| v.as_str()),
+                    msg.session_id(),
+                    config_dir.clone(),
                 );
                 effects
                     .captured
@@ -990,6 +1027,7 @@ impl ClaudeWatch {
                 }
             }
             Some("SessionEnd") => {
+                self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
                 entry.agents = false;
                 entry.before_compact = None;
@@ -1027,6 +1065,11 @@ impl ClaudeWatch {
             self.handle_msg(msg, active, &title, &mut effects);
         }
         self.hooks_drained = drained;
+        // An empty title map is a workspace not built yet, not one with no
+        // tabs: keep every tracker until there is something to compare with.
+        if !titles.is_empty() {
+            self.agents.tick(|id| titles.contains_key(&id));
+        }
 
         self.apply_found_prompts();
 
@@ -1037,6 +1080,10 @@ impl ClaudeWatch {
                     self.scan_rx = None;
                     self.scanned = result;
                     let live = &self.scanned.live;
+                    self.agents.set_hosts(
+                        live.iter()
+                            .map(|s| (s.entry.session_id.as_str(), s.entry.started_at_ms)),
+                    );
                     self.predate_hooks.retain(|(dir, pid)| {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
@@ -1649,6 +1696,13 @@ impl ClaudeWatch {
         }
     }
 
+    /// The management panel was switched on or off. It writes nothing to
+    /// any account: its rows come from what Claude Code writes anyway and
+    /// from the hooks Giverny already relays.
+    pub fn set_management_panel(&mut self, enable: bool) {
+        self.panel = enable;
+    }
+
     /// Do all accounts start Claude in auto mode?
     pub fn auto_mode_on(&self) -> bool {
         !self.profiles.is_empty()
@@ -1941,6 +1995,8 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             accounts: Vec::new(),
+            agents: ManagementLive::in_memory(),
+            panel: false,
             hooks_installed: true,
             hook_rx: None,
             relay_holder: None,

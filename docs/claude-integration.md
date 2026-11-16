@@ -6,10 +6,10 @@ Verified against Claude Code **2.1.220**. Claude Code's internals change between
 
 | Path | Direction | Why |
 |---|---|---|
-| `<config>/settings.json` | write (on request) | installs the hook relay + usage statusline, and with the management panel on the `subagentStatusLine` ([management-panel.md](management-panel.md)) |
+| `<config>/settings.json` | write (on request) | installs the hook relay + usage statusline |
 | `<config>/sessions/<pid>.json` | read | live session registry: busy/idle, session id, name |
 | `<config>/projects/<munged-cwd>/<id>.jsonl` | read | transcript lookup for resume + session titles |
-| `<config>/projects/<munged-cwd>/<id>/subagents/` | read | the management panel's workers: their transcripts and metas |
+| `<config>/projects/<munged-cwd>/<id>/subagents/` | read | the management panel's workers: their transcripts and metas ([management-panel.md](management-panel.md)) |
 | `<config>/.claude.json` (or `~/.claude.json`) | read | account identity + `cachedUsageUtilization` |
 | `~/.config/giverny/**` | write | Giverny's own state |
 

@@ -7,6 +7,7 @@ mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
+mod list_hide;
 mod management_live;
 mod management_panel;
 mod oom;
@@ -496,8 +497,6 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      taskbar icon on Wayland)\n  \
      giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
      giverny relay      (internal) agent hook entrypoint\n  \
-     giverny relay --subagent-line\n                     \
-     (internal) Claude Code subagentStatusLine entrypoint\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
@@ -519,13 +518,7 @@ fn main() -> eframe::Result {
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
             let paths = Paths::default_dirs();
-            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
-            {
-                let panel_on = config::load(paths.base()).claude.management_panel;
-                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), panel_on);
-            } else {
-                giverny_claude::hooks::run_relay(&paths.hook_spool());
-            }
+            giverny_claude::hooks::run_relay(&paths.hook_spool());
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -1292,14 +1285,11 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode, and
-/// the management panel's subagent line.
+/// Bring every account in line with the config at startup: auto mode.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
-/// following those would rewrite accounts against what the user configured:
-/// strip the management panel's subagent line from every account where it
-/// was turned on.
+/// following those would rewrite accounts against what the user configured.
 /// Once the file parses again, the hot reload applies what it says. Hook
 /// paths and the status line read nothing from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
@@ -1317,7 +1307,6 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
-    claude.set_management_panel(cfg.claude.management_panel);
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1778,6 +1767,8 @@ impl App {
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         set_up_accounts(&mut app.claude, &app.cfg, config_read);
+        app.claude
+            .set_management_panel(app.cfg.claude.management_panel);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -2017,16 +2008,10 @@ impl App {
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => {
-                match self.claude.install_hooks() {
-                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                    Err(e) => tracing::error!("hook install: {e}"),
-                }
-                // The hooks are the consent the management panel's line
-                // waits for.
-                self.claude
-                    .set_management_panel(self.cfg.claude.management_panel);
-            }
+            Action::InstallHooks => match self.claude.install_hooks() {
+                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                Err(e) => tracing::error!("hook install: {e}"),
+            },
             Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
             Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
             Action::ConfirmCodexResume(id) => {
@@ -4365,6 +4350,12 @@ impl eframe::App for App {
                 shown_line = line;
             }
 
+            // With the management panel on, it stands in for Claude Code's
+            // own agent list: the list is kept out of the picture, in the
+            // tab's own Claude Code alone (the one in front of its shell; a
+            // claude in a multiplexer or a nested shell keeps its list).
+            let hide_list = self.cfg.claude.management_panel
+                && list_hide::own_claude(self.ws.tab(active).and_then(|t| t.foreground.as_deref()));
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(page) = self.page.as_mut().filter(|p| p.tab == active) {
                     // The tab shows a worker page in its terminal's place:
@@ -4398,6 +4389,8 @@ impl eframe::App for App {
                     // The wheel over the closed prompt bar scrolls the
                     // terminal under it.
                     rt.view.wheel_through([prompt_bar::layer(active)]);
+                    rt.view.hide_for = hide_list.then_some(list_hide::hidden_rows as fn(&str) -> _);
+                    rt.view.tail_for = hide_list.then_some(list_hide::tail_rows as fn(&str) -> _);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     if rt.view.paste_image {

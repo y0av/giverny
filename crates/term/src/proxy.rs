@@ -3,7 +3,7 @@
 
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
 use crossbeam_channel::Sender;
@@ -35,6 +35,10 @@ pub struct SharedTermState {
     pub size: RwLock<GridSize>,
     /// Images transmitted by the kitty graphics protocol.
     pub graphics: parking_lot::Mutex<crate::graphics::Graphics>,
+    /// Bumped each time the io loop has applied output to the grid: how
+    /// the widget tells that the program answered a resize
+    /// ([`crate::tail`]).
+    pub output_seq: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -88,7 +92,10 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
-            Event::Wakeup => self.wake(),
+            Event::Wakeup => {
+                self.shared.output_seq.fetch_add(1, Ordering::AcqRel);
+                self.wake();
+            }
             Event::PtyWrite(text) => self.write_back.push(text.into_bytes().into()),
             Event::Title(title) => self.send(TabEvent::Title(Some(title))),
             Event::ResetTitle => self.send(TabEvent::Title(None)),

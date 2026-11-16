@@ -94,6 +94,30 @@ impl RelayMsg {
         self.event.get("agent_id").and_then(|v| v.as_str())
     }
 
+    /// On `PostToolUse`: does this call say the session has a worker — a
+    /// call the worker made, or the session's own `Agent` (`Task` before
+    /// 2.1.x) call launching one? `Some` with the worker's id when the
+    /// payload gives it: its `agent_id`, or the launch result's `agentId`.
+    /// What gives a tab its management-panel table.
+    pub fn names_worker(&self) -> Option<Option<&str>> {
+        if self.hook_event() != Some("PostToolUse") {
+            return None;
+        }
+        if let Some(id) = self.agent_id() {
+            return Some(Some(id));
+        }
+        let tool = self.event.get("tool_name").and_then(|v| v.as_str());
+        if !matches!(tool, Some("Agent" | "Task")) {
+            return None;
+        }
+        Some(
+            self.event
+                .pointer("/tool_response/agentId")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty()),
+        )
+    }
+
     /// On `Stop`: is work this session delegated still running as the turn
     /// ends — a subagent, a workflow, a teammate, a cloud session?
     ///
@@ -150,8 +174,9 @@ pub fn run_relay(spool: &Path) {
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
     // Sessions outside Giverny tabs have no tab identity — nothing to relay
     // (and nothing worth spooling; the stdin read above keeps claude's
-    // pipe-write happy before we bail).
-    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+    // pipe-write happy before we bail). Nor has one that only inherited a
+    // tab's identity: its hooks would move the tab's state.
+    let Some(tab_id) = tab_of_this_process() else {
         return;
     };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
@@ -192,6 +217,15 @@ pub fn run_relay(spool: &Path) {
         event,
     };
     deliver(&msg, spool);
+}
+
+/// The tab whose own session ran this process: `$GIVERNY_TAB_ID`, unless the
+/// session only inherited it — a claude started inside the tab's claude, or
+/// under a multiplexer the tab launched ([`crate::lineage`]). `None` outside
+/// Giverny.
+fn tab_of_this_process() -> Option<String> {
+    let tab = std::env::var("GIVERNY_TAB_ID").ok()?;
+    crate::lineage::of_this_process().is_tabs().then_some(tab)
 }
 
 /// Which account this session runs under.
@@ -805,6 +839,13 @@ fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
     })
 }
 
+/// Synthetic event name a manager sends to clear the management panel's
+/// Done rows in its tab (not a Claude hook event): it pipes
+/// `{"hook_event_name": "GivernyClearDone", "session_id": …, "at_ms": …}`
+/// into `giverny relay` from inside the tab, and the relay forwards it as it
+/// forwards any hook. `at_ms` is when the clear was asked for.
+pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
+
 /// Is this statusLine command ours? Giverny only ever writes its binary
 /// followed by ` statusline`. A command that just mentions giverny, like a
 /// script of the user's under `~/giverny-tools/`, is theirs.
@@ -1155,6 +1196,48 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_tool_use_names_the_worker_it_shows() {
+        let msg = |event: serde_json::Value| RelayMsg {
+            provider: "claude".into(),
+            wsl_distro: None,
+            emitted_at: None,
+            tab_id: Some("giverny-1".into()),
+            config_dir: None,
+            event,
+        };
+        let worker = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1",
+            "agent_id": "a1", "tool_name": "Bash",
+        }));
+        assert_eq!(
+            worker.names_worker(),
+            Some(Some("a1")),
+            "the worker's own call"
+        );
+        let launch = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Agent",
+            "tool_response": {"status": "async_launched", "agentId": "a2"},
+        }));
+        assert_eq!(
+            launch.names_worker(),
+            Some(Some("a2")),
+            "the session's launch"
+        );
+        let bare = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Task",
+        }));
+        assert_eq!(bare.names_worker(), Some(None), "a launch with no id");
+        let own = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash",
+        }));
+        assert_eq!(own.names_worker(), None, "the session's own work");
+        let stop = msg(serde_json::json!({
+            "hook_event_name": "Stop", "session_id": "s1", "agent_id": "a1",
+        }));
+        assert_eq!(stop.names_worker(), None);
+    }
 
     /// A short socket path of its own: a long one does not fit `sun_path`.
     #[cfg(unix)]

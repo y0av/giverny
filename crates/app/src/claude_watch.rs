@@ -17,6 +17,8 @@ use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
+use crate::management_live::ManagementLive;
+
 pub use giverny_core::agent::AgentState as ClaudeState;
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +51,11 @@ pub struct ClaudeTab {
     /// reached Giverny. Kept until a transcript read is sure to have it or
     /// sure not to. See [`ClaudeWatch::apply_found_prompts`].
     heard: Vec<Heard>,
+    /// The newest prompts `UserPromptSubmit` carried, whoever sent them, as
+    /// sent (at most [`SUBMITS_KEPT`]), and how many it has carried in all:
+    /// what a line the app put at the prompt is seen to arrive by.
+    submitted: Vec<String>,
+    submits: u64,
     last_hook: Option<Instant>,
     /// When `last_hook` was heard, by the wall clock (ms since the epoch):
     /// what a registry entry's `statusUpdatedAt` is told apart by, older
@@ -74,6 +81,9 @@ const SEAM: Duration = Duration::from_secs(1);
 
 /// How many of a session's prompts a tab keeps.
 pub const PROMPT_HISTORY: usize = 200;
+
+/// How many submitted prompts a tab keeps for [`ClaudeWatch::submits`].
+const SUBMITS_KEPT: usize = 8;
 
 /// Keep only the newest [`PROMPT_HISTORY`] prompts.
 fn cap_history(prompts: &mut Vec<String>) {
@@ -366,6 +376,12 @@ pub struct ClaudeWatch {
     /// Background agents across every account — the Claudes with no tab.
     pub jobs: Vec<Job>,
     pub accounts: Vec<AccountPanel>,
+    /// Each tab's subagents, read off the disk — what the management panel
+    /// draws. See [`ManagementLive::tracker`].
+    pub agents: ManagementLive,
+    /// The management panel is on ([`ClaudeWatch::set_management_panel`]):
+    /// only then does a hook naming a worker give its tab a table.
+    panel: bool,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
     /// The live Giverny that has the relay socket, when this one could not
@@ -718,6 +734,14 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
+            // Beside the spool: Giverny's own state dir.
+            agents: ManagementLive::load(
+                spool
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("agents.json"),
+            ),
+            panel: false,
             leave_accounts,
             #[cfg(unix)]
             last_link_check: Instant::now(),
@@ -858,6 +882,14 @@ impl ClaudeWatch {
             self.apply_statusline(msg);
             return;
         }
+        // A manager's clear-done: the tab's Done rows, cleared by hand.
+        if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
+            if let Some(tab_id) = Self::tab_id_of(msg) {
+                let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
+                self.agents.clear_done(tab_id, at);
+            }
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -870,6 +902,15 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // A worker's tool call, or the session's own launch of one: the
+        // tab's management-panel table, made if it has none, reads the disk
+        // now.
+        if self.panel
+            && let Some(worker) = msg.names_worker()
+        {
+            self.agents
+                .worker_seen(tab_id, msg.session_id(), config_dir.clone(), worker);
+        }
 
         match msg.hook_event() {
             // A compaction is the same session carrying on: the turn it
@@ -885,6 +926,12 @@ impl ClaudeWatch {
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
                 );
+                self.agents.session_started(
+                    tab_id,
+                    Some("compact"),
+                    msg.session_id(),
+                    config_dir.clone(),
+                );
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
@@ -897,6 +944,12 @@ impl ClaudeWatch {
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
                 );
+                self.agents.session_started(
+                    tab_id,
+                    msg.event.get("source").and_then(|v| v.as_str()),
+                    msg.session_id(),
+                    config_dir.clone(),
+                );
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
@@ -908,6 +961,12 @@ impl ClaudeWatch {
                 // A turn is running: whatever it leaves behind, its `Stop`
                 // says.
                 entry.agents = false;
+                if let Some(prompt) = msg.prompt() {
+                    entry.submitted.push(prompt.to_string());
+                    let over = entry.submitted.len().saturating_sub(SUBMITS_KEPT);
+                    entry.submitted.drain(..over);
+                    entry.submits += 1;
+                }
                 // The hook fires for every turn, also the ones Claude Code or
                 // another agent sends (a finished background task, a
                 // subagent's hand-back, another session's message): those
@@ -990,6 +1049,7 @@ impl ClaudeWatch {
                 }
             }
             Some("SessionEnd") => {
+                self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
                 entry.agents = false;
                 entry.before_compact = None;
@@ -1027,6 +1087,11 @@ impl ClaudeWatch {
             self.handle_msg(msg, active, &title, &mut effects);
         }
         self.hooks_drained = drained;
+        // An empty title map is a workspace not built yet, not one with no
+        // tabs: keep every tracker until there is something to compare with.
+        if !titles.is_empty() {
+            self.agents.tick(|id| titles.contains_key(&id));
+        }
 
         self.apply_found_prompts();
 
@@ -1037,6 +1102,10 @@ impl ClaudeWatch {
                     self.scan_rx = None;
                     self.scanned = result;
                     let live = &self.scanned.live;
+                    self.agents.set_hosts(
+                        live.iter()
+                            .map(|s| (s.entry.session_id.as_str(), s.entry.started_at_ms)),
+                    );
                     self.predate_hooks.retain(|(dir, pid)| {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
@@ -1649,6 +1718,13 @@ impl ClaudeWatch {
         }
     }
 
+    /// The management panel was switched on or off. It writes nothing to
+    /// any account: its rows come from what Claude Code writes anyway and
+    /// from the hooks Giverny already relays.
+    pub fn set_management_panel(&mut self, enable: bool) {
+        self.panel = enable;
+    }
+
     /// Do all accounts start Claude in auto mode?
     pub fn auto_mode_on(&self) -> bool {
         !self.profiles.is_empty()
@@ -1841,6 +1917,27 @@ impl ClaudeWatch {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
 
+    /// Giverny's hooks have reported on this tab's session.
+    pub fn hooked(&self, tab: TabId) -> bool {
+        self.tabs.get(&tab).is_some_and(|t| t.last_hook.is_some())
+    }
+
+    /// A compaction runs in this tab's session: `PreCompact` came, and the
+    /// `SessionStart` that ends it has not.
+    pub fn compacting(&self, tab: TabId) -> bool {
+        self.tabs
+            .get(&tab)
+            .is_some_and(|t| t.before_compact.is_some())
+    }
+
+    /// How many prompts `UserPromptSubmit` has carried in this tab, and the
+    /// newest of them, oldest first.
+    pub fn submits(&self, tab: TabId) -> (u64, &[String]) {
+        self.tabs
+            .get(&tab)
+            .map_or((0, &[][..]), |t| (t.submits, &t.submitted[..]))
+    }
+
     /// The prompt to pin above this tab: its last one, while Claude runs.
     pub fn prompt_of(&self, tab: TabId) -> Option<&str> {
         self.prompts_of(tab)?.last().map(String::as_str)
@@ -1941,6 +2038,8 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             accounts: Vec::new(),
+            agents: ManagementLive::in_memory(),
+            panel: false,
             hooks_installed: true,
             hook_rx: None,
             relay_holder: None,
@@ -2018,6 +2117,62 @@ mod tests {
         let mut fx = WatchEffects::default();
         w.handle_msg(m, active, "tab", &mut fx);
         fx
+    }
+
+    /// What a worker page's line is confirmed by: every prompt the hook
+    /// carries, counted, whoever sent it, and whether a compaction holds the
+    /// prompt.
+    #[test]
+    fn submits_are_counted_and_a_compaction_is_known() {
+        let mut w = ClaudeWatch::for_tests();
+        assert!(!w.hooked(TAB));
+        assert_eq!(w.submits(TAB), (0, &[][..]));
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        assert!(w.hooked(TAB));
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"one\ntwo""#),
+            Some(TAB),
+        );
+        feed(
+            &mut w,
+            &hook(
+                "UserPromptSubmit",
+                r#","prompt":"<task-notification>x</task-notification>""#,
+            ),
+            Some(TAB),
+        );
+        let (n, recent) = w.submits(TAB);
+        assert_eq!(n, 2);
+        assert_eq!(
+            recent,
+            ["one\ntwo", "<task-notification>x</task-notification>"]
+        );
+        for i in 0..20 {
+            feed(
+                &mut w,
+                &hook("UserPromptSubmit", &format!(r#","prompt":"p{i}""#)),
+                Some(TAB),
+            );
+        }
+        let (n, recent) = w.submits(TAB);
+        assert_eq!(n, 22);
+        assert_eq!(recent.len(), SUBMITS_KEPT);
+        assert_eq!(recent.last().map(String::as_str), Some("p19"));
+
+        assert!(!w.compacting(TAB));
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"manual""#),
+            Some(TAB),
+        );
+        assert!(w.compacting(TAB));
+        feed(
+            &mut w,
+            &hook("SessionStart", r#","source":"compact""#),
+            Some(TAB),
+        );
+        assert!(!w.compacting(TAB));
     }
 
     /// A `/compact` is work the rail shows, and once it is done the tab is

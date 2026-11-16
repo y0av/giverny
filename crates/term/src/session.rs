@@ -63,6 +63,7 @@ impl TermSession {
             graphics: parking_lot::Mutex::new(crate::graphics::Graphics::default()),
             theme: RwLock::new(theme),
             size: RwLock::new(cfg.size),
+            output_seq: Default::default(),
         });
         let proxy = EventProxy::new(
             tx,
@@ -163,6 +164,11 @@ impl TermSession {
     /// Current terminal mode (brief lock).
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
+    }
+
+    /// The program in the terminal asked for pastes bracketed.
+    pub fn bracketed_paste(&self) -> bool {
+        self.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Resize grid + PTY when the geometry changed.
@@ -369,6 +375,12 @@ impl TermSession {
             self.term.lock().scroll_display(Scroll::Delta(lines));
             self.dirty.store(true, Ordering::Release);
         }
+    }
+
+    /// Whether terminal content changed since [`Self::take_dirty`] last
+    /// took it (leaves the flag).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
     }
 
     /// True when terminal content changed since the last call (consumes flag).

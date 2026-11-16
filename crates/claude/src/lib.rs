@@ -5,6 +5,7 @@
 //! profiles (`CLAUDE_CONFIG_DIR` dirs), and reads transcripts for session
 //! titles. Never reads credentials, never calls the network.
 
+pub mod away;
 pub mod hooks;
 pub mod jobs;
 pub mod profiles;

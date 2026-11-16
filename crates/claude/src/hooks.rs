@@ -23,6 +23,9 @@ pub const RELAY_EVENTS: &[&str] = &[
     // without it the tab reads idle through the minute it compacts.
     "PreCompact",
     "Stop",
+    // A turn ended on an API error, which Claude Code sends in place of
+    // `Stop`: the rail marks it with a ✕, not the tick.
+    "StopFailure",
     "Notification",
     "SessionEnd",
 ];

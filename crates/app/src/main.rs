@@ -1171,7 +1171,10 @@ pub struct App {
     /// frame) or a plain shell's command. Apart from Claude's state, because
     /// it outlives it: a turn you have not seen stays unseen when the agent
     /// starts working again, and the rail wears its tick beside the spinner.
-    unseen_done: HashSet<TabId>,
+    /// Each with whether that finish failed — a turn that died on an API
+    /// error, a command that exited non-zero — which the rail marks with a
+    /// ✕ in place of the tick. The latest finish says.
+    unseen_done: HashMap<TabId, bool>,
     /// Whether each tab's shell had a command in front at the last
     /// foreground poll (`track_foreground`), as seen this run: the persisted
     /// `Tab::foreground` is a restored tab's last command, not a live one,
@@ -1705,7 +1708,7 @@ impl App {
             wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
-            unseen_done: HashSet::new(),
+            unseen_done: HashMap::new(),
             fg_running: HashMap::new(),
             osc_running: HashSet::new(),
             finish_input: HashMap::new(),
@@ -2459,9 +2462,18 @@ impl App {
                 }
                 // `D` ends it; a shell that skips `D` ends it with the next
                 // prompt's `A`.
-                PromptMark::CommandDone(_) | PromptMark::PromptStart => {
+                PromptMark::CommandDone(exit) => {
                     if self.osc_running.remove(&id) {
-                        self.command_finished(id);
+                        self.command_finished(id, failed_exit(exit));
+                    } else if failed_exit(exit) {
+                        // The foreground poll saw it end first: the finish
+                        // it noted failed.
+                        self.command_failed(id);
+                    }
+                }
+                PromptMark::PromptStart => {
+                    if self.osc_running.remove(&id) {
+                        self.command_finished(id, false);
                     }
                 }
                 PromptMark::CommandStart => {}
@@ -3349,7 +3361,7 @@ impl App {
             // Only one seen this run: see `fg_running`.
             let running = cmd.is_some();
             if self.fg_running.insert(id, running) == Some(true) && !running {
-                self.command_finished(id);
+                self.command_finished(id, false);
             }
             if let Some(tab) = self.ws.tab_mut(id)
                 && tab.foreground != cmd
@@ -3367,7 +3379,11 @@ impl App {
     /// Only a command typed: one with no input since the last finish (or
     /// since the shell started) was the shell's own doing — its rc file, its
     /// prompt — and finishes nothing you asked for (see `finish_input`).
-    fn command_finished(&mut self, id: TabId) {
+    ///
+    /// `failed`: its exit code said so ([`failed_exit`]), and the rail wears
+    /// a ✕ in place of the tick. Only OSC 133 `D` carries the code; the
+    /// foreground poll's finish has none.
+    fn command_finished(&mut self, id: TabId, failed: bool) {
         let Some(seq) = self
             .rt
             .get(&id)
@@ -3380,7 +3396,24 @@ impl App {
             return;
         }
         if self.ws.active != Some(id) {
-            self.unseen_done.insert(id);
+            self.unseen_done.insert(id, failed);
+        }
+    }
+
+    /// The command whose finish tab `id` already noted, from the foreground
+    /// poll that has no exit code, ended with a `D` saying it failed: its
+    /// unseen finish, if it is still unseen, failed.
+    fn command_failed(&mut self, id: TabId) {
+        let noted = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .map(|s| s.input_seq());
+        if noted.is_some()
+            && self.finish_input.get(&id).copied() == noted
+            && let Some(failed) = self.unseen_done.get_mut(&id)
+        {
+            *failed = true;
         }
     }
 
@@ -3400,10 +3433,12 @@ impl App {
             if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
                 || self.codex.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
             {
-                self.unseen_done.insert(t.id);
+                // The latest turn says whether its finish failed: a turn
+                // that ended well after one that died is good news.
+                self.unseen_done.insert(t.id, self.claude.turn_failed(t.id));
             }
         }
-        self.unseen_done.retain(|id| self.ws.tab(*id).is_some());
+        self.unseen_done.retain(|id, _| self.ws.tab(*id).is_some());
     }
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
@@ -4950,9 +4985,30 @@ fn fresh_nonce(salt: u64) -> String {
     format!("{:x}{:x}{:x}", nanos, std::process::id(), salt)
 }
 
+/// Whether a command's exit code, from OSC 133 `D`, says it failed:
+/// anything but 0, except 130, a Ctrl-C you pressed, and 141, a SIGPIPE
+/// such as `… | head` leaves, which end what you meant to end. No code says
+/// nothing.
+fn failed_exit(exit: Option<i32>) -> bool {
+    exit.is_some_and(|code| !matches!(code, 0 | 130 | 141))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that exited non-zero failed; Ctrl-C, SIGPIPE and a `D`
+    /// with no code did not.
+    #[test]
+    fn a_non_zero_exit_fails_but_ctrl_c_and_sigpipe_do_not() {
+        assert!(failed_exit(Some(1)));
+        assert!(failed_exit(Some(127)));
+        assert!(failed_exit(Some(2)));
+        assert!(!failed_exit(Some(0)));
+        assert!(!failed_exit(Some(130)));
+        assert!(!failed_exit(Some(141)));
+        assert!(!failed_exit(None));
+    }
 
     /// A bare word the binary does not know is a command, and is refused;
     /// flags and anything that reads as a path still open the window.

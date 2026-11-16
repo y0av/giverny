@@ -133,6 +133,20 @@ if [ -n "$__giverny_hf" ]; then
         PROMPT_COMMAND='${__giverny_hf:+__giverny_history}'
     fi
 fi
+# Tell the tab where each command starts and how it ended, which bash sends
+# no terminal by itself (OSC 133 C, and D with the exit code): C as the
+# command runs (PS0), D first thing at the next prompt, ahead of the rest of
+# PROMPT_COMMAND so it reads the command's own $?, which it hands on. Both
+# go where bash writes its prompts.
+__giverny_mark_done() {
+    local s=$?
+    builtin printf '\e]133;D;%s\a' "$s" >&2
+    return "$s"
+}
+if [ -n "$__giverny_hf" ]; then
+    PS0+='${__giverny_hf:+\e]133;C\a}'
+    PROMPT_COMMAND='${__giverny_hf:+__giverny_mark_done}'$'\n'"$PROMPT_COMMAND"
+fi
 "#;
 
 /// zsh's `.zshenv` under the `ZDOTDIR` Giverny starts it with: put the
@@ -335,8 +349,10 @@ mod tests {
 
     /// Run `shell` interactively, steered, with `HOME` at `home` and nothing
     /// else of this process's environment, feeding it `input`.
+    /// What the shell wrote to its stderr, where an interactive shell puts
+    /// its prompts.
     #[cfg(unix)]
-    fn run_steered(shell: &Path, steer: &Steer, home: &Path, input: &str) {
+    fn run_steered(shell: &Path, steer: &Steer, home: &Path, input: &str) -> String {
         use std::io::Write;
         let mut cmd = std::process::Command::new(shell);
         cmd.args(&steer.args)
@@ -347,15 +363,58 @@ mod tests {
             .envs(steer.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         child
             .stdin
-            .as_mut()
+            .take()
             .unwrap()
             .write_all(input.as_bytes())
             .unwrap();
-        let _ = child.wait();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// The init file marks each command for the tab: OSC 133 `C` as it runs
+    /// and `D` with its exit code at the next prompt, ahead of an rc's own
+    /// prompt command, which still gets the command's `$?`. An empty Enter
+    /// runs nothing and marks no start.
+    #[cfg(unix)]
+    #[test]
+    fn bash_marks_each_command_with_its_exit_code() {
+        let Some(bash) = on_path("bash") else { return };
+        let dir = scratch("bash-marks");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".bashrc"),
+            "PROMPT_COMMAND='echo \"rc saw $?\" >&2'\n",
+        )
+        .unwrap();
+        let steer = steer(
+            ShellKind::Bash,
+            &dir.join("tab"),
+            TabId(1),
+            false,
+            Some(&home),
+            &dir.join("init"),
+            |_| None,
+        );
+        let out = run_steered(&bash, &steer, &home, "false\n\ntrue\n(exit 130)\nexit\n");
+        let marks: Vec<&str> = out
+            .split('\x1b')
+            .filter_map(|s| s.strip_prefix("]133;"))
+            .map(|s| s.split('\x07').next().unwrap_or_default())
+            .collect();
+        // The first prompt's D is the rc's own status, before any command.
+        assert_eq!(
+            marks,
+            ["D;0", "C", "D;1", "D;1", "C", "D;0", "C", "D;130", "C"],
+            "{out:?}"
+        );
+        assert!(out.contains("rc saw 1"), "{out:?}");
+        assert!(out.contains("rc saw 130"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The history variables in an `env` dump.

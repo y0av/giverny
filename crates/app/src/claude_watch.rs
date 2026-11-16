@@ -368,9 +368,12 @@ pub struct ClaudeWatch {
     /// Background agents across every account — the Claudes with no tab.
     pub jobs: Vec<Job>,
     pub accounts: Vec<AccountPanel>,
-    /// Each tab's subagents, from relayed `subagentStatusLine` ticks — what
-    /// the management panel draws. See [`ManagementLive::tracker`].
+    /// Each tab's subagents, read off the disk — what the management panel
+    /// draws. See [`ManagementLive::tracker`].
     pub agents: ManagementLive,
+    /// The management panel is on ([`ClaudeWatch::set_management_panel`]):
+    /// only then does a hook naming a worker give its tab a table.
+    panel: bool,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
     /// The live Giverny that has the relay socket, when this one could not
@@ -730,6 +733,7 @@ impl ClaudeWatch {
                     .unwrap_or_else(|| Path::new("."))
                     .join("agents.json"),
             ),
+            panel: false,
             leave_accounts,
             #[cfg(unix)]
             last_link_check: Instant::now(),
@@ -870,14 +874,6 @@ impl ClaudeWatch {
             self.apply_statusline(msg);
             return;
         }
-        // Subagent-line ticks carry a tab's live workers, not its state.
-        if msg.hook_event() == Some(hooks::SUBAGENT_LINE_EVENT) {
-            if let Some(tab_id) = Self::tab_id_of(msg) {
-                let config_dir = self.canonical_dir(msg.config_dir.as_deref());
-                self.agents.apply_live(tab_id, config_dir, &msg.event);
-            }
-            return;
-        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -890,6 +886,15 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // A worker's tool call, or the session's own launch of one: the
+        // tab's management-panel table, made if it has none, reads the disk
+        // now.
+        if self.panel
+            && let Some(worker) = msg.names_worker()
+        {
+            self.agents
+                .worker_seen(tab_id, msg.session_id(), config_dir.clone(), worker);
+        }
 
         match msg.hook_event() {
             // A compaction is the same session carrying on: the turn it
@@ -1075,6 +1080,10 @@ impl ClaudeWatch {
                     self.scan_rx = None;
                     self.scanned = result;
                     let live = &self.scanned.live;
+                    self.agents.set_hosts(
+                        live.iter()
+                            .map(|s| (s.entry.session_id.as_str(), s.entry.started_at_ms)),
+                    );
                     self.predate_hooks.retain(|(dir, pid)| {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
@@ -1687,32 +1696,11 @@ impl ClaudeWatch {
         }
     }
 
-    /// Turn the management panel's `subagentStatusLine` on or off in every
-    /// account. On, each account's `settings.json` gains the line that relays
-    /// Claude Code's live worker list to the app; off, it goes.
-    ///
-    /// The setting is not consent by itself: the line is written only into
-    /// an account that already holds our hooks
-    /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
-    /// it is for the live-usage statusline. Every other account is left
-    /// byte-identical. Off removes only what is ours, wherever it is.
+    /// The management panel was switched on or off. It writes nothing to
+    /// any account: its rows come from what Claude Code writes anyway and
+    /// from the hooks Giverny already relays.
     pub fn set_management_panel(&mut self, enable: bool) {
-        if self.leave_accounts {
-            return;
-        }
-        for p in &self.profiles {
-            let settings = p.config_dir.join("settings.json");
-            let enable = enable && hooks::partly_installed_in(&settings);
-            match hooks::set_subagent_line(&settings, enable) {
-                Ok(true) => tracing::info!(
-                    "subagentStatusLine {} for {}",
-                    if enable { "installed" } else { "removed" },
-                    p.name
-                ),
-                Ok(false) => {}
-                Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
-            }
-        }
+        self.panel = enable;
     }
 
     /// Do all accounts start Claude in auto mode?
@@ -2008,6 +1996,7 @@ impl ClaudeWatch {
             jobs: Vec::new(),
             accounts: Vec::new(),
             agents: ManagementLive::in_memory(),
+            panel: false,
             hooks_installed: true,
             hook_rx: None,
             relay_holder: None,

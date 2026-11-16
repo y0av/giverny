@@ -5,8 +5,8 @@
 //! is drawn as a resizable bottom panel inside the terminal's area, only in a
 //! tab whose tracker holds a real subagent, running or done this session.
 //!
-//! The rows are a [`Tracker`]: Claude Code's own data (live list,
-//! transcripts, notifications), nothing else. This module owns only the
+//! The rows are a [`Tracker`]: Claude Code's own data (the workers'
+//! transcripts and metas, the parent's notifications), nothing else. This module owns only the
 //! look: the columns STAGE, TASK, ELAPSED, NOW and TOKENS, every one but TASK
 //! a fixed width, no column headings, the whole row tinted by its stage, a
 //! stopwatch ELAPSED ticking every second — a compact status table pinned
@@ -14,7 +14,7 @@
 //! status line.
 //!
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker —
-//! `ClaudeWatch::agents` (`management_live.rs`), fed by the relay, persisted,
+//! `ClaudeWatch::agents` (`management_live.rs`), read off the disk, persisted,
 //! emptied on `/clear` and refreshed once a second — and keeps only what the
 //! pane itself needs per tab.
 //!
@@ -753,7 +753,7 @@ fn format_row(l: &SubagentRow, now_ms: u64, clock: &Clock) -> Line {
         },
         Stage::Done => l.outcome.map(outcome_word).unwrap_or_default(),
     };
-    let tokens = l.shown_tokens().map(fmt_tokens).unwrap_or_default();
+    let tokens = l.tokens.map(fmt_tokens).unwrap_or_default();
     // The hover's lines under the title: where the row is and why, from the
     // cells above.
     let why = match l.stage {
@@ -1617,14 +1617,28 @@ fn draw_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giverny_claude::subagents::LiveSnapshot;
 
     const T0: u64 = 1_790_000_000_000; // an epoch-ms "now"
 
-    fn live(json: &str) -> Vec<SubagentRow> {
-        let mut t = Tracker::new(None);
-        t.apply_live(&LiveSnapshot::parse(json), T0);
-        t.rows().to_vec()
+    /// A row as the tracker keeps it: `id`, Running or Done (`done` ended at
+    /// [`T0`]), its description, start and tokens.
+    fn row(
+        id: &str,
+        done: bool,
+        description: Option<&str>,
+        started: u64,
+        tokens: u64,
+    ) -> SubagentRow {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "stage": if done { "done" } else { "running" },
+            "outcome": done.then_some("completed"),
+            "ended_ms": done.then_some(T0),
+            "description": description,
+            "started_ms": started,
+            "tokens": tokens,
+        }))
+        .expect("a row")
     }
 
     #[test]
@@ -1637,28 +1651,22 @@ mod tests {
         assert_eq!(fmt_tokens(2_000), "2k");
     }
 
-    /// Live rows from `(id, status, start offset s, parent)`: each named
+    /// Rows from `(id, status, start offset s, parent)`: each named
     /// `Work <id>`, its parent as its meta would give it.
     fn family(rows: &[(&str, &str, u64, Option<&str>)]) -> Vec<SubagentRow> {
-        let tasks: Vec<String> = rows
-            .iter()
-            .map(|(id, status, at, _)| {
-                format!(
-                    r#"{{"id":"{id}","status":"{status}","description":"Work {id}",
-                       "startTime":{},"tokenCount":1000}}"#,
-                    T0 - 600_000 + at * 1000
-                )
+        rows.iter()
+            .map(|(id, status, at, parent)| {
+                let mut r = row(
+                    id,
+                    *status != "running",
+                    Some(&format!("Work {id}")),
+                    T0 - 600_000 + at * 1000,
+                    1000,
+                );
+                r.parent_id = parent.map(str::to_string);
+                r
             })
-            .collect();
-        let mut out = live(&format!(
-            r#"{{"session_id":"s","tasks":[{}]}}"#,
-            tasks.join(",")
-        ));
-        for r in &mut out {
-            let (.., parent) = rows.iter().find(|(id, ..)| *id == r.id).unwrap();
-            r.parent_id = parent.map(str::to_string);
-        }
-        out
+            .collect()
     }
 
     fn titles(t: &Table) -> Vec<(String, usize, Stage)> {

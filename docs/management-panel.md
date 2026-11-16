@@ -12,7 +12,7 @@ The management panel is a table under a tab's terminal listing that tab's Claude
 - **TASK**: the agent's name and its description; an agent with no name shows its model (`opus`, `sonnet`, `haiku`) in place of the name. An agent another agent spawned hangs under that agent's row, indented a step per level, and goes where that row goes. A `▾` at the head of the spawner's title folds them away (`▸ … +3, 1 running`), kept per tab while Giverny runs.
 - **ELAPSED**: a stopwatch while it runs, the time it took once Done. A span the worker stood stopped on an API error is off its clock. While the tab's account is out of a usage limit the clock stops, and starts again from where it stood once the window reopens.
 - **NOW**: what it is doing, its last tool call (`Bash: cargo test`); `5h limit → 13:00` while the account is out; `stopped: no network` while it stands on an API error; how it ended once Done (`done`, `failed`, `killed`, `stopped`).
-- **TOKENS**: Claude Code's own count, as its agents view shows it.
+- **TOKENS**: the context of its last turn, read from its transcript the way the status line counts it. Claude Code's own figure in its agents view adds the run's output so far, a few hundred tokens more for a short worker.
 
 A row's hover has its whole title and why it is where it is. A drag selects the pane's text as the terminal does, and copies it when it ends. A look at a tab that wore the unseen-finish tick breathes the frames of the rows that landed since the last look.
 
@@ -20,25 +20,12 @@ Rows stay until the tab's conversation is cleared (`/clear`), a fresh `claude` s
 
 ## Where the rows come from
 
-- **Running** rows come from Claude Code's live worker list, through the relay below.
-- **Done** rows come from the workers' own transcripts (`projects/<cwd>/<session>/subagents/agent-<id>.jsonl`) and from the `<task-notification>` Claude Code queues on the parent's transcript when a worker stops. A worker messaged again after it finished is Running again until its next notification.
+Giverny reads a tab's workers off the disk once a second. It writes nothing to Claude Code's settings for the pane: the rows come from files Claude Code writes anyway and from the hooks Giverny already installs.
 
-## The relay
-
-With `claude.management_panel` on, Giverny installs one key into each account's `settings.json`:
-
-```json
-"subagentStatusLine": { "type": "command", "command": "<giverny> relay --subagent-line" }
-```
-
-Claude Code runs that command at least every five seconds while a session has live workers. It passes the worker list on stdin: `session_id` and `tasks[]`. The relay forwards that list to the app, tagged with the tab it ran in (`GIVERNY_TAB_ID`, which reaches this command).
-
-**The pane stands in for Claude Code's own subagent panel** (the strip under its prompt) while it is on. Claude Code reads each line the command prints as one row's decoration, `{"id":…,"content":…}`, and drops a row whose decoration is `""`; with every row dropped it draws no strip at all. So with the setting on, the relay prints an empty decoration for every worker, and the workers show once, in the pane. With it off, the relay prints nothing and Claude Code draws its strip as it would without the command. The way into a worker's own Claude Code view, which goes through that strip, comes back in a later change.
-
-- **Outside a Giverny tab** (no `GIVERNY_TAB_ID`), the relay forwards nothing and prints nothing, so Claude Code's strip is drawn as usual.
-- **In a session that is not the tab's own**, the relay does the same. A `claude` started inside the tab's claude, or under a `tmux` the tab launched, inherits `GIVERNY_TAB_ID` too. The tab also exports the app's process id (`GIVERNY_PID`), and the relay walks up from itself: the tab's own claude reaches the app with no other `claude` on the way. A nested one passes a second `claude`, and a multiplexer's sessions never reach the app at all, so their workers stay out of the tab's pane. The plain hook relay applies the same check, so a nested session does not move the tab's state or its resume target either. Where the walk sees no `claude` at all (a relay run on the Windows side for a session inside WSL), it trusts `GIVERNY_TAB_ID` as before.
-- **Only in an account that opted in.** Giverny writes the key only into an account whose `settings.json` already holds Giverny's hooks: installing them is the consent, as it is for the live-usage statusline. Installing the hooks brings the key with them. An account without them is never written to.
-- **With the setting off**, Giverny removes the key again.
-- **Uninstalling the hooks** removes the key too, since it is the same relay.
-- **An account whose `subagentStatusLine` is someone else's** is left alone: the installer never replaces a command it did not write. On that account the pane gets no live rows.
-- **Project settings override user settings.** A project that sets its own `subagentStatusLine` shadows Giverny's. To keep both, that command must pass through: inside a Giverny tab (`GIVERNY_TAB_ID` set), pipe the stdin it received, byte for byte, into `giverny relay --subagent-line`.
+- **A tab gets a table** when its session is seen to have a worker: a `PostToolUse` hook from one (its payload carries `agent_id`) or the session's own `Agent` launch, each relayed with the tab it ran in (`GIVERNY_TAB_ID`). A `SessionStart` that resumes a conversation gives it one too, so its finished workers show again. A fresh `claude` with no worker costs nothing.
+- **Each worker is its transcript**, `<config>/projects/<cwd>/<session>/subagents/agent-<id>.jsonl`, with `agent-<id>.meta.json` beside it: `description`, `agentType`, `model`, `name` when the agent was given one, and for an agent another agent spawned `parentAgentId` and `spawnDepth`; `finished: true` once its run has ended, and `revivedAt` when a message woke it again. A second's look is the folder listed, a `stat` per worker, and only the bytes a running worker appended since.
+- **Running** while it has not landed since its last turn and has written since the claude now running the session started (that claude's `startedAt` in Claude Code's session registry, `<config>/sessions/<pid>.json`). A worker of an earlier claude of the conversation was killed with it and lands nowhere, so it is Done (`stopped`) at its last write instead.
+- **Done** once landed: the parent transcript's `<task-notification>` for its id is at least as new as its last turn, its `<status>` the outcome (`completed`, `failed`, `killed`, `stopped`), or, in the seconds before the notification and where none comes, its meta's `finished` (the meta's mtime is when). A worker messaged after that is Running again from the message, until its next landing.
+- **Its cells.** The clock starts at the transcript's first line, or at `revivedAt` for a worker woken again. NOW is its last tool call (`Bash: cargo test`).
+- **Only the tab's own session.** A `claude` started inside the tab's claude, or under a `tmux` the tab launched, inherits `GIVERNY_TAB_ID` too. The tab also exports the app's process id (`GIVERNY_PID`), and the hook relay walks up from itself: the tab's own claude reaches the app with no other `claude` on the way. A nested one passes a second `claude`, and a multiplexer's sessions never reach the app at all, so their hooks move neither the tab's rows nor its state or resume target. Where the walk sees no `claude` at all (a relay run on the Windows side for a session inside WSL), it trusts `GIVERNY_TAB_ID`.
+- **A conversation's earlier ids.** A resume or a compaction can give the conversation a new session id; the table keeps its rows across it and looks for workers under every id the conversation had. Two ids are the same conversation when their transcripts start from the same record (the first one with no parent, which Claude Code copies forward on a re-id). `/clear`, a fresh `claude` and a `/resume` into another conversation start the table over, and an earlier id found to hold another conversation is dropped, with its rows, when the session next starts.

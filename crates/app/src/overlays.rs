@@ -166,6 +166,58 @@ pub struct SessionPicker {
     pub sessions: Vec<PastSession>,
 }
 
+/// The stop's confirm, while one is asked: what would die, one line each,
+/// and `stop` / `cancel`. Enter stops (the button has the keyboard); Esc or
+/// a click beside it cancels.
+pub fn stop_confirm_ui(app: &App, ctx: &egui::Context) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let Some(asked) = &app.stop_confirm else {
+        return actions;
+    };
+    let c = app.chrome;
+    // Read here, as the palette reads its keys: a focused button's own
+    // Enter did not reach it in a real window.
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+        actions.push(Action::ConfirmStop(true));
+    }
+    let shown = egui::Modal::new(egui::Id::new("stop-confirm"))
+        .frame(
+            egui::Frame::popup(&ctx.global_style())
+                .fill(c.panel)
+                .inner_margin(14.0),
+        )
+        .show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(RichText::new("stopping ends").color(c.fg));
+            ui.add_space(4.0);
+            for line in &asked.lines {
+                ui.label(RichText::new(format!("· {line}")).monospace().color(c.fg));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let stop = ui.button("stop");
+                let cancel = ui.button("cancel");
+                let mine = ui
+                    .ctx()
+                    .memory(|m| m.focused())
+                    .is_some_and(|f| f == stop.id || f == cancel.id);
+                if !mine {
+                    stop.request_focus();
+                }
+                if stop.clicked() {
+                    actions.push(Action::ConfirmStop(true));
+                }
+                if cancel.clicked() {
+                    actions.push(Action::ConfirmStop(false));
+                }
+            });
+        });
+    if actions.is_empty() && shown.should_close() {
+        actions.push(Action::ConfirmStop(false));
+    }
+    actions
+}
+
 pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let mut actions = Vec::new();
     let Some(picker) = app.session_picker.take() else {

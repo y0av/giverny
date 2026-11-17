@@ -23,6 +23,22 @@ pub struct SaveState {
     pub font_size: f32,
     #[serde(default)]
     pub layout: Layout,
+    /// Windows besides the first, which keeps its focus in `workspace` and
+    /// its geometry in `layout` so a build from before windows restores it.
+    #[serde(default)]
+    pub windows: Vec<WindowSave>,
+}
+
+/// A second (or third…) window: what it shows and how big it was. Where it
+/// was is not kept, as for the first: Wayland places windows itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowSave {
+    #[serde(default)]
+    pub focus: crate::tabs::Focus,
+    #[serde(default)]
+    pub size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub rail_hidden: bool,
 }
 
 fn default_font_size() -> f32 {
@@ -67,6 +83,9 @@ pub struct Layout {
     /// whole state file.
     #[serde(default)]
     pub settings_section: Option<String>,
+    /// The rail folded away (Ctrl+Shift+B), leaving only terminals.
+    #[serde(default)]
+    pub rail_hidden: bool,
 }
 
 /// What the rail groups tabs by.
@@ -212,7 +231,10 @@ pub fn load(paths: &Paths) -> Option<SaveState> {
     let path = paths.state_file();
     let bytes = std::fs::read(&path).ok()?;
     match serde_json::from_slice::<SaveState>(&bytes) {
-        Ok(state) if state.version <= STATE_VERSION => Some(state),
+        Ok(mut state) if state.version <= STATE_VERSION => {
+            state.workspace.normalize();
+            Some(state)
+        }
         Ok(state) => {
             tracing::warn!(
                 "state version {} is newer than {}",
@@ -285,7 +307,16 @@ mod tests {
                 zoom: Some(1.7),
                 work_area: Some([0.0, 0.0, 2880.0, 1716.0]),
                 settings_section: Some("keys".into()),
+                rail_hidden: true,
             },
+            windows: vec![WindowSave {
+                focus: crate::tabs::Focus {
+                    active: Some(tab),
+                    recent: vec![],
+                },
+                size: Some([900.0, 600.0]),
+                rail_hidden: true,
+            }],
         };
         save(&paths, &state).unwrap();
         let back = load(&paths).expect("load");
@@ -300,6 +331,11 @@ mod tests {
         assert_eq!(back.layout.zoom(), Some(1.7));
         // And the settings section last looked at.
         assert_eq!(back.layout.settings_section.as_deref(), Some("keys"));
+        // And the other windows, with what each showed.
+        assert!(back.layout.rail_hidden);
+        assert_eq!(back.windows.len(), 1);
+        assert_eq!(back.windows[0].focus.active, Some(tab));
+        assert_eq!(back.windows[0].size, Some([900.0, 600.0]));
         // The pre-window read sees the same thing without a full load.
         assert_eq!(load_layout(&paths), back.layout);
     }

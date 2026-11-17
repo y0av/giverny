@@ -21,6 +21,9 @@ pub struct Capture {
     saved: u32,
     /// Skip the first frames so fonts and the first PTY output settle.
     warmup: u32,
+    /// Close the window once done: the first window's capture ends the run;
+    /// another window's only records.
+    close_when_done: bool,
 }
 
 impl Capture {
@@ -43,7 +46,20 @@ impl Capture {
             tick: 0,
             saved: 0,
             warmup: 90,
+            close_when_done: true,
         })
+    }
+
+    /// The same capture for extra window `n`, into a `w<n>` folder beside
+    /// the first window's frames.
+    pub fn for_window(n: usize) -> Option<Self> {
+        let mut cap = Self::from_env()?;
+        cap.dir = cap.dir.join(format!("w{n}"));
+        std::fs::create_dir_all(&cap.dir).ok()?;
+        cap.close_when_done = false;
+        // Ahead of the first window's, so the run is still up when it lands.
+        cap.warmup = 60;
+        Some(cap)
     }
 
     pub fn done(&self) -> bool {
@@ -70,7 +86,9 @@ impl Capture {
             self.remaining = self.remaining.saturating_sub(1);
             if self.remaining == 0 {
                 tracing::info!("capture complete: {} frame(s)", self.saved);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if self.close_when_done {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 return;
             }
         }

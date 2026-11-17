@@ -60,6 +60,7 @@ impl TermSession {
         let dirty = Arc::new(AtomicBool::new(true));
         let write_back = Arc::new(WriteBack::default());
         let shared = Arc::new(SharedTermState {
+            snapshot_revision: AtomicU64::new(0),
             graphics: parking_lot::Mutex::new(crate::graphics::Graphics::default()),
             theme: RwLock::new(theme),
             size: RwLock::new(cfg.size),
@@ -172,15 +173,38 @@ impl TermSession {
         }
         self.size = size;
         *self.shared.size.write() = size;
-        self.term
-            .lock()
-            .resize(TermSize::new(size.cols as usize, size.rows as usize));
+        {
+            let mut term = self.term.lock();
+            term.resize(TermSize::new(size.cols as usize, size.rows as usize));
+            self.shared.note_snapshot_change();
+        }
         let _ = self.sender.send(Msg::Resize(size.into()));
         self.dirty.store(true, Ordering::Release);
     }
 
     pub fn size(&self) -> GridSize {
         self.size
+    }
+
+    /// Revision for persistence, including output in tabs never drawn.
+    /// Read BEFORE `snapshot_ansi`: output arriving between the two may
+    /// cause a redundant capture next time, but can never be marked saved
+    /// without being included in the dump. Failed saves must not commit it.
+    pub fn snapshot_revision(&self) -> u64 {
+        self.shared.snapshot_revision.load(Ordering::Acquire)
+    }
+
+    /// Whether there is a cursor on screen for a blink timer to animate.
+    pub fn cursor_on_screen(&self) -> bool {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::vte::ansi::CursorShape;
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let row = content.cursor.point.line.0 + content.display_offset as i32;
+        content.mode.contains(TermMode::SHOW_CURSOR)
+            && content.cursor.shape != CursorShape::Hidden
+            && row >= 0
+            && row < term.screen_lines() as i32
     }
 
     /// Serialize scrollback + screen to an ANSI dump for restore-time

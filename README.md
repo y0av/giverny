@@ -15,6 +15,7 @@ Written in Rust on `alacritty_terminal` and rendered on the GPU, with no web eng
 - **Background agents.** Forked and `run_in_background` Claude sessions appear in the rail. Click one to attach a tab.
 - **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude and Codex conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
 - **Right-to-left text.** Hebrew and Arabic render in reading order. Cascadia Mono Hebrew is bundled.
+- **Splits.** Several terminals side by side in one rail row, tmux style. The row shows the most pressing state among them; each terminal has its own header with its state. Drag a row onto a terminal to split with it.
 - **Rail views.** Group tabs by your own categories or by git repository.
 - **Terminal support.** Kitty keyboard protocol (Shift+Enter works in Claude without `/terminal-setup`), kitty graphics, synchronized output, OSC 7 and 52, sanitized bracketed paste, SGR mouse, file drag-and-drop.
 - **Plain config.** `~/.config/giverny/config.toml` hot-reloads. The `Ctrl+,` settings screen writes back to it with comments preserved. See [all options](docs/options.md).
@@ -61,6 +62,9 @@ Hook installation shows what it adds, keeps your existing hooks and writes a `.g
 | Chord | Action |
 |---|---|
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab / close tab |
+| `Ctrl+Shift+D` / `Ctrl+Shift+S` | Split right / split down |
+| `Ctrl+Shift+arrows` | Move between terminals in a split (with `Alt`: resize) |
+| `Ctrl+Shift+Z` | Zoom one terminal of a split |
 | `Ctrl+Shift+A` | Next tab where an agent needs you |
 | `Ctrl+Shift+P` | Tab palette |
 | `Ctrl+Shift+F` | Search scrollback |

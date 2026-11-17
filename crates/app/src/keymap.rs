@@ -48,7 +48,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "Ctrl+Shift+W",
-        action: "close the active tab",
+        action: "close the active tab (in a split, the focused terminal)",
         scope: Scope::Global,
     },
     Binding {
@@ -69,6 +69,36 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         chord: "Ctrl+PageUp / PageDown",
         action: "previous / next tab",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+D / Ctrl+Shift+S",
+        action: "split the terminal: new one to the right / below",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+arrows",
+        action: "in a split: move to the terminal that way",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+Alt+arrows",
+        action: "in a split: move the nearest divider that way",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+Z",
+        action: "in a split: show only this terminal, or all again",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+N",
+        action: "new window (for another monitor), on a new terminal",
+        scope: Scope::Global,
+    },
+    Binding {
+        chord: "Ctrl+Shift+B",
+        action: "hide or show the rail in this window",
         scope: Scope::Global,
     },
     Binding {
@@ -123,12 +153,22 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "drag",
-        action: "reorder, or move between categories",
+        action: "between rows to reorder; onto a row's middle or a terminal to split with it",
         scope: Scope::Rail,
     },
     Binding {
+        chord: "▸ on a split",
+        action: "unfold its terminals; drag one out between rows to unsplit it",
+        scope: Scope::Rail,
+    },
+    Binding {
+        chord: "drag a terminal's header",
+        action: "onto another's edge to move it there, its middle to swap, the rail to unsplit",
+        scope: Scope::Terminal,
+    },
+    Binding {
         chord: "right-click",
-        action: "tab and category menus (move, colour, account, sessions)",
+        action: "tab and category menus (move, window, colour, account, sessions)",
         scope: Scope::Rail,
     },
 ];

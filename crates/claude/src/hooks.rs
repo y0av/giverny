@@ -290,13 +290,14 @@ pub fn spawn_spool_watcher(
 /// spooled while the app was closed.
 ///
 /// The socket is also how one Giverny finds another: a second launch sends
-/// [`RAISE_REQUEST`] instead of opening a window ([`ask_running_to_raise`]).
-/// Each such request reaches `raise` as the connection to answer, and the app
-/// answers it from its UI thread, so an answer means a window that is alive.
+/// [`NEW_WINDOW_REQUEST`] instead of opening a window of its own
+/// ([`ask_running`]). Each such request reaches `raise` as the connection to
+/// answer, and the app answers it from its UI thread, so an answer means a
+/// window that is alive.
 #[cfg(unix)]
 pub fn spawn_listener(
     spool: &Path,
-    raise: crossbeam_channel::Sender<std::os::unix::net::UnixStream>,
+    raise: crossbeam_channel::Sender<(std::os::unix::net::UnixStream, Ask)>,
     wake: impl Fn() + Send + 'static,
 ) -> anyhow::Result<(crossbeam_channel::Receiver<RelayMsg>, Vec<RelayMsg>)> {
     use std::io::BufRead;
@@ -323,9 +324,9 @@ pub fn spawn_listener(
                 let reader = std::io::BufReader::new(&stream);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
-                    if is_raise_request(&line) {
+                    if let Some(ask) = control_request(&line) {
                         if let Ok(reply) = stream.try_clone() {
-                            let _ = raise.send(reply);
+                            let _ = raise.send((reply, ask));
                             wake();
                         }
                         continue;
@@ -341,23 +342,56 @@ pub fn spawn_listener(
     Ok((rx, spooled))
 }
 
-/// What a second launch sends down the relay socket in place of a hook: come
-/// to the front, because the user just started Giverny again.
+/// What a second launch once sent down the relay socket in place of a hook:
+/// come to the front, because the user just started Giverny again.
 pub const RAISE_REQUEST: &str = r#"{"giverny":"raise"}"#;
 
+/// What a second launch sends now: open another window, as a browser does.
+/// It is a raise request with one more field, so a Giverny older than this
+/// build reads it as the raise it knows and comes to the front, instead of
+/// leaving the launch waiting for an answer that never comes.
+pub const NEW_WINDOW_REQUEST: &str = r#"{"giverny":"raise","window":true}"#;
+
+/// What a second launch asked of the running Giverny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// Come to the front.
+    Raise,
+    /// Open another window.
+    Window,
+}
+
+impl Ask {
+    #[cfg(unix)]
+    fn request(self) -> &'static str {
+        match self {
+            Ask::Raise => RAISE_REQUEST,
+            Ask::Window => NEW_WINDOW_REQUEST,
+        }
+    }
+}
+
 #[cfg(unix)]
-fn is_raise_request(line: &str) -> bool {
+fn control_request(line: &str) -> Option<Ask> {
     #[derive(Deserialize)]
     struct Control {
         giverny: String,
+        #[serde(default)]
+        window: bool,
     }
-    serde_json::from_str::<Control>(line).is_ok_and(|c| c.giverny == "raise")
+    let c = serde_json::from_str::<Control>(line).ok()?;
+    (c.giverny == "raise").then_some(if c.window { Ask::Window } else { Ask::Raise })
 }
 
-/// The answer to a [`RAISE_REQUEST`], written by the running app once its
-/// window has been told to come forward.
-pub fn raise_reply() -> String {
-    format!("{{\"raised\":true,\"pid\":{}}}\n", std::process::id())
+/// The answer to a request, written by the running app once it has done
+/// what was asked. `window` says a new window opened rather than the old one
+/// coming forward.
+pub fn raise_reply(ask: Ask) -> String {
+    let window = ask == Ask::Window;
+    format!(
+        "{{\"raised\":true,\"window\":{window},\"pid\":{}}}\n",
+        std::process::id()
+    )
 }
 
 /// Whoever already listens on the relay socket.
@@ -440,23 +474,24 @@ fn peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 pub enum Running {
     /// Nobody listens: this launch is the one Giverny.
     Nobody,
-    /// A Giverny answered and is coming to the front.
-    Raised { pid: Option<u32> },
+    /// A Giverny answered: it opened a new window (`window`), or one too
+    /// old to know that request came to the front.
+    Raised { pid: Option<u32>, window: bool },
     /// Something holds the socket but gave no answer in time: a window that
     /// is hung, or a Giverny too old to know the request.
     Silent(Holder),
 }
 
-/// Ask the Giverny that holds the relay socket, if one does, to come to the
-/// front. The answer comes from that app's UI thread, so `timeout` is how
-/// long a live window may take to get to it.
+/// Ask the Giverny that holds the relay socket, if one does, for `ask`. The
+/// answer comes from that app's UI thread, so `timeout` is how long a live
+/// window may take to get to it.
 #[cfg(unix)]
-pub fn ask_running_to_raise(timeout: Duration) -> Running {
-    ask_to_raise(&socket_path(), timeout)
+pub fn ask_running(ask: Ask, timeout: Duration) -> Running {
+    ask_to(&socket_path(), ask, timeout)
 }
 
 #[cfg(unix)]
-fn ask_to_raise(path: &Path, timeout: Duration) -> Running {
+fn ask_to(path: &Path, ask: Ask, timeout: Duration) -> Running {
     use std::io::BufRead;
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
         return Running::Nobody;
@@ -466,7 +501,7 @@ fn ask_to_raise(path: &Path, timeout: Duration) -> Running {
     };
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let _ = stream.set_read_timeout(Some(timeout));
-    if writeln!(stream, "{RAISE_REQUEST}").is_err() {
+    if writeln!(stream, "{}", ask.request()).is_err() {
         return Running::Silent(holder);
     }
     // Done writing: the listener reads to the end of a connection before it
@@ -477,11 +512,18 @@ fn ask_to_raise(path: &Path, timeout: Duration) -> Running {
     #[derive(Deserialize)]
     struct Reply {
         raised: bool,
+        #[serde(default)]
+        window: bool,
         pid: Option<u32>,
     }
     match serde_json::from_str::<Reply>(answer.trim()) {
-        Ok(Reply { raised: true, pid }) => Running::Raised {
+        Ok(Reply {
+            raised: true,
+            window,
+            pid,
+        }) => Running::Raised {
             pid: pid.or(holder.pid),
+            window,
         },
         _ => Running::Silent(holder),
     }
@@ -1166,13 +1208,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn only_the_raise_request_reads_as_one() {
-        assert!(is_raise_request(RAISE_REQUEST));
-        assert!(!is_raise_request(r#"{"giverny":"other"}"#));
-        assert!(!is_raise_request(
-            r#"{"tab_id":"1","config_dir":null,"event":{"hook_event_name":"Stop"}}"#
-        ));
-        assert!(!is_raise_request("not json"));
+    fn only_the_control_requests_read_as_one() {
+        assert_eq!(control_request(RAISE_REQUEST), Some(Ask::Raise));
+        assert_eq!(control_request(NEW_WINDOW_REQUEST), Some(Ask::Window));
+        assert_eq!(control_request(r#"{"giverny":"other"}"#), None);
+        assert_eq!(
+            control_request(
+                r#"{"tab_id":"1","config_dir":null,"event":{"hook_event_name":"Stop"}}"#
+            ),
+            None
+        );
+        assert_eq!(control_request("not json"), None);
+    }
+
+    /// A Giverny from before new windows reads the request with the parser
+    /// it had, which knew no `window` field: it must still see a raise.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_giverny_reads_the_window_request_as_a_raise() {
+        #[derive(Deserialize)]
+        struct Control {
+            giverny: String,
+        }
+        let old = serde_json::from_str::<Control>(NEW_WINDOW_REQUEST).unwrap();
+        assert_eq!(old.giverny, "raise");
     }
 
     #[cfg(unix)]
@@ -1180,14 +1239,14 @@ mod tests {
     fn nobody_on_the_socket_means_this_launch_opens_the_window() {
         let path = scratch_socket("none");
         assert_eq!(
-            ask_to_raise(&path, Duration::from_millis(200)),
+            ask_to(&path, Ask::Window, Duration::from_millis(200)),
             Running::Nobody
         );
         assert_eq!(socket_holder(&path), None);
         // A socket file left by a Giverny that is gone refuses connections.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert_eq!(
-            ask_to_raise(&path, Duration::from_millis(200)),
+            ask_to(&path, Ask::Window, Duration::from_millis(200)),
             Running::Nobody
         );
         let _ = std::fs::remove_file(&path);
@@ -1211,21 +1270,24 @@ mod tests {
             std::io::BufReader::new(&stream)
                 .read_line(&mut line)
                 .unwrap();
-            assert!(is_raise_request(line.trim()));
-            (&stream).write_all(raise_reply().as_bytes()).unwrap();
+            assert_eq!(control_request(line.trim()), Some(Ask::Window));
+            (&stream)
+                .write_all(raise_reply(Ask::Window).as_bytes())
+                .unwrap();
             listener
         });
         assert_eq!(
-            ask_to_raise(&path, Duration::from_secs(5)),
+            ask_to(&path, Ask::Window, Duration::from_secs(5)),
             Running::Raised {
-                pid: Some(std::process::id())
+                pid: Some(std::process::id()),
+                window: true,
             }
         );
         let listener = server.join().unwrap();
 
         // Hung: the connection is accepted (by the kernel) and never answered.
         assert_eq!(
-            ask_to_raise(&path, Duration::from_millis(200)),
+            ask_to(&path, Ask::Window, Duration::from_millis(200)),
             Running::Silent(Holder { pid: ours })
         );
         drop(listener);

@@ -8,8 +8,28 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::panes::{Axis, Node};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TabId(pub u64);
+
+/// A rail row holding several terminals in a split layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupId(pub u64);
+
+/// Several terminals sharing one rail row, laid out by `tree`. A row of one
+/// terminal is not a group: it is a tab with `group: None`, which is what
+/// every tab from before splits existed loads as.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: GroupId,
+    pub tree: Node,
+    /// The terminal last typed into here, which selecting the row returns to.
+    pub focus: TabId,
+    /// Showing only the focused terminal, full size, for now.
+    #[serde(skip)]
+    pub zoomed: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CategoryId(pub u64);
@@ -65,6 +85,9 @@ pub struct Tab {
     pub wsl_distro: Option<String>,
     #[serde(skip)]
     pub exited: bool,
+    /// The split row this terminal is part of, if any.
+    #[serde(default)]
+    pub group: Option<GroupId>,
 }
 
 impl Tab {
@@ -90,6 +113,16 @@ impl Tab {
     }
 }
 
+/// What one window is showing: its current tab and the ones before it.
+/// The workspace holds the focus of the window being drawn; the others
+/// park theirs here until their turn ([`Workspace::swap_focus`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Focus {
+    pub active: Option<TabId>,
+    #[serde(default)]
+    pub recent: Vec<TabId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     next_id: u64,
@@ -103,6 +136,10 @@ pub struct Workspace {
     /// tabs feeds it, and so it survives a restart with the tabs themselves.
     #[serde(default)]
     recent: Vec<TabId>,
+    /// Split rows. Their members sit next to each other in `tabs`, in one
+    /// category, so the rail draws each group once where its first member is.
+    #[serde(default)]
+    pub groups: Vec<Group>,
 }
 
 impl Default for Workspace {
@@ -113,6 +150,7 @@ impl Default for Workspace {
             tabs: Vec::new(),
             active: None,
             recent: Vec::new(),
+            groups: Vec::new(),
         };
         ws.add_category("main");
         ws
@@ -191,6 +229,7 @@ impl Workspace {
                 git_repo: None,
                 wsl_distro: None,
                 exited: false,
+                group: None,
             },
         );
         self.switch_to(id);
@@ -210,8 +249,15 @@ impl Workspace {
         let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
+        // A terminal closing inside a split hands its space, and the
+        // keyboard, to its neighbour in the layout rather than leaving the row.
+        let heir = self.leave_group(id);
         self.tabs.remove(pos);
-        if self.active == Some(id) {
+        if self.active == Some(id)
+            && let Some(heir) = heir
+        {
+            self.active = Some(heir);
+        } else if self.active == Some(id) {
             self.active = self
                 .recent
                 .iter()
@@ -241,6 +287,13 @@ impl Workspace {
         self.tabs.iter().filter(move |t| t.category == category)
     }
 
+    /// Trade the focus being used for `other`'s: how a second window gets
+    /// the same tab operations as the first, each with its own selection.
+    pub fn swap_focus(&mut self, other: &mut Focus) {
+        std::mem::swap(&mut self.active, &mut other.active);
+        std::mem::swap(&mut self.recent, &mut other.recent);
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         self.active.and_then(|id| self.tab(id))
     }
@@ -256,6 +309,15 @@ impl Workspace {
         if self.active == Some(id) {
             return;
         }
+        self.note_focus(id);
+        // Moving between the terminals of one row is not switching rows:
+        // Ctrl+Tab still goes back to the row you came from.
+        if let Some(prev) = self.active
+            && self.same_row(prev, id)
+        {
+            self.active = Some(id);
+            return;
+        }
         if let Some(prev) = self.active {
             self.recent.retain(|&x| x != prev);
             self.recent.insert(0, prev);
@@ -269,6 +331,7 @@ impl Workspace {
     /// until the walk ends. Pair with `commit_switch`.
     pub fn preview_active(&mut self, id: TabId) {
         if self.tab(id).is_some() {
+            self.note_focus(id);
             self.active = Some(id);
         }
     }
@@ -282,39 +345,42 @@ impl Workspace {
         self.switch_to(landed);
     }
 
-    /// Tabs in most-recently-used order, the active one first, with tabs
+    /// Rows in most-recently-used order, the active one first, with rows
     /// never activated (a restored workspace, before anything is clicked)
-    /// last in rail order.
+    /// last in rail order. A split row appears once, as the terminal it
+    /// would select.
     pub fn recent_order(&self) -> Vec<TabId> {
         let mut out: Vec<TabId> = Vec::with_capacity(self.tabs.len());
-        if let Some(active) = self.active.filter(|&id| self.tab(id).is_some()) {
-            out.push(active);
-        }
-        for &id in &self.recent {
-            if self.tab(id).is_some() && !out.contains(&id) {
+        let push = |ws: &Self, out: &mut Vec<TabId>, id: TabId| {
+            if ws.tab(id).is_some() && !out.iter().any(|&x| ws.same_row(x, id)) {
                 out.push(id);
             }
+        };
+        if let Some(active) = self.active {
+            push(self, &mut out, active);
+        }
+        for &id in &self.recent {
+            push(self, &mut out, self.row_target(id));
         }
         for tab in &self.tabs {
-            if !out.contains(&tab.id) {
-                out.push(tab.id);
-            }
+            push(self, &mut out, self.row_target(tab.id));
         }
         out
     }
 
-    /// Move active selection by `delta` in rail order (wraps).
+    /// Move active selection by `delta` rows in rail order (wraps).
     pub fn cycle_active(&mut self, delta: i32) {
-        if self.tabs.is_empty() {
+        let rows = self.row_heads();
+        if rows.is_empty() {
             return;
         }
-        let len = self.tabs.len() as i32;
+        let len = rows.len() as i32;
         let current = self
             .active
-            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            .and_then(|id| rows.iter().position(|&r| self.same_row(r, id)))
             .unwrap_or(0) as i32;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.switch_to(self.tabs[next].id);
+        self.switch_to(self.row_target(rows[next]));
     }
 
     /// Move a category to `index` in rail order. Tabs follow their category:
@@ -331,52 +397,370 @@ impl Workspace {
         self.categories.insert(to, moved);
     }
 
-    /// Move `id` into `category` at `index` counted among that category's
-    /// tabs (clamped). Used by rail drag-and-drop.
+    /// Move `id`'s row into `category` at `index` counted among that
+    /// category's rows (clamped). Used by rail drag-and-drop.
     pub fn reorder_tab(&mut self, id: TabId, category: CategoryId, index: usize) {
-        if self.category(category).is_none() {
+        if self.category(category).is_none() || self.tab(id).is_none() {
             return;
         }
-        let Some(from) = self.tabs.iter().position(|t| t.id == id) else {
-            return;
-        };
-        let mut tab = self.tabs.remove(from);
-        tab.category = category;
-
-        // Translate the within-category index into an absolute rail index.
-        let siblings: Vec<usize> = self
+        let block = self.take_row(id, category);
+        // Translate the within-category row index into an absolute rail index.
+        let heads: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.category == category)
+            .filter(|(i, t)| t.category == category && self.is_head_at(*i))
             .map(|(i, _)| i)
             .collect();
-        let at = match siblings.get(index) {
+        let at = match heads.get(index) {
             Some(&i) => i,
-            None => siblings
-                .last()
-                .map(|&i| i + 1)
-                .unwrap_or_else(|| self.tabs.len()),
+            None => self.end_of(category),
         };
-        self.tabs.insert(at, tab);
+        self.tabs.splice(at..at, block);
     }
 
     pub fn move_tab_to_category(&mut self, id: TabId, category: CategoryId) {
-        if self.category(category).is_none() {
+        if self.category(category).is_none() || self.tab(id).is_none() {
             return;
         }
-        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
-            return;
-        };
-        let mut tab = self.tabs.remove(pos);
-        tab.category = category;
-        let insert_at = self
-            .tabs
+        let block = self.take_row(id, category);
+        let at = self.end_of(category);
+        self.tabs.splice(at..at, block);
+    }
+
+    /// Lift `id`'s whole row out of `tabs`, retagged to `category`.
+    fn take_row(&mut self, id: TabId, category: CategoryId) -> Vec<Tab> {
+        let group = self.tab(id).and_then(|t| t.group);
+        let mut block = Vec::new();
+        let mut i = 0;
+        while i < self.tabs.len() {
+            let t = &self.tabs[i];
+            if t.id == id || (group.is_some() && t.group == group) {
+                let mut t = self.tabs.remove(i);
+                t.category = category;
+                block.push(t);
+            } else {
+                i += 1;
+            }
+        }
+        block
+    }
+
+    /// Index just past `category`'s last tab, or the end.
+    fn end_of(&self, category: CategoryId) -> usize {
+        self.tabs
             .iter()
             .rposition(|t| t.category == category)
             .map(|i| i + 1)
-            .unwrap_or(self.tabs.len());
-        self.tabs.insert(insert_at, tab);
+            .unwrap_or(self.tabs.len())
+    }
+
+    // ── split rows ──────────────────────────────────────────────────────
+
+    pub fn group(&self, id: GroupId) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// The split row `tab` is in, if it is in one.
+    pub fn group_of(&self, tab: TabId) -> Option<&Group> {
+        self.tab(tab)
+            .and_then(|t| t.group)
+            .and_then(|g| self.group(g))
+    }
+
+    pub fn group_of_mut(&mut self, tab: TabId) -> Option<&mut Group> {
+        let g = self.tab(tab).and_then(|t| t.group)?;
+        self.group_mut(g)
+    }
+
+    /// The terminals on screen when `tab` is: its row's, in layout order.
+    pub fn row_tabs(&self, tab: TabId) -> Vec<TabId> {
+        match self.group_of(tab) {
+            Some(g) => g.tree.leaves(),
+            None if self.tab(tab).is_some() => vec![tab],
+            None => Vec::new(),
+        }
+    }
+
+    /// The terminals on screen now. A zoomed row shows only its focus.
+    pub fn visible(&self) -> Vec<TabId> {
+        let Some(active) = self.active else {
+            return Vec::new();
+        };
+        match self.group_of(active) {
+            Some(g) if g.zoomed => vec![active],
+            _ => self.row_tabs(active),
+        }
+    }
+
+    pub fn same_row(&self, a: TabId, b: TabId) -> bool {
+        if a == b {
+            return true;
+        }
+        let ga = self.tab(a).and_then(|t| t.group);
+        ga.is_some() && ga == self.tab(b).and_then(|t| t.group)
+    }
+
+    /// The terminal selecting `tab`'s row lands on: the one last focused.
+    pub fn row_target(&self, tab: TabId) -> TabId {
+        self.group_of(tab).map(|g| g.focus).unwrap_or(tab)
+    }
+
+    /// Whether the rail draws `tab`'s row at `tab`: it is the row's first
+    /// member in rail order.
+    pub fn is_row_head(&self, tab: TabId) -> bool {
+        self.tabs
+            .iter()
+            .position(|t| t.id == tab)
+            .is_some_and(|i| self.is_head_at(i))
+    }
+
+    fn is_head_at(&self, i: usize) -> bool {
+        match self.tabs[i].group {
+            None => true,
+            Some(g) => i == 0 || self.tabs[i - 1].group != Some(g),
+        }
+    }
+
+    /// The first member of every row, in rail order.
+    pub fn row_heads(&self) -> Vec<TabId> {
+        (0..self.tabs.len())
+            .filter(|&i| self.is_head_at(i))
+            .map(|i| self.tabs[i].id)
+            .collect()
+    }
+
+    fn note_focus(&mut self, id: TabId) {
+        if let Some(g) = self.group_of_mut(id) {
+            if g.focus != id {
+                g.zoomed = false;
+            }
+            g.focus = id;
+        }
+    }
+
+    /// Open a new terminal beside `from`, in its row (making the row a
+    /// split if it was one terminal), and focus it. `axis` is the split's
+    /// direction; `before` puts the new one left of or above `from`.
+    pub fn split(&mut self, from: TabId, axis: Axis, before: bool) -> Option<TabId> {
+        let category = self.tab(from)?.category;
+        let id = TabId(self.fresh_id());
+        let group = match self.tab(from).and_then(|t| t.group) {
+            Some(g) => g,
+            None => {
+                let g = GroupId(self.fresh_id());
+                self.groups.push(Group {
+                    id: g,
+                    tree: Node::Leaf(from),
+                    focus: from,
+                    zoomed: false,
+                });
+                self.tab_mut(from)?.group = Some(g);
+                g
+            }
+        };
+        let grp = self.group_mut(group)?;
+        grp.zoomed = false;
+        grp.tree.split_leaf(from, id, axis, before);
+        let at = self.row_end(from);
+        self.tabs.insert(
+            at,
+            Tab {
+                id,
+                category,
+                custom_title: None,
+                auto_title: String::new(),
+                cwd: None,
+                foreground: None,
+                claude_session: None,
+                agent_session: None,
+                claude_config_dir: None,
+                git_branch: None,
+                git_repo: None,
+                wsl_distro: None,
+                exited: false,
+                group: Some(group),
+            },
+        );
+        self.switch_to(id);
+        Some(id)
+    }
+
+    /// Index just past the last member of `tab`'s row.
+    fn row_end(&self, tab: TabId) -> usize {
+        let group = self.tab(tab).and_then(|t| t.group);
+        self.tabs
+            .iter()
+            .rposition(|t| t.id == tab || (group.is_some() && t.group == group))
+            .map(|i| i + 1)
+            .unwrap_or(self.tabs.len())
+    }
+
+    /// Take `id` out of its split, if it is in one. The group dissolves
+    /// when one terminal is left. Returns who takes over its space.
+    fn leave_group(&mut self, id: TabId) -> Option<TabId> {
+        let gid = self.tab(id)?.group?;
+        if let Some(t) = self.tab_mut(id) {
+            t.group = None;
+        }
+        let idx = self.groups.iter().position(|g| g.id == gid)?;
+        let heir = self.groups[idx].tree.heir(id);
+        let tree = std::mem::replace(&mut self.groups[idx].tree, Node::Leaf(id));
+        match tree.remove(id) {
+            Some(rest) if rest.len() > 1 => {
+                let g = &mut self.groups[idx];
+                if g.focus == id {
+                    g.focus = heir.unwrap_or_else(|| rest.leaves()[0]);
+                }
+                g.tree = rest;
+                g.zoomed = false;
+            }
+            rest => {
+                self.groups.remove(idx);
+                for leaf in rest.map(|n| n.leaves()).unwrap_or_default() {
+                    if let Some(t) = self.tab_mut(leaf) {
+                        t.group = None;
+                    }
+                }
+            }
+        }
+        heir
+    }
+
+    /// Move `id` out of its split onto a row of its own, just after the row
+    /// it left. Focus stays with it.
+    pub fn detach(&mut self, id: TabId) {
+        if self.tab(id).and_then(|t| t.group).is_none() {
+            return;
+        }
+        let anchor = self.row_tabs(id).into_iter().find(|&t| t != id);
+        self.leave_group(id);
+        if let Some(anchor) = anchor {
+            let pos = self.tabs.iter().position(|t| t.id == id).unwrap();
+            let tab = self.tabs.remove(pos);
+            let at = self.row_end(anchor);
+            self.tabs.insert(at, tab);
+        }
+        // It was in the active row; now it is a row, and the one you're in.
+        if self.active == Some(id) {
+            self.recent.retain(|&x| x != id);
+        }
+    }
+
+    /// Trade the places of two terminals of one split.
+    pub fn swap_in_group(&mut self, a: TabId, b: TabId) {
+        if a == b || !self.same_row(a, b) {
+            return;
+        }
+        if let Some(g) = self.group_of_mut(a) {
+            g.tree.swap_leaves(a, b);
+            g.zoomed = false;
+        }
+    }
+
+    /// Take `id` out of its split onto a row of its own at `index` among
+    /// `category`'s rows: a terminal dragged out of a split in the rail.
+    pub fn detach_to(&mut self, id: TabId, category: CategoryId, index: usize) {
+        self.detach(id);
+        self.reorder_tab(id, category, index);
+    }
+
+    /// Put `id` (with its row, if it had one, broken up) into `onto`'s
+    /// row, beside `onto`. The rail drop that builds a split.
+    pub fn join(&mut self, id: TabId, onto: TabId, axis: Axis, before: bool) {
+        if id == onto || self.tab(id).is_none() || self.tab(onto).is_none() {
+            return;
+        }
+        self.leave_group(id);
+        let category = self.tab(onto).map(|t| t.category).unwrap();
+        let group = match self.tab(onto).and_then(|t| t.group) {
+            Some(g) => g,
+            None => {
+                let g = GroupId(self.fresh_id());
+                self.groups.push(Group {
+                    id: g,
+                    tree: Node::Leaf(onto),
+                    focus: onto,
+                    zoomed: false,
+                });
+                self.tab_mut(onto).unwrap().group = Some(g);
+                g
+            }
+        };
+        let grp = self.group_mut(group).unwrap();
+        grp.tree.split_leaf(onto, id, axis, before);
+        grp.zoomed = false;
+        let pos = self.tabs.iter().position(|t| t.id == id).unwrap();
+        let mut tab = self.tabs.remove(pos);
+        tab.category = category;
+        tab.group = Some(group);
+        let at = self.row_end(onto);
+        self.tabs.insert(at, tab);
+        self.recent.retain(|&x| x != id);
+        self.switch_to(id);
+    }
+
+    /// Make a loaded workspace consistent: every group's tree names exactly
+    /// its live members, a group of fewer than two dissolves, and members
+    /// sit together in one category. A hand-edited or half-written file
+    /// costs a split, never a terminal.
+    pub fn normalize(&mut self) {
+        let live: Vec<TabId> = self.tabs.iter().map(|t| t.id).collect();
+        let mut groups = std::mem::take(&mut self.groups);
+        groups.retain_mut(|g| {
+            let mut tree = Some(g.tree.clone());
+            for leaf in g.tree.leaves() {
+                let member = self.tab(leaf).is_some_and(|t| t.group == Some(g.id));
+                if !live.contains(&leaf) || !member {
+                    tree = tree.and_then(|n| n.remove(leaf));
+                }
+            }
+            match tree {
+                Some(t) if t.len() > 1 => {
+                    if !t.contains(g.focus) {
+                        g.focus = t.leaves()[0];
+                    }
+                    g.tree = t;
+                    true
+                }
+                _ => false,
+            }
+        });
+        for t in &mut self.tabs {
+            if let Some(g) = t.group
+                && !groups.iter().any(|x| x.id == g && x.tree.contains(t.id))
+            {
+                t.group = None;
+            }
+        }
+        self.groups = groups;
+        // Pull each group's members together behind its first one.
+        for g in self.groups.clone() {
+            let leaves = g.tree.leaves();
+            let Some(first) = self.tabs.iter().position(|t| t.group == Some(g.id)) else {
+                continue;
+            };
+            let category = self.tabs[first].category;
+            let mut block: Vec<Tab> = Vec::new();
+            self.tabs.retain(|t| {
+                if t.group == Some(g.id) {
+                    block.push(t.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            block.sort_by_key(|t| leaves.iter().position(|&l| l == t.id));
+            for t in &mut block {
+                t.category = category;
+            }
+            let at = first.min(self.tabs.len());
+            self.tabs.splice(at..at, block);
+        }
     }
 }
 
@@ -686,5 +1070,234 @@ mod tests {
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.tab(id).unwrap().title(), "x");
         assert_eq!(back.active, Some(id));
+    }
+
+    // ── split rows ──────────────────────────────────────────────────────
+
+    #[test]
+    fn splitting_makes_a_row_of_two_and_focuses_the_new_terminal() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let other = ws.add_tab(cat);
+        ws.set_active(a);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        assert_eq!(ws.active, Some(b));
+        assert_eq!(ws.row_tabs(a), vec![a, b]);
+        assert_eq!(ws.visible(), vec![a, b]);
+        assert!(ws.same_row(a, b));
+        // b sits right after a in the rail, before the other row.
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![a, b, other]);
+        assert_eq!(ws.row_heads(), vec![a, other]);
+        assert!(!ws.is_row_head(b));
+    }
+
+    #[test]
+    fn moving_inside_a_row_is_not_switching_rows() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let x = ws.add_tab(cat);
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        ws.set_active(a);
+        ws.set_active(b);
+        assert_eq!(
+            ws.recent_order(),
+            vec![b, x],
+            "the row once, then the row before it"
+        );
+        ws.set_active(x);
+        assert_eq!(
+            ws.recent_order(),
+            vec![x, b],
+            "the row comes back at its last focus"
+        );
+        assert_eq!(ws.row_target(a), b);
+    }
+
+    #[test]
+    fn cycling_steps_over_rows_not_terminals() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        let c = ws.add_tab(cat);
+        ws.set_active(c);
+        ws.cycle_active(1);
+        assert_eq!(ws.active, Some(b), "wraps to the row, at its focus");
+        ws.cycle_active(1);
+        assert_eq!(ws.active, Some(c));
+    }
+
+    #[test]
+    fn closing_a_split_terminal_hands_focus_to_its_neighbour() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let x = ws.add_tab(cat);
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        let c = ws.split(b, Axis::Column, false).unwrap();
+        ws.close_tab(c);
+        assert_eq!(
+            ws.active,
+            Some(b),
+            "the terminal beside it, not the previous row"
+        );
+        assert_eq!(ws.row_tabs(a), vec![a, b]);
+        ws.close_tab(b);
+        assert_eq!(ws.active, Some(a));
+        assert!(ws.groups.is_empty(), "a row of one is no longer a group");
+        assert_eq!(ws.tab(a).unwrap().group, None);
+        ws.close_tab(a);
+        assert_eq!(ws.active, Some(x));
+    }
+
+    #[test]
+    fn a_row_moves_as_one() {
+        let mut ws = Workspace::default();
+        let main = ws.categories[0].id;
+        let work = ws.add_category("work");
+        let a = ws.add_tab(main);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        let c = ws.add_tab(main);
+        let ids = |ws: &Workspace, cat| ws.tabs_in(cat).map(|t| t.id).collect::<Vec<_>>();
+
+        ws.reorder_tab(c, main, 0);
+        assert_eq!(ids(&ws, main), vec![c, a, b]);
+        ws.reorder_tab(b, main, 0);
+        assert_eq!(
+            ids(&ws, main),
+            vec![a, b, c],
+            "dragging any member drags the row"
+        );
+        ws.reorder_tab(c, main, 1);
+        assert_eq!(
+            ids(&ws, main),
+            vec![a, b, c],
+            "index 1 is after the row, not inside it"
+        );
+        ws.move_tab_to_category(a, work);
+        assert_eq!(ids(&ws, work), vec![a, b]);
+        assert_eq!(ids(&ws, main), vec![c]);
+    }
+
+    #[test]
+    fn detach_and_join() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        let c = ws.split(b, Axis::Column, false).unwrap();
+        let x = ws.add_tab(cat);
+
+        ws.set_active(c);
+        ws.detach(c);
+        assert_eq!(ws.row_tabs(a), vec![a, b]);
+        assert_eq!(ws.row_tabs(c), vec![c]);
+        assert_eq!(ws.active, Some(c));
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![a, b, c, x], "right after the row it left");
+
+        ws.join(x, a, Axis::Column, true);
+        assert_eq!(ws.row_tabs(a), vec![x, a, b]);
+        assert_eq!(ws.active, Some(x));
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![a, b, x, c]);
+
+        // Joining a terminal of one split onto another moves just it.
+        ws.join(b, c, Axis::Row, false);
+        assert_eq!(ws.row_tabs(c), vec![c, b]);
+        assert_eq!(ws.row_tabs(a), vec![x, a]);
+    }
+
+    #[test]
+    fn a_terminal_dragged_out_lands_where_it_was_dropped() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let x = ws.add_tab(cat);
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        // Rows: x, [a b]. Drop b above x.
+        ws.detach_to(b, cat, 0);
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![b, x, a]);
+        assert!(ws.groups.is_empty());
+
+        let c = ws.split(a, Axis::Row, false).unwrap();
+        ws.swap_in_group(a, c);
+        assert_eq!(ws.row_tabs(a), vec![c, a]);
+        ws.swap_in_group(a, x);
+        assert_eq!(ws.row_tabs(a), vec![c, a], "not in one split: nothing");
+    }
+
+    #[test]
+    fn zoom_shows_only_the_focus_until_focus_moves() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        ws.group_of_mut(b).unwrap().zoomed = true;
+        assert_eq!(ws.visible(), vec![b]);
+        ws.set_active(a);
+        assert_eq!(ws.visible(), vec![a, b], "moving focus unzooms");
+    }
+
+    #[test]
+    fn normalize_repairs_what_a_bad_file_can_hold() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let other = ws.add_category("other");
+        let a = ws.add_tab(cat);
+        let b = ws.split(a, Axis::Row, false).unwrap();
+        let c = ws.split(b, Axis::Row, false).unwrap();
+        let x = ws.add_tab(cat);
+        // Scatter the row and lose a member, as a hand edit might.
+        let pos = ws.tabs.iter().position(|t| t.id == c).unwrap();
+        let mut moved = ws.tabs.remove(pos);
+        moved.category = other;
+        ws.tabs.push(moved);
+        ws.tabs.retain(|t| t.id != b);
+        ws.normalize();
+        assert_eq!(ws.row_tabs(a), vec![a, c]);
+        let order: Vec<TabId> = ws.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![a, c, x]);
+        assert_eq!(ws.tab(c).unwrap().category, cat);
+
+        ws.tabs.retain(|t| t.id != c);
+        ws.normalize();
+        assert!(ws.groups.is_empty());
+        assert_eq!(ws.tab(a).unwrap().group, None);
+    }
+
+    #[test]
+    fn swapping_focus_trades_selection_and_history() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let mut other = Focus {
+            active: Some(a),
+            recent: vec![],
+        };
+        ws.swap_focus(&mut other);
+        assert_eq!(ws.active, Some(a));
+        assert_eq!(other.active, Some(b));
+        assert_eq!(
+            other.recent,
+            vec![a],
+            "the first window's history went with it"
+        );
+        ws.swap_focus(&mut other);
+        assert_eq!(ws.active, Some(b));
+    }
+
+    #[test]
+    fn a_file_from_before_splits_loads_as_rows_of_one() {
+        let json = r#"{"next_id":3,"categories":[{"id":1,"name":"main","color_index":0,"collapsed":false}],
+            "tabs":[{"id":2,"category":1,"custom_title":null,"cwd":null}],"active":2}"#;
+        let ws: Workspace = serde_json::from_str(json).unwrap();
+        assert!(ws.groups.is_empty());
+        assert_eq!(ws.visible(), vec![TabId(2)]);
     }
 }

@@ -240,6 +240,11 @@ where
                 }
             }
             state.parser.advance(&mut **terminal, &buf[at..unprocessed]);
+            // Before releasing the terminal lock: snapshot readers must not
+            // observe a new revision paired with old terminal contents.
+            if let Some(shared) = self.event_proxy.shared_state() {
+                shared.note_snapshot_change();
+            }
 
             processed += unprocessed;
             unprocessed = 0;
@@ -336,7 +341,13 @@ where
 
                 // Handle synchronized update timeout.
                 if events.is_empty() && self.rx.peek().is_none() {
-                    state.parser.stop_sync(&mut *self.terminal.lock());
+                    {
+                        let mut term = self.terminal.lock();
+                        state.parser.stop_sync(&mut *term);
+                        if let Some(shared) = self.event_proxy.shared_state() {
+                            shared.note_snapshot_change();
+                        }
+                    }
                     self.event_proxy.send_event(Event::Wakeup);
                     continue;
                 }

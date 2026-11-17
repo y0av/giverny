@@ -5,6 +5,7 @@
 //! Giverny start it again — the same trick as `claude --resume`, and with the
 //! same limits: the program restarts, its internal state does not.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Programs Giverny will restart on its own. Deliberately conservative:
@@ -44,28 +45,35 @@ pub const DEFAULT_RESTORE_APPS: &[&str] = &[
 
 /// The command running in the foreground of `shell_pid`'s tab, as an argv
 /// string. `None` when the shell is just sitting at its prompt.
-#[cfg(target_os = "linux")]
 pub fn foreground_command(shell_pid: u32) -> Option<String> {
-    // The shell's own children are the candidates; take the most recently
-    // started, which is the one the user is looking at.
-    let mut best: Option<(u64, String)> = None;
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    foreground_commands(&[shell_pid]).remove(&shell_pid)
+}
+
+/// Read the process table once for all requested shells. Missing entries
+/// mean no child command was found, just as with `foreground_command`.
+#[cfg(target_os = "linux")]
+pub fn foreground_commands(shell_pids: &[u32]) -> HashMap<u32, String> {
+    let mut best: HashMap<u32, Option<(u64, String)>> =
+        shell_pids.iter().map(|&pid| (pid, None)).collect();
+    if best.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return HashMap::new();
+    };
+    for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        // Fields after the parenthesised comm: state, ppid, …, starttime(22).
-        let Some((_, rest)) = stat.rsplit_once(')') else {
+        let Some((parent, start)) = parent_and_start(&stat) else {
             continue;
         };
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let ppid = fields.get(1).and_then(|p| p.parse::<u32>().ok());
-        if ppid != Some(shell_pid) {
+        let Some(candidate) = best.get_mut(&parent) else {
             continue;
-        }
-        let start: u64 = fields.get(19).and_then(|s| s.parse().ok()).unwrap_or(0);
+        };
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
@@ -74,43 +82,65 @@ pub fn foreground_command(shell_pid: u32) -> Option<String> {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        if argv.is_empty() {
-            continue;
-        }
-        let line = argv.join(" ");
-        if best.as_ref().is_none_or(|(t, _)| start >= *t) {
-            best = Some((start, line));
+        if !argv.is_empty() {
+            keep_newest(candidate, start, argv.join(" "));
         }
     }
-    best.map(|(_, line)| line)
+    best.into_iter()
+        .filter_map(|(pid, value)| value.map(|(_, cmd)| (pid, cmd)))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parent_and_start(stat: &str) -> Option<(u32, u64)> {
+    // comm may itself contain spaces and parentheses. After its final ')':
+    // state (3), ppid (4), ... starttime (22).
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let parent = fields.nth(1)?.parse().ok()?;
+    let start = fields.nth(17).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((parent, start))
+}
+
+fn keep_newest(best: &mut Option<(u64, String)>, start: u64, command: String) {
+    if best.as_ref().is_none_or(|(previous, _)| start >= *previous) {
+        *best = Some((start, command));
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn foreground_command(shell_pid: u32) -> Option<String> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+pub fn foreground_commands(shell_pids: &[u32]) -> HashMap<u32, String> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut best: HashMap<u32, Option<(u64, String)>> =
+        shell_pids.iter().map(|&pid| (pid, None)).collect();
+    if best.is_empty() {
+        return HashMap::new();
+    }
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
     );
-    let parent = Pid::from_u32(shell_pid);
-    sys.processes()
-        .values()
-        .filter(|p| p.parent() == Some(parent))
-        .max_by_key(|p| p.start_time())
-        .map(|p| {
-            let cmd: Vec<String> = p
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect();
-            if cmd.is_empty() {
-                p.name().to_string_lossy().into_owned()
-            } else {
-                cmd.join(" ")
-            }
-        })
+    for p in sys.processes().values() {
+        let Some(candidate) = p.parent().and_then(|pid| best.get_mut(&pid.as_u32())) else {
+            continue;
+        };
+        let cmd: Vec<String> = p
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let command = if cmd.is_empty() {
+            p.name().to_string_lossy().into_owned()
+        } else {
+            cmd.join(" ")
+        };
+        keep_newest(candidate, p.start_time(), command);
+    }
+    best.into_iter()
+        .filter_map(|(pid, value)| value.map(|(_, cmd)| (pid, cmd)))
+        .collect()
 }
 
 /// The program a command line actually runs: no directory, and seen through a
@@ -191,6 +221,57 @@ pub fn shell_cwd(shell_pid: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn newest_child_wins_including_equal_start_times() {
+        let mut best = None;
+        keep_newest(&mut best, 20, "newer".into());
+        keep_newest(&mut best, 10, "older".into());
+        assert_eq!(best.as_ref().unwrap().1, "newer");
+        keep_newest(&mut best, 20, "same tick".into());
+        assert_eq!(best.unwrap().1, "same tick");
+        assert!(foreground_commands(&[]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_handles_parentheses_inside_command_names() {
+        let stat = "123 (shell (worker)) S 42 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 98765 0";
+        assert_eq!(parent_and_start(stat), Some((42, 98765)));
+        assert_eq!(parent_and_start("bad stat"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn batch_keeps_shell_commands_separate() {
+        use std::process::{Command, Stdio};
+        // Short-lived children finish even if an assertion fails.
+        let mut shells: Vec<_> = ["1", "2"]
+            .into_iter()
+            .map(|seconds| {
+                Command::new("/bin/sh")
+                    .args(["-c", &format!("sleep {seconds} & wait")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let pids: Vec<_> = shells.iter().map(|s| s.id()).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        let found = loop {
+            let found = foreground_commands(&pids);
+            if found.len() == 2 || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        for shell in &mut shells {
+            let _ = shell.wait();
+        }
+        assert_eq!(found.get(&pids[0]).map(String::as_str), Some("sleep 1"));
+        assert_eq!(found.get(&pids[1]).map(String::as_str), Some("sleep 2"));
+    }
 
     #[test]
     fn a_remembered_resume_command_names_its_conversation() {

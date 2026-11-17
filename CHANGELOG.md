@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v1.8.0 — 2026-11-17
+
+- **Splits.** `Ctrl+Shift+D` and `Ctrl+Shift+S` split the terminal right or
+  down, inside the same rail row. The row wears the most pressing state among
+  its terminals, and each terminal has a header with its own. Move between
+  them with `Ctrl+Shift+arrows`, resize with `Alt` added or by dragging the
+  divider, and zoom one with `Ctrl+Shift+Z`.
+- **Arrange splits with the mouse.** Drop a rail row onto the middle of
+  another to split them together, or onto a terminal's edge to place it
+  there. Drag a terminal's header to another edge to change the tiling, or
+  onto another terminal to swap them. Unfold a split row in the rail and drag
+  a terminal out to give it its own row again.
+- **More windows.** `Ctrl+Shift+N` opens another window, for another monitor,
+  and so does launching Giverny again while it runs, as a browser does.
+  Every window's rail lists every row; a row shown in another window carries
+  its number, and clicking it brings it over. A row's menu moves it to a new
+  or existing window. `Ctrl+Shift+B` hides the rail in a window. Windows and
+  what they show come back after a restart; where they sit on screen is left
+  to the compositor, as Wayland requires.
+- **Lower CPU use with many terminals.** Foreground commands are found with
+  one process-table scan per refresh. Unchanged scrollback skips serialization
+  as well as disk writes, including in background tabs. Hidden and scrolled-away
+  cursors no longer schedule blink repaints.
+
 ## v1.7.3 — 2026-11-05
 
 - New theme **red-rock**, from Mark Badolato's iTerm2-Color-Schemes

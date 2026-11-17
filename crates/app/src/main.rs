@@ -846,8 +846,8 @@ impl ComingForward {
 const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
 
 /// One Giverny per relay socket: when one is already running, ask it to
-/// come to the front instead of opening a second window that would get none
-/// of the hooks. Returns whether this launch should end here.
+/// open another window instead of starting a second Giverny that would get
+/// none of the hooks. Returns whether this launch should end here.
 ///
 /// A test instance with its own `XDG_RUNTIME_DIR` has its own socket, and is
 /// never the same Giverny as the one the user runs. One started with
@@ -863,12 +863,17 @@ fn defer_to_running() -> bool {
         tracing::info!("{var} is set: opening a window whatever else runs");
         return false;
     }
-    match hooks::ask_running_to_raise(Duration::from_secs(4)) {
+    match hooks::ask_running(hooks::Ask::Window, Duration::from_secs(4)) {
         Running::Nobody => false,
-        Running::Raised { pid } => {
+        Running::Raised { pid, window } => {
             let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
-            tracing::info!("Giverny is already running{pid}; it was asked to the front");
-            eprintln!("giverny: already running{pid} — brought its window to the front");
+            let did = if window {
+                "opened another window"
+            } else {
+                "brought its window to the front"
+            };
+            tracing::info!("Giverny is already running{pid}; it {did}");
+            eprintln!("giverny: already running{pid}; {did}");
             true
         }
         Running::Silent(holder) => {
@@ -2823,7 +2828,7 @@ impl App {
     }
 
     /// Come to the front for a second launch of Giverny, which asked over the
-    /// relay socket ([`giverny_claude::hooks::ask_running_to_raise`]) and
+    /// relay socket ([`giverny_claude::hooks::ask_running`]) and
     /// exits once this answers.
     ///
     /// The answer is written here, on the UI thread, so that an answer means a
@@ -2836,7 +2841,7 @@ impl App {
     /// mark the window instead.
     #[cfg(unix)]
     fn come_forward(&mut self, ctx: &egui::Context) {
-        for mut asker in self.claude.raise_requests() {
+        for (mut asker, ask) in self.claude.raise_requests() {
             use std::io::Write;
             // Closing, as on a restart into a new version: the launch asking
             // is the one taking over, and an answer would send it away just
@@ -2849,10 +2854,15 @@ impl App {
             // opened its own window: this one jumping in front of that, late,
             // helps nobody.
             if asker
-                .write_all(giverny_claude::hooks::raise_reply().as_bytes())
+                .write_all(giverny_claude::hooks::raise_reply(ask).as_bytes())
                 .is_err()
             {
                 tracing::info!("a launch asked this window forward, and gave up waiting");
+                continue;
+            }
+            if ask == giverny_claude::hooks::Ask::Window {
+                tracing::info!("another launch of Giverny asked for a new window");
+                self.open_window(ctx, None);
                 continue;
             }
             tracing::info!("another launch of Giverny asked this window to come forward");

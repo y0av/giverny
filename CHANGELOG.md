@@ -14,6 +14,8 @@
   or existing window. `Ctrl+Shift+B` hides the rail in a window. Windows and
   what they show come back after a restart; where they sit on screen is left
   to the compositor, as Wayland requires.
+  Launching Giverny again while it runs opens another window too, as a
+  browser does, instead of bringing the open one to the front.
 
 ## v1.7.3 — 2026-11-05
 

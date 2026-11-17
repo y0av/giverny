@@ -397,7 +397,7 @@ pub struct ClaudeWatch {
     /// Second launches asking this window to come forward, each the
     /// connection to answer ([`hooks::spawn_listener`]).
     #[cfg(unix)]
-    raise_rx: Receiver<std::os::unix::net::UnixStream>,
+    raise_rx: Receiver<(std::os::unix::net::UnixStream, hooks::Ask)>,
     last_scan: Instant,
     /// The last registry scan, and whether every live session predates the
     /// settings file. Both are filesystem work — for an account inside WSL,
@@ -2017,7 +2017,7 @@ impl ClaudeWatch {
 
     /// Second launches waiting for this window to come forward and say so.
     #[cfg(unix)]
-    pub fn raise_requests(&self) -> Vec<std::os::unix::net::UnixStream> {
+    pub fn raise_requests(&self) -> Vec<(std::os::unix::net::UnixStream, hooks::Ask)> {
         self.raise_rx.try_iter().collect()
     }
 }

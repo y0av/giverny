@@ -362,6 +362,7 @@ pub enum Ask {
 }
 
 impl Ask {
+    #[cfg(unix)]
     fn request(self) -> &'static str {
         match self {
             Ask::Raise => RAISE_REQUEST,

@@ -51,17 +51,14 @@ impl Target {
             let Ok(metadata) = path.metadata() else {
                 return false;
             };
-            if !metadata.is_file() {
-                return false;
-            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             }
             #[cfg(not(unix))]
             {
-                true
+                metadata.is_file()
             }
         };
         if executable.is_absolute() || executable.components().count() > 1 {

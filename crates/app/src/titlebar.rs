@@ -18,7 +18,8 @@
 
 use crate::chrome::Chrome;
 use eframe::egui::{self, Color32, CursorIcon, ResizeDirection, Sense, Stroke, ViewportCommand};
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Caption height, in points: Windows 11's 32 px at 100 %.
@@ -49,11 +50,14 @@ const CLOSE_RED: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 /// So the window is never left maximised: it is laid over the work area by
 /// hand, one move and one resize, which an ordinary window takes exactly
 /// (its margin falls off-screen). The work area comes from Windows, asked
-/// once in the background at startup ([`probe_work_areas`]), and is kept in
-/// the saved layout so the next launch has it before the window exists.
-/// Until either has it, and whenever Windows maximises the window itself
-/// (Win+↑, a drag to the top), the window manager's maximise is what gives
-/// the work area away, and it is undone and redone by hand.
+/// in the background at startup ([`probe_work_areas`]) and again once X's
+/// monitors change, and is kept in the saved layout so the next launch has
+/// it before the window exists. Until either has it, and whenever Windows
+/// maximises the window itself (Win+↑, a drag to the top), the window
+/// manager's maximise is what gives the work area away, and it is undone
+/// and redone by hand.
+///
+/// Windows' pixels are not X's (#540): see [`work_area_on`].
 #[derive(Default)]
 pub struct Maximize {
     /// Laid over the work area by hand.
@@ -241,7 +245,12 @@ impl Maximize {
         let since = *self.max_since.get_or_insert_with(Instant::now);
         let ppp = ctx.pixels_per_point();
         let monitor = ctx.input(|i| i.viewport().monitor_size)? * ppp;
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor).expand(1.0);
+        // The monitor where X has it, which under WSLg is not at the origin
+        // whenever another sits above or left of it (#540).
+        let screen = x_monitors()
+            .and_then(|screens| screen_of(now, &screens))
+            .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, monitor))
+            .expand(1.0);
         let settled = !near(now, before) && screen.contains_rect(now);
         // Not the far-off rect an unmapped window reports, either.
         let waited = since.elapsed() > GIVE_UP
@@ -260,26 +269,35 @@ impl Maximize {
         ctx.request_repaint();
     }
 
-    /// The work area of the monitor the window is on, if it is known without
-    /// asking the window manager: from Windows, or from last time.
+    /// The work area of the monitor the window is on, in X's coordinates, if
+    /// it is known without asking the window manager: from Windows, or from
+    /// last time.
     fn work_area(&self, ctx: &egui::Context) -> Option<egui::Rect> {
         let ppp = ctx.pixels_per_point();
         let (inner, monitor) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
-        let centre = px(inner?, ppp).center();
+        let window = px(inner?, ppp);
         let monitor = monitor? * ppp;
-        let fits = |bounds: egui::Rect| (bounds.size() - monitor).length() < 3.0;
-        if let Some(areas) = WORK_AREAS.get() {
-            let on = areas
-                .iter()
-                .find(|(b, _)| b.contains(centre))
-                .or_else(|| areas.iter().find(|(b, _)| b.min == egui::Pos2::ZERO));
-            if let Some(&(_, work)) = on.filter(|(b, _)| fits(*b)) {
-                return Some(work);
-            }
+        let x = x_monitors();
+        let probe = probed(x.as_ref());
+        // X's monitors when it says; otherwise where Weston would have put
+        // Windows' — and then only one the size winit says the window's is.
+        let screen = match (&x, &probe) {
+            (Some(screens), _) => screen_of(window, screens),
+            (None, Some(probe)) => screen_of(window, &weston_layout(&probe.windows))
+                .filter(|s| (s.size() - monitor).length() < 3.0),
+            (None, None) => None,
+        };
+        if let (Some(screen), Some(probe)) = (screen, &probe)
+            && let Some(work) = work_area_on(screen, &probe.windows)
+        {
+            return Some(work);
         }
-        // Last time's: only while it is still on a monitor this size.
-        self.learned
-            .filter(|a| a.width() <= monitor.x + 0.5 && a.height() <= monitor.y + 0.5)
+        // Last time's: only while it is still on the window's monitor, or
+        // with no monitors known, on a monitor this size.
+        self.learned.filter(|a| match (screen, &x) {
+            (Some(screen), Some(_)) => screen.expand(1.0).contains_rect(*a),
+            _ => a.width() <= monitor.x + 0.5 && a.height() <= monitor.y + 0.5,
+        })
     }
 
     /// The caption's □, or a double click on it.
@@ -362,18 +380,37 @@ fn px(r: egui::Rect, ppp: f32) -> egui::Rect {
     egui::Rect::from_min_max(r.min * ppp, r.max * ppp)
 }
 
-/// Each Windows monitor's bounds and work area, in physical pixels — which
-/// under WSLg are X's coordinates too — once the background probe has them.
-static WORK_AREAS: OnceLock<Vec<(egui::Rect, egui::Rect)>> = OnceLock::new();
+/// What Windows said about its monitors: each one's bounds and work area, in
+/// Windows' physical pixels, and X's monitors as they were when it was
+/// asked, to tell when it needs asking again.
+#[derive(Clone)]
+struct Probe {
+    windows: Vec<(egui::Rect, egui::Rect)>,
+    x: Option<Vec<egui::Rect>>,
+}
+
+/// The last probe that answered.
+static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
+
+/// A probe on its way, so that only one is.
+static PROBING: AtomicBool = AtomicBool::new(false);
 
 /// Ask Windows for its monitors' work areas, in the background. PowerShell
-/// takes seconds to start, so this is done once, at launch, and never
-/// waited for: until it answers, the saved or the window manager's work
-/// area stands in.
+/// takes seconds to start, so this is never waited for: until it answers,
+/// the saved or the window manager's work area stands in. Done at launch,
+/// and again whenever X's monitors are no longer the ones it was done
+/// against (see [`probed`]): a screen plugged in, or a switch between
+/// duplicate and extend.
 pub fn probe_work_areas() {
-    std::thread::Builder::new()
+    if PROBING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
         .name("work-areas".into())
         .spawn(|| {
+            // X's before Windows': changed in between, the next look sees it
+            // and asks again.
+            let x = read_x_monitors();
             let out = std::process::Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", WORK_AREA_PS])
                 .stdin(std::process::Stdio::null())
@@ -381,22 +418,181 @@ pub fn probe_work_areas() {
                 .output();
             match out {
                 Ok(out) if out.status.success() => {
-                    let areas = parse_work_areas(&String::from_utf8_lossy(&out.stdout));
-                    tracing::debug!("WSLg work areas: {areas:?}");
-                    if !areas.is_empty() {
-                        let _ = WORK_AREAS.set(areas);
+                    let windows = parse_work_areas(&String::from_utf8_lossy(&out.stdout));
+                    tracing::debug!("WSLg work areas: {windows:?}, X monitors: {x:?}");
+                    if !windows.is_empty()
+                        && let Ok(mut probe) = PROBE.lock()
+                    {
+                        *probe = Some(Probe { windows, x });
                     }
                 }
                 Ok(out) => tracing::debug!("work-area probe failed: {}", out.status),
                 Err(e) => tracing::debug!("work-area probe failed: {e}"),
             }
-        })
-        .ok();
+            PROBING.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        PROBING.store(false, Ordering::Release);
+    }
 }
 
-/// Physical pixels (DPI-aware), one monitor a line: bounds, then work area,
-/// each `x y w h`.
-const WORK_AREA_PS: &str = r#"Add-Type -Namespace G -Name D -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; [void][G.D]::SetProcessDPIAware(); Add-Type -AssemblyName System.Windows.Forms; foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $b = $s.Bounds; $w = $s.WorkingArea; "$($b.X) $($b.Y) $($b.Width) $($b.Height) $($w.X) $($w.Y) $($w.Width) $($w.Height)" }"#;
+/// The last probe, after asking again in the background if `x`, X's
+/// monitors now, are not the ones it was made against. Windows' answer
+/// still holds meanwhile for every monitor it has: [`work_area_on`] goes by
+/// the monitor's own corner, not by where the layout put it.
+fn probed(x: Option<&Vec<egui::Rect>>) -> Option<Probe> {
+    let probe = PROBE.lock().ok()?.clone()?;
+    if x.is_some() && probe.x.as_ref() != x {
+        probe_work_areas();
+    }
+    Some(probe)
+}
+
+/// Physical pixels, one monitor a line: bounds, then work area, each
+/// `x y w h`. Per-monitor DPI-aware: merely DPI-aware, a monitor at
+/// another scale than the main one comes back scaled by the main one's —
+/// a 1920×1080 screen at 100 % beside a laptop at 175 % as 3360×1890
+/// (#540).
+const WORK_AREA_PS: &str = r#"Add-Type -Namespace G -Name D -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr c); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; try { $ok = [G.D]::SetThreadDpiAwarenessContext([System.IntPtr]::new(-4)) -ne [System.IntPtr]::Zero } catch { $ok = $false }; if (-not $ok) { [void][G.D]::SetProcessDPIAware() }; Add-Type -AssemblyName System.Windows.Forms; foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $b = $s.Bounds; $w = $s.WorkingArea; "$($b.X) $($b.Y) $($b.Width) $($b.Height) $($w.X) $($w.Y) $($w.Width) $($w.Height)" }"#;
+
+/// The work area, in X's coordinates, of the X monitor at `screen`, from
+/// `windows`: each Windows monitor's bounds and work area, in Windows'
+/// pixels.
+///
+/// Under WSLg the two are not the same coordinates (#540). Weston lays
+/// Windows' monitors out with their combined top-left at (0, 0), so a
+/// screen placed above or left of the main one moves every other one down
+/// or right in X: a laptop at Windows' (0, 0) beside a monitor set 628 px
+/// higher is at X's (0, 628). And Weston lays them out again only when a
+/// monitor is added or changes, not when one goes, so after a switch to
+/// duplicate, or unplugging, the laptop stays where the layout before had
+/// it — which no sum over Windows' monitors can know.
+///
+/// So the work area goes by the monitor itself: the Windows monitor that is
+/// `screen` is the one its size, the nearest to where Weston would have put
+/// it, and its work area keeps the same place on it.
+fn work_area_on(screen: egui::Rect, windows: &[(egui::Rect, egui::Rect)]) -> Option<egui::Rect> {
+    let corner = desktop_corner(windows);
+    let off = |bounds: &egui::Rect| ((bounds.min - corner) - screen.min.to_vec2()).length();
+    let (bounds, work) = windows
+        .iter()
+        .filter(|(bounds, _)| (bounds.size() - screen.size()).length() < 3.0)
+        .min_by(|(a, _), (b, _)| off(a).total_cmp(&off(b)))?;
+    Some(work.translate(screen.min - bounds.min))
+}
+
+/// The top-left of Windows' monitors together, as Weston finds it: never
+/// right of or below the main monitor's corner, (0, 0).
+fn desktop_corner(windows: &[(egui::Rect, egui::Rect)]) -> egui::Pos2 {
+    windows
+        .iter()
+        .fold(egui::Pos2::ZERO, |c, (bounds, _)| c.min(bounds.min))
+}
+
+/// Where Weston puts Windows' monitors in X, for when X will not say.
+fn weston_layout(windows: &[(egui::Rect, egui::Rect)]) -> Vec<egui::Rect> {
+    let corner = desktop_corner(windows).to_vec2();
+    windows
+        .iter()
+        .map(|(bounds, _)| bounds.translate(-corner))
+        .collect()
+}
+
+/// The monitor among `screens` a window at `window` is on: the one it
+/// covers most of, or, off every one, the nearest.
+fn screen_of(window: egui::Rect, screens: &[egui::Rect]) -> Option<egui::Rect> {
+    let overlap = |s: &egui::Rect| {
+        let i = s.intersect(window);
+        if i.is_positive() { i.area() } else { 0.0 }
+    };
+    let distance = |s: &egui::Rect| s.distance_to_pos(window.center());
+    screens.iter().copied().max_by(|a, b| {
+        overlap(a)
+            .total_cmp(&overlap(b))
+            .then_with(|| distance(b).total_cmp(&distance(a)))
+    })
+}
+
+/// Whether a saved work area (`[x, y, w, h]`, physical pixels) still lies
+/// on one of X's monitors — so not one saved before #540 in Windows'
+/// coordinates, or on a monitor since unplugged. True when X will not say.
+pub fn on_a_screen([x, y, w, h]: [f32; 4]) -> bool {
+    let area = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+    x_monitors().is_none_or(|screens| screens.iter().any(|s| s.expand(1.0).contains_rect(area)))
+}
+
+/// X's monitors, in physical pixels, sorted: RandR's, which under WSLg
+/// are Weston's outputs where Weston put them. Kept for a second, as one
+/// maximise asks a few times over.
+fn x_monitors() -> Option<Vec<egui::Rect>> {
+    static LAST: Mutex<Option<(Instant, Option<Vec<egui::Rect>>)>> = Mutex::new(None);
+    let mut last = LAST.lock().ok()?;
+    if let Some((at, screens)) = &*last
+        && at.elapsed() < Duration::from_secs(1)
+    {
+        return screens.clone();
+    }
+    let screens = read_x_monitors();
+    *last = Some((Instant::now(), screens.clone()));
+    screens
+}
+
+/// Ask X for its monitors, on a connection of its own; `None` where there
+/// is no X, or no RandR 1.5 on it.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+fn read_x_monitors() -> Option<Vec<egui::Rect>> {
+    use x11_dl::{xlib, xrandr};
+    let xlib = xlib::Xlib::open().ok()?;
+    let xrandr = xrandr::Xrandr::open().ok()?;
+    // SAFETY: a display of its own, opened, used and closed right here; the
+    // monitor list is read before it is freed.
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let (mut event, mut error, mut major, mut minor) = (0, 0, 0, 0);
+        let mut screens = None;
+        // Asked of a server without RandR 1.5, `XRRGetMonitors` is an X
+        // error, which by default ends the process.
+        if (xrandr.XRRQueryExtension)(display, &mut event, &mut error) != 0
+            && (xrandr.XRRQueryVersion)(display, &mut major, &mut minor) != 0
+            && (major, minor) >= (1, 5)
+        {
+            let root = (xlib.XDefaultRootWindow)(display);
+            let mut n = 0;
+            let list = (xrandr.XRRGetMonitors)(display, root, xlib::True, &mut n);
+            if !list.is_null() {
+                let mut found: Vec<egui::Rect> =
+                    std::slice::from_raw_parts(list, usize::try_from(n).unwrap_or(0))
+                        .iter()
+                        .map(|m| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(m.x as f32, m.y as f32),
+                                egui::vec2(m.width as f32, m.height as f32),
+                            )
+                        })
+                        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+                        .collect();
+                (xrandr.XRRFreeMonitors)(list);
+                found.sort_by(|a, b| {
+                    a.min
+                        .x
+                        .total_cmp(&b.min.x)
+                        .then(a.min.y.total_cmp(&b.min.y))
+                });
+                screens = (!found.is_empty()).then_some(found);
+            }
+        }
+        (xlib.XCloseDisplay)(display);
+        screens
+    }
+}
+
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+fn read_x_monitors() -> Option<Vec<egui::Rect>> {
+    None
+}
 
 fn parse_work_areas(out: &str) -> Vec<(egui::Rect, egui::Rect)> {
     out.lines()
@@ -680,6 +876,94 @@ mod tests {
         );
         assert_eq!(areas[1].0.min, egui::pos2(-1920.0, 0.0));
         assert_eq!(areas[1].1.height(), 1040.0);
+    }
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+    }
+
+    /// A 2880×1800 laptop and a 1920×1080 screen right of it and 628 px
+    /// higher, as Windows has them (#540).
+    fn laptop_and_screen() -> Vec<(egui::Rect, egui::Rect)> {
+        vec![
+            (r(0.0, 0.0, 2880.0, 1800.0), r(0.0, 0.0, 2880.0, 1716.0)),
+            (
+                r(2880.0, -628.0, 1920.0, 1080.0),
+                r(2880.0, -628.0, 1920.0, 1032.0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_work_area_moves_with_its_monitor_into_x() {
+        let windows = laptop_and_screen();
+        // Where WSLg's Weston put them, as RandR reported it.
+        let laptop = r(0.0, 628.0, 2880.0, 1800.0);
+        let screen = r(2880.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(weston_layout(&windows), vec![laptop, screen]);
+        assert_eq!(
+            work_area_on(laptop, &windows),
+            Some(r(0.0, 628.0, 2880.0, 1716.0))
+        );
+        assert_eq!(
+            work_area_on(screen, &windows),
+            Some(r(2880.0, 0.0, 1920.0, 1032.0))
+        );
+    }
+
+    #[test]
+    fn a_monitor_weston_left_behind_is_found_by_its_size() {
+        // Duplicate: Windows has the laptop alone, and Weston left it where
+        // the extended layout had it.
+        let windows = vec![laptop_and_screen()[0]];
+        assert_eq!(
+            work_area_on(r(0.0, 628.0, 2880.0, 1800.0), &windows),
+            Some(r(0.0, 628.0, 2880.0, 1716.0))
+        );
+        // A monitor Windows did not tell of has no work area here.
+        assert_eq!(work_area_on(r(2880.0, 0.0, 1920.0, 1080.0), &windows), None);
+    }
+
+    #[test]
+    fn two_monitors_the_same_size_go_by_place() {
+        let windows = vec![
+            (r(0.0, 0.0, 1920.0, 1080.0), r(0.0, 0.0, 1920.0, 1040.0)),
+            (
+                r(-1920.0, 0.0, 1920.0, 1080.0),
+                r(-1920.0, 0.0, 1920.0, 1080.0),
+            ),
+        ];
+        assert_eq!(
+            work_area_on(r(1920.0, 0.0, 1920.0, 1080.0), &windows),
+            Some(r(1920.0, 0.0, 1920.0, 1040.0))
+        );
+        assert_eq!(
+            work_area_on(r(0.0, 0.0, 1920.0, 1080.0), &windows),
+            Some(r(0.0, 0.0, 1920.0, 1080.0))
+        );
+    }
+
+    #[test]
+    fn the_window_is_on_the_monitor_it_covers_most() {
+        let screens = [
+            r(0.0, 628.0, 2880.0, 1800.0),
+            r(2880.0, 0.0, 1920.0, 1080.0),
+        ];
+        // Laid over Windows' work area as if it were X's: still mostly on
+        // the laptop.
+        assert_eq!(
+            screen_of(r(0.0, 0.0, 2880.0, 1716.0), &screens),
+            Some(screens[0])
+        );
+        assert_eq!(
+            screen_of(r(3000.0, 100.0, 800.0, 600.0), &screens),
+            Some(screens[1])
+        );
+        // Off both: the nearer.
+        assert_eq!(
+            screen_of(r(100.0, 50.0, 400.0, 300.0), &screens),
+            Some(screens[0])
+        );
     }
 
     #[test]

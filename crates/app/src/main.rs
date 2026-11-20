@@ -691,7 +691,10 @@ fn main() -> eframe::Result {
     // saved last time when it opens maximised, rather than through the
     // window manager, whose maximise lands it 32 px off.
     let window_size = layout.window_size().unwrap_or(first_size);
-    let work_area = layout.work_area.filter(|_| frameless);
+    // Not one off every monitor X has now (#540).
+    let work_area = layout
+        .work_area
+        .filter(|&area| frameless && titlebar::on_a_screen(area));
     let open_laid = frameless && layout.maximized && work_area.is_some();
     let mut viewport = egui::ViewportBuilder::default()
         .with_app_id("giverny")

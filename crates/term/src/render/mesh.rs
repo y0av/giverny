@@ -93,7 +93,9 @@ impl Snapshot {
             if selected {
                 let s = theme.selection_bg;
                 let base = bg_opt.unwrap_or(theme.bg);
-                bg_opt = Some(blend(base, s));
+                let band = blend(base, s);
+                bg_opt = Some(band);
+                fg = theme.selected_fg(fg, band);
             }
 
             any_rtl |= super::bidi::is_rtl(cell.c);
@@ -451,7 +453,7 @@ fn push_uv(mesh: &mut Mesh, rect: Rect, uv_min: Vec2, uv_max: Vec2, color: Color
         .extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 3]);
 }
 
-fn blend(base: Color32, over: Color32) -> Color32 {
+pub(crate) fn blend(base: Color32, over: Color32) -> Color32 {
     let a = over.a() as u32;
     let inv = 255 - a;
     Color32::from_rgb(

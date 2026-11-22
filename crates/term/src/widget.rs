@@ -830,7 +830,7 @@ impl TabView {
         let Some(pos) = pointer else { return };
         let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
 
-        let select_at = |ty: SelectionType, copy: bool| {
+        let select_at = |ty: SelectionType, pos: Pos2, copy: bool| {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
             let (col, vp_line, side) = grid_cell(orders, cell_at(rect, ppp, m, pos));
@@ -855,11 +855,16 @@ impl TabView {
         };
 
         if response.triple_clicked() {
-            select_at(SelectionType::Lines, true);
+            select_at(SelectionType::Lines, pos, true);
         } else if response.double_clicked() {
-            select_at(SelectionType::Semantic, true);
+            select_at(SelectionType::Semantic, pos, true);
         } else if response.drag_started_by(PointerButton::Primary) {
-            select_at(SelectionType::Simple, false);
+            // egui calls it a drag only once the pointer has left the press
+            // by `max_click_dist` (6 pt, most of a cell): anchored where the
+            // pointer is by then, the selection began a cell late, and the
+            // first character was lost. It begins where the button went down.
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+            select_at(SelectionType::Simple, origin, false);
         } else if response.dragged_by(PointerButton::Primary) {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
@@ -1514,5 +1519,86 @@ mod rtl_pointer_tests {
         // A run of cells reads back as the columns it is drawn over.
         assert_eq!(drawn_span(&orders, 3, 3, 4), (3, 4));
         assert_eq!(drawn_span(&orders, 3, 0, 2), (0, 2));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod drag_select_tests {
+    use super::{RenderShared, TabView};
+    use crate::pty::{GridSize, SpawnCfg};
+    use crate::render::theme::Theme;
+    use crate::session::TermSession;
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+    /// A drag selects from the character it was pressed on, though egui
+    /// reports it only once the pointer is most of a cell away from there.
+    #[test]
+    fn a_drag_selects_from_where_the_button_went_down() {
+        let ctx = egui::Context::default();
+        let cfg = SpawnCfg {
+            shell: Some(("sleep".into(), vec!["30".into()])),
+            cwd: std::env::temp_dir(),
+            env_extra: vec![],
+            tab_id: "drag-test".into(),
+            nonce: "drag-test".into(),
+            claude_config_dir: None,
+            size: GridSize {
+                cols: 40,
+                rows: 10,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        };
+        let mut session = TermSession::spawn(&cfg, ctx.clone(), Theme::ink(), Some("abcdefghij"))
+            .expect("session spawns");
+        let mut shared = RenderShared::new(Theme::ink(), 12.0).expect("fonts load");
+        // Headless, a point is a pixel.
+        let m = shared.metrics_for(shared.font_size);
+        let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
+        let mut view = TabView::default();
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
+        let mut time = 0.0;
+        let mut frame = |events: Vec<Event>| {
+            time += 1.0 / 60.0;
+            let input = RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut rect = Rect::NOTHING;
+            let _ = ctx.run_ui(input, |ui| {
+                rect = view.show(ui, &mut shared, &mut session).rect;
+            });
+            rect
+        };
+
+        let rect = frame(vec![]);
+        // egui's 6 pt must reach past the middle of a cell, or a late
+        // anchor would land on the same character and this would prove
+        // nothing.
+        assert!(cw < 12.0, "a cell {cw} pt wide");
+        // On the left edge of 'c', then right in small steps to the middle
+        // of 'g': egui sees a drag only some way along.
+        let row = rect.min.y + ch / 2.0;
+        let press = Pos2::new(rect.min.x + 2.0 * cw + 1.0, row);
+        let release = Pos2::new(rect.min.x + 6.0 * cw + cw * 0.75, row);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(vec![Event::PointerMoved(press), button(press, true)]);
+        let mut x = press.x;
+        while x < release.x {
+            x = (x + 2.0).min(release.x);
+            frame(vec![Event::PointerMoved(Pos2::new(x, row))]);
+        }
+        frame(vec![button(release, false)]);
+
+        let selected = session.term.lock().selection_to_string();
+        assert_eq!(selected.as_deref(), Some("cdefg"));
     }
 }

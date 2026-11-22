@@ -102,7 +102,11 @@ impl Theme {
             fg: hex(0xe6e6e6),
             cursor: hex(0xffffff),
             cursor_text: hex(0x0b0b0c),
-            selection_bg: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 60),
+            // Solid, and the blue Claude Code selects with in its dark theme,
+            // so a selection looks the same in a shell as in Claude. White at
+            // 60 over near-black was a flat grey haze that grey text vanished
+            // into.
+            selection_bg: hex(0x264f78),
             ansi: [
                 hex(0x1c1c1e),
                 hex(0xd06b5c),
@@ -446,6 +450,20 @@ impl Theme {
         }
     }
 
+    /// `fg` as selected text on `band`, the selection under it: kept while
+    /// it still reads there, otherwise whichever of the theme's foreground
+    /// and background reads better. Text in the selection's own hue, or grey
+    /// text on a grey one, would otherwise vanish the moment it is marked.
+    pub fn selected_fg(&self, fg: Color32, band: Color32) -> Color32 {
+        if contrast(fg, band) >= SELECTED_TEXT_CONTRAST {
+            fg
+        } else if contrast(self.fg, band) >= contrast(self.bg, band) {
+            self.fg
+        } else {
+            self.bg
+        }
+    }
+
     /// True when the background is light (UI chrome follows).
     pub fn is_light(&self) -> bool {
         let c = self.bg;
@@ -538,6 +556,30 @@ impl Theme {
     }
 }
 
+/// The least contrast selected text keeps with the selection under it
+/// ([`Theme::selected_fg`]): WCAG's floor for large text and UI. Most of a
+/// program's colours clear it and keep their colour while selected; what
+/// falls under it was close to unreadable.
+pub const SELECTED_TEXT_CONTRAST: f32 = 3.0;
+
+/// WCAG contrast ratio between two colours: 1.0 for identical, 21.0 for
+/// black on white.
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let f = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    };
+    let (x, y) = (lum(a).max(lum(b)), lum(a).min(lum(b)));
+    (x + 0.05) / (y + 0.05)
+}
+
 fn hex(v: u32) -> Color32 {
     Color32::from_rgb((v >> 16) as u8, (v >> 8 & 0xff) as u8, (v & 0xff) as u8)
 }
@@ -584,6 +626,44 @@ mod tests {
             !Theme::by_name("nonsense").is_light(),
             "unknown names fall back to the default dark theme"
         );
+    }
+
+    /// Marked text stays readable in every theme: its own foreground, and
+    /// every palette colour once [`Theme::selected_fg`] has had its say,
+    /// clear the floor on the selection over the plain background.
+    #[test]
+    fn selected_text_reads_in_every_theme() {
+        let band = |t: &Theme| crate::render::mesh::blend(t.bg, t.selection_bg);
+        for name in Theme::NAMES {
+            let t = Theme::by_name(name);
+            let b = band(&t);
+            assert!(
+                contrast(t.fg, b) >= 4.5,
+                "{name}: text on the selection at {:.2}",
+                contrast(t.fg, b)
+            );
+            for (i, &c) in t.ansi.iter().enumerate() {
+                let shown = t.selected_fg(c, b);
+                assert!(
+                    contrast(shown, b) >= SELECTED_TEXT_CONTRAST,
+                    "{name}: colour {i} selected at {:.2}",
+                    contrast(shown, b)
+                );
+            }
+        }
+    }
+
+    /// Ink's selection is a band, not a haze: it stands out from the
+    /// background, and its grey text is drawn readable on it.
+    #[test]
+    fn ink_selection_stands_out() {
+        let t = Theme::ink();
+        assert_eq!(t.selection_bg.a(), 255, "solid");
+        assert!(contrast(t.selection_bg, t.bg) >= 2.0);
+        let grey = t.ansi[8];
+        assert_eq!(t.selected_fg(grey, t.selection_bg), t.fg);
+        let green = t.ansi[2];
+        assert_eq!(t.selected_fg(green, t.selection_bg), green, "colour kept");
     }
 
     /// Rouen never jumps: the palette on either side of any moment is the

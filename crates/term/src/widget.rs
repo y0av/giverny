@@ -223,6 +223,14 @@ fn update_cursor_blink(
     cursor_blink(now - from.unwrap())
 }
 
+/// Whether the block cursor is drawn as an outline: when this terminal is
+/// not the one that takes the keys, or the window itself does not have the
+/// keyboard, so a cursor that would not receive what is typed never looks
+/// as if it would.
+fn cursor_hollow(owns_keys: bool, window_focused: bool) -> bool {
+    !owns_keys || !window_focused
+}
+
 /// Input that restarts the blink: what a person typing produces.
 fn is_typing(event: &egui::Event) -> bool {
     matches!(
@@ -458,7 +466,7 @@ impl TabView {
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
         let dirty = session.take_dirty();
-        let hollow = !self.owns_keys;
+        let hollow = cursor_hollow(self.owns_keys, window_focused);
         let needs_rebuild = dirty
             || self.last_blink != cursor_visible
             || self.last_hollow != hollow
@@ -1395,7 +1403,15 @@ fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) 
 
 #[cfg(test)]
 mod blink_tests {
-    use super::{cursor_blink, update_cursor_blink};
+    use super::{cursor_blink, cursor_hollow, update_cursor_blink};
+
+    #[test]
+    fn the_cursor_is_solid_only_where_typing_lands() {
+        assert!(!cursor_hollow(true, true), "focused window, this terminal");
+        assert!(cursor_hollow(false, true), "another split has the keys");
+        assert!(cursor_hollow(true, false), "the window is not focused");
+        assert!(cursor_hollow(false, false));
+    }
 
     #[test]
     fn invisible_cursor_stops_waking_and_reappears_solid() {
